@@ -2696,6 +2696,9 @@ class NFLIngestor:
 
         last_payload: Optional[Dict[str, Any]] = None
 
+        collected_by_team: Dict[str, List[Dict[str, Any]]] = {}
+        found_payload = False
+
         for date_key in date_candidates:
             for lineup_type in (None, "expected"):
                 cache_token = f"{season_slug}|{date_key}|{lineup_type or 'default'}"
@@ -2703,7 +2706,10 @@ class NFLIngestor:
                 if cache_key in lineup_cache:
                     cached = lineup_cache[cache_key]
                     if cached:
-                        return cached
+                        for rec in cached:
+                            collected_by_team.setdefault(rec.get("team"), []).append(rec)
+                        found_payload = True
+                        break
                     continue
 
                 url = (
@@ -2837,7 +2843,176 @@ class NFLIngestor:
 
                 lineup_cache[cache_key] = enriched_rows
                 if enriched_rows:
-                    return enriched_rows
+                    found_payload = True
+                    for rec in enriched_rows:
+                        collected_by_team.setdefault(rec.get("team"), []).append(rec)
+                    break
+            if found_payload:
+                break
+
+        def _lineup_needs_team(team_code: str) -> bool:
+            team_rows = collected_by_team.get(team_code) or []
+            if not team_rows:
+                return True
+            if not any(normalize_position(r.get("base_pos")) == "QB" for r in team_rows):
+                return True
+            for pos_key, max_count in _OFFENSE_KEEP.items():
+                pos_rows = [
+                    r
+                    for r in team_rows
+                    if normalize_position(r.get("base_pos")) == pos_key
+                ]
+                if not pos_rows:
+                    return True
+                if len(pos_rows) < max_count:
+                    return True
+            return False
+
+        def _merge_records(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            if not incoming:
+                return existing
+            merged = (existing or []) + incoming
+
+            def priority(rec: Dict[str, Any]) -> Tuple[int, int]:
+                source = rec.get("source") or ""
+                source_rank = 0 if str(source).startswith("msf-lineup") else 1
+                depth_val = rec.get("rank")
+                if depth_val is None:
+                    depth_val = 99
+                return (source_rank, depth_val)
+
+            deduped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            for rec in sorted(merged, key=priority):
+                team = rec.get("team")
+                pos = normalize_position(rec.get("base_pos"))
+                key = (team, f"{pos}:{rec.get('__pname_key')}")
+                if key not in deduped:
+                    deduped[key] = rec
+            return list(deduped.values())
+
+        def _fetch_team_depth(team_code: str) -> List[Dict[str, Any]]:
+            team_rows: List[Dict[str, Any]] = []
+            team_cache_prefix = f"{season_slug}|team|{team_code}"
+            for lineup_type in (None, "expected"):
+                cache_token = f"{team_cache_prefix}|{lineup_type or 'default'}"
+                cache_key = (cache_token, team_code, team_code)
+                if cache_key in lineup_cache:
+                    cached_rows = lineup_cache[cache_key]
+                    if cached_rows:
+                        team_rows = cached_rows
+                        break
+                    continue
+                url = (
+                    f"https://api.mysportsfeeds.com/v2.1/pull/nfl/{season_slug}/teams/"
+                    f"{team_code}/lineup.json"
+                )
+                params = {"lineupType": lineup_type} if lineup_type else None
+                response = _http_get_with_retry(
+                    url,
+                    auth,
+                    params=params,
+                    headers=accept_headers,
+                )
+                if response is None:
+                    lineup_cache[cache_key] = []
+                    continue
+                if response.status_code in {401, 404}:
+                    lineup_cache[cache_key] = []
+                    if response.status_code == 401:
+                        logging.warning(
+                            "lineup: 401 unauthorized for %s (check MSF credentials)",
+                            url,
+                        )
+                        return []
+                    continue
+                if response.status_code == 204:
+                    lineup_cache[cache_key] = []
+                    continue
+                if response.status_code != 200:
+                    logging.info("lineup: %s returned %s", url, response.status_code)
+                    lineup_cache[cache_key] = []
+                    continue
+                try:
+                    payload = response.json()
+                except Exception:
+                    logging.exception("lineup: JSON decode failed for %s", url)
+                    lineup_cache[cache_key] = []
+                    continue
+                rows = _extract_lineup_rows(payload if isinstance(payload, dict) else {})
+                enriched: List[Dict[str, Any]] = []
+                updated_at = (
+                    parse_dt(payload.get("lastUpdatedOn"))
+                    if isinstance(payload, dict)
+                    else None
+                )
+                for rec in rows:
+                    if _msf_team_abbr(rec.get("team")) != team_code:
+                        continue
+                    enriched.append(
+                        {
+                            "team": team_code,
+                            "position": rec.get("position"),
+                            "player_id": rec.get("player_id") or "",
+                            "player_name": rec.get("player_name"),
+                            "first_name": rec.get("first_name"),
+                            "last_name": rec.get("last_name"),
+                            "rank": rec.get("rank"),
+                            "depth_id": (
+                                f"msf-team-lineup:{team_code}:{rec.get('position')}:{rec.get('player_id') or rec.get('__pname_key')}"
+                            ),
+                            "updated_at": updated_at,
+                            "source": "msf-team-lineup",
+                            "player_team": rec.get("player_team"),
+                            "game_start": start_dt,
+                            "__pname_key": rec.get("__pname_key"),
+                            "side": rec.get("side"),
+                            "base_pos": rec.get("base_pos") or rec.get("position"),
+                            "playing_probability": rec.get("playing_probability"),
+                            "status_bucket": rec.get("status_bucket"),
+                            "practice_status": rec.get("practice_status"),
+                        }
+                    )
+                lineup_cache[cache_key] = enriched
+                if enriched:
+                    team_rows = enriched
+                    break
+            return team_rows
+
+        for team_code in (away_norm, home_norm):
+            if _lineup_needs_team(team_code):
+                supplemental = _fetch_team_depth(team_code)
+                if supplemental:
+                    collected_by_team[team_code] = _merge_records(
+                        collected_by_team.get(team_code, []), supplemental
+                    )
+
+        flattened: List[Dict[str, Any]] = []
+        for team_code, team_rows in collected_by_team.items():
+            if not team_rows:
+                continue
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for rec in team_rows:
+                pos = normalize_position(rec.get("base_pos"))
+                if pos not in _OFFENSE_KEEP:
+                    continue
+                grouped.setdefault(pos, []).append(rec)
+            for pos, recs in grouped.items():
+                recs_sorted = sorted(
+                    recs,
+                    key=lambda r: (
+                        0 if str(r.get("source", "")).startswith("msf-lineup") else 1,
+                        r.get("rank") if r.get("rank") is not None else 99,
+                        r.get("player_name") or r.get("__pname_key") or "",
+                    ),
+                )
+                keep = _OFFENSE_KEEP.get(pos, 0)
+                for rec in recs_sorted[:keep]:
+                    if rec.get("game_start") is None:
+                        rec["game_start"] = start_dt
+                    flattened.append(rec)
+
+        if flattened:
+            return flattened
 
         if last_payload is not None:
             logging.debug(
