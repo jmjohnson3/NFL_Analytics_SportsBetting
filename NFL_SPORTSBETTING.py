@@ -317,7 +317,7 @@ def build_lineups_df(msf_json: Dict[str, Any]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 API_PREFIX_NFL = "https://api.mysportsfeeds.com/v2.1/pull/nfl"
-NFL_SEASONS = ["2024-regular", "2025-regular"]
+NFL_SEASONS = ["2025-regular", "2024-regular"]
 
 NFL_API_USER = "4359aa1b-cc29-4647-a3e5-7314e2"
 NFL_API_PASS = "MYSPORTSFEEDS"
@@ -2698,7 +2698,7 @@ class NFLIngestor:
 
         for date_key in date_candidates:
             for lineup_type in (None, "expected"):
-                cache_token = f"{date_key}|{lineup_type or 'default'}"
+                cache_token = f"{season_slug}|{date_key}|{lineup_type or 'default'}"
                 cache_key = (cache_token, away_norm, home_norm)
                 if cache_key in lineup_cache:
                     cached = lineup_cache[cache_key]
@@ -2812,28 +2812,28 @@ class NFLIngestor:
                         if player_id
                         else f"msf-lineup:{team}:{position}:{player_key}"
                     )
-                enriched_rows.append(
-                    {
-                        "team": team,
-                        "position": position,
-                        "player_id": player_id,
-                        "player_name": player_name,
-                        "first_name": first_name,
-                        "last_name": last_name,
-                        "rank": record.get("rank"),
-                        "depth_id": depth_id,
-                        "updated_at": last_updated,
-                        "source": "msf-lineup",
-                        "player_team": record.get("player_team"),
-                        "game_start": start_dt,
-                        "__pname_key": player_key,
-                        "side": record.get("side"),
-                        "base_pos": record.get("base_pos") or position,
-                        "playing_probability": record.get("playing_probability"),
-                        "status_bucket": record.get("status_bucket"),
-                        "practice_status": record.get("practice_status"),
-                    }
-                )
+                    enriched_rows.append(
+                        {
+                            "team": team,
+                            "position": position,
+                            "player_id": player_id,
+                            "player_name": player_name,
+                            "first_name": first_name,
+                            "last_name": last_name,
+                            "rank": record.get("rank"),
+                            "depth_id": depth_id,
+                            "updated_at": last_updated,
+                            "source": "msf-lineup",
+                            "player_team": record.get("player_team"),
+                            "game_start": start_dt,
+                            "__pname_key": player_key,
+                            "side": record.get("side"),
+                            "base_pos": record.get("base_pos") or position,
+                            "playing_probability": record.get("playing_probability"),
+                            "status_bucket": record.get("status_bucket"),
+                            "practice_status": record.get("practice_status"),
+                        }
+                    )
 
                 lineup_cache[cache_key] = enriched_rows
                 if enriched_rows:
