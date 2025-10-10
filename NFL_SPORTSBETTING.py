@@ -141,8 +141,36 @@ _SLOT_TO_POS = {
     "RB": "RB",
     "WR": "WR",
     "TE": "TE",
+    # Explicit backfield/receiver aliases that occasionally appear without suffixes
+    "HB": "RB",
+    "FB": "RB",
+    "TB": "RB",
+    "SLOT": "WR",
     # OL/DEF/ST are ignored in player projections
 }
+
+_SLOT_PREFIX_MAP = {
+    "QB": "QB",
+    "RB": "RB",
+    "HB": "RB",
+    "FB": "RB",
+    "TB": "RB",
+    "WR": "WR",
+    "TE": "TE",
+    "SLOT": "WR",
+}
+
+
+def _slot_token_to_pos(token: Optional[str]) -> str:
+    token_upper = (token or "").strip().upper()
+    if not token_upper:
+        return ""
+    if token_upper in _SLOT_TO_POS:
+        return _SLOT_TO_POS[token_upper]
+    for prefix, canonical in _SLOT_PREFIX_MAP.items():
+        if token_upper.startswith(prefix):
+            return canonical
+    return ""
 
 def _parse_slot(slot: str) -> Tuple[str, Optional[int], Optional[str]]:
     """
@@ -155,7 +183,7 @@ def _parse_slot(slot: str) -> Tuple[str, Optional[int], Optional[str]]:
     if not m:
         return ("", None, None)
     side_token, token, depth = m.groups()
-    pos = _SLOT_TO_POS.get(token, "")
+    pos = _slot_token_to_pos(token)
     d = int(depth) if depth and depth.isdigit() else None
     side = side_token.title() if side_token else None
     return (pos, d, side)
@@ -725,6 +753,54 @@ def normalize_practice_status(value: Any) -> str:
     return text
 
 
+_PLAYING_PROBABILITY_ALIASES = {
+    "prob": "probable",
+    "probable": "probable",
+    "likely": "probable",
+    "expected": "probable",
+    "game-time decision": "questionable",
+    "gtd": "questionable",
+    "game time decision": "questionable",
+    "game-time": "questionable",
+    "uncertain": "questionable",
+    "na": "other",
+}
+
+
+def interpret_playing_probability(value: Any) -> Tuple[str, str]:
+    """Return (status_bucket, practice_status) derived from MSF playingProbability labels."""
+
+    text_raw = str(value or "").strip().lower()
+    if not text_raw:
+        return "other", "available"
+
+    cleaned = re.sub(r"[^a-z\s]", " ", text_raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return "other", "available"
+
+    canonical = _PLAYING_PROBABILITY_ALIASES.get(cleaned, cleaned)
+
+    keyword_rules = [
+        ("suspend", ("suspended", "dnp")),
+        ("doubt", ("doubtful", "limited")),
+        ("question", ("questionable", "limited")),
+        ("inactive", ("out", "dnp")),
+        ("out", ("out", "dnp")),
+        ("probable", ("probable", "available")),
+        ("likely", ("probable", "available")),
+        ("expect", ("probable", "available")),
+        ("available", ("other", "full")),
+        ("active", ("other", "full")),
+    ]
+
+    for keyword, outcome in keyword_rules:
+        if keyword in canonical:
+            return outcome
+
+    return "other", "available"
+
+
 def normalize_injury_status(value: Any) -> str:
     text = str(value or "").lower().strip()
     if not text:
@@ -914,14 +990,26 @@ def ensure_lineup_players_in_latest(
         depth_rank = lineup_row.get("rank")
         placeholder["depth_rank"] = depth_rank if depth_rank not in (None, "") else 1
 
-        playing_prob = str(lineup_row.get("playing_probability", "") or "").lower()
-        status_bucket = "questionable" if playing_prob == "questionable" else "other"
+        lineup_status = lineup_row.get("status_bucket")
+        lineup_practice = lineup_row.get("practice_status")
+        if lineup_status:
+            status_bucket = normalize_injury_status(lineup_status)
+            practice_status = normalize_practice_status(lineup_practice)
+        else:
+            status_bucket, practice_status = interpret_playing_probability(
+                lineup_row.get("playing_probability")
+            )
+            status_bucket = normalize_injury_status(status_bucket)
+            practice_status = normalize_practice_status(practice_status)
+
         placeholder["status_bucket"] = status_bucket
-        placeholder["practice_status"] = "available"
+        placeholder["practice_status"] = practice_status
         if "injury_priority" in placeholder:
             placeholder["injury_priority"] = INJURY_STATUS_PRIORITY.get(status_bucket, 1)
         if "practice_priority" in placeholder:
-            placeholder["practice_priority"] = PRACTICE_STATUS_PRIORITY.get("available", 1)
+            placeholder["practice_priority"] = PRACTICE_STATUS_PRIORITY.get(
+                practice_status, PRACTICE_STATUS_PRIORITY.get("available", 1)
+            )
 
         if "_lineup_entry" in placeholder:
             placeholder["_lineup_entry"] = True
@@ -1358,6 +1446,9 @@ def _extract_lineup_rows(json_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
 
         pname_source = player_name or " ".join(part for part in [first, last] if part)
+        status_bucket, practice_status = interpret_playing_probability(
+            record.get("playing_probability")
+        )
         results.append(
             {
                 "team": _msf_team_abbr(team_abbr),
@@ -1372,6 +1463,8 @@ def _extract_lineup_rows(json_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "source_section": record.get("source_section") or "actual",
                 "player_team": _msf_team_abbr(record.get("player_team_abbr")),
                 "playing_probability": record.get("playing_probability"),
+                "status_bucket": status_bucket,
+                "practice_status": practice_status,
                 "slot": record.get("slot"),
                 "__pname_key": robust_player_name_key(pname_source),
             }
@@ -2719,26 +2812,28 @@ class NFLIngestor:
                         if player_id
                         else f"msf-lineup:{team}:{position}:{player_key}"
                     )
-                    enriched_rows.append(
-                        {
-                            "team": team,
-                            "position": position,
-                            "player_id": player_id,
-                            "player_name": player_name,
-                            "first_name": first_name,
-                            "last_name": last_name,
-                            "rank": record.get("rank"),
-                            "depth_id": depth_id,
-                            "updated_at": last_updated,
-                            "source": "msf-lineup",
-                            "player_team": record.get("player_team"),
-                            "game_start": start_dt,
-                            "__pname_key": player_key,
-                            "side": record.get("side"),
-                            "base_pos": record.get("base_pos") or position,
-                            "playing_probability": record.get("playing_probability"),
-                        }
-                    )
+                enriched_rows.append(
+                    {
+                        "team": team,
+                        "position": position,
+                        "player_id": player_id,
+                        "player_name": player_name,
+                        "first_name": first_name,
+                        "last_name": last_name,
+                        "rank": record.get("rank"),
+                        "depth_id": depth_id,
+                        "updated_at": last_updated,
+                        "source": "msf-lineup",
+                        "player_team": record.get("player_team"),
+                        "game_start": start_dt,
+                        "__pname_key": player_key,
+                        "side": record.get("side"),
+                        "base_pos": record.get("base_pos") or position,
+                        "playing_probability": record.get("playing_probability"),
+                        "status_bucket": record.get("status_bucket"),
+                        "practice_status": record.get("practice_status"),
+                    }
+                )
 
                 lineup_cache[cache_key] = enriched_rows
                 if enriched_rows:
@@ -2815,9 +2910,42 @@ class NFLIngestor:
                     parsed_rank = int(rank_val)
                 else:
                     parsed_rank = None
+                status_bucket = entry.get("status_bucket") or "other"
+                practice_status = normalize_practice_status(
+                    entry.get("practice_status")
+                )
                 current = by_key.get(key)
                 current_rank = current.get("rank") if current else None
-                if current is None or ((parsed_rank or 999) < (current_rank or 999)):
+                current_status = current.get("status_bucket") if current else None
+                new_rank_val = parsed_rank or 999
+                current_rank_val = current_rank or 999
+                replace_entry = False
+                if current is None:
+                    replace_entry = True
+                elif new_rank_val < current_rank_val:
+                    replace_entry = True
+                elif new_rank_val == current_rank_val:
+                    current_inactive = current_status in INACTIVE_INJURY_BUCKETS if current_status else False
+                    new_inactive = status_bucket in INACTIVE_INJURY_BUCKETS
+                    if current_inactive and not new_inactive:
+                        replace_entry = True
+                    elif not current_inactive and new_inactive:
+                        replace_entry = False
+                    else:
+                        existing_ts = current.get("updated_at")
+                        new_ts = entry.get("updated_at")
+                        existing_dt = (
+                            existing_ts
+                            if isinstance(existing_ts, dt.datetime)
+                            else parse_dt(existing_ts)
+                        )
+                        new_dt = (
+                            new_ts if isinstance(new_ts, dt.datetime) else parse_dt(new_ts)
+                        )
+                        if new_dt and (not existing_dt or new_dt > existing_dt):
+                            replace_entry = True
+
+                if replace_entry:
                     by_key[key] = {
                         "player_id": pid,
                         "player_name": pname,
@@ -2825,6 +2953,8 @@ class NFLIngestor:
                         "rank": parsed_rank,
                         "source": entry.get("source", "msf-lineup"),
                         "updated_at": entry.get("updated_at"),
+                        "status_bucket": status_bucket,
+                        "practice_status": practice_status,
                     }
 
             now_utc = default_now_utc()
@@ -2847,7 +2977,10 @@ class NFLIngestor:
                         "position": info["position"],
                         "depth_rank": info["rank"],
                         "is_starter": 1
-                        if self._is_starter_label(info["position"], info["rank"])
+                        if (
+                            self._is_starter_label(info["position"], info["rank"])
+                            and info.get("status_bucket") not in INACTIVE_INJURY_BUCKETS
+                        )
                         else 0,
                         "source": info.get("source", "msf-lineup"),
                         "updated_at": updated_at_dt,
@@ -6489,6 +6622,18 @@ def predict_upcoming_games(
                 if not depth_id:
                     depth_id = f"msf-lineup:{team}:{position}:{pname_key}"
 
+                status_bucket = row.get("status_bucket")
+                practice_status = row.get("practice_status")
+                if status_bucket:
+                    status_bucket = normalize_injury_status(status_bucket)
+                    practice_status = normalize_practice_status(practice_status)
+                else:
+                    status_bucket, practice_status = interpret_playing_probability(
+                        row.get("playing_probability")
+                    )
+                    status_bucket = normalize_injury_status(status_bucket)
+                    practice_status = normalize_practice_status(practice_status)
+
                 record = {
                     "game_id": str(getattr(game, "game_id", "")),
                     "depth_id": depth_id,
@@ -6507,6 +6652,8 @@ def predict_upcoming_games(
                     "base_pos": row.get("base_pos") or position,
                     "playing_probability": row.get("playing_probability"),
                     "player_team": row.get("player_team"),
+                    "status_bucket": status_bucket,
+                    "practice_status": practice_status,
                 }
                 key = (record["game_id"], team, pname_key, position)
                 existing = lineup_records.get(key)
