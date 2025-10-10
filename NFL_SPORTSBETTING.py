@@ -624,6 +624,7 @@ PRACTICE_STATUS_PRIORITY = {
     "available": 2,
 }
 
+
 PRACTICE_STATUS_ALIASES = {
     "fp": "full",
     "full practice": "full",
@@ -1449,26 +1450,25 @@ def _extract_lineup_rows(json_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
         status_bucket, practice_status = interpret_playing_probability(
             record.get("playing_probability")
         )
-        results.append(
-            {
-                "team": _msf_team_abbr(team_abbr),
-                "player_id": str(record.get("player_id") or ""),
-                "player_name": player_name,
-                "first_name": first,
-                "last_name": last,
-                "position": position,
-                "base_pos": position,
-                "side": record.get("side"),
-                "rank": depth,
-                "source_section": record.get("source_section") or "actual",
-                "player_team": _msf_team_abbr(record.get("player_team_abbr")),
-                "playing_probability": record.get("playing_probability"),
-                "status_bucket": status_bucket,
-                "practice_status": practice_status,
-                "slot": record.get("slot"),
-                "__pname_key": robust_player_name_key(pname_source),
-            }
-        )
+        entry = {
+            "team": _msf_team_abbr(team_abbr),
+            "player_id": str(record.get("player_id") or ""),
+            "player_name": player_name,
+            "first_name": first,
+            "last_name": last,
+            "position": position,
+            "base_pos": position,
+            "side": record.get("side"),
+            "rank": depth,
+            "source_section": record.get("source_section") or "actual",
+            "player_team": _msf_team_abbr(record.get("player_team_abbr")),
+            "playing_probability": record.get("playing_probability"),
+            "status_bucket": status_bucket,
+            "practice_status": practice_status,
+            "slot": record.get("slot"),
+            "__pname_key": robust_player_name_key(pname_source),
+        }
+        results.append(entry)
     return results
 
 
@@ -2876,6 +2876,7 @@ class NFLIngestor:
 
         rows: List[Dict[str, Any]] = []
         lineup_by_team: Dict[str, List[Dict[str, Any]]] = {}
+        mismatch_logged: Set[Tuple[str, str, str]] = set()
         for record in lineup_rows:
             team_code = normalize_team_abbr(record.get("team"))
             if not team_code:
@@ -2896,9 +2897,22 @@ class NFLIngestor:
                 if not self._skill_pos(pos):
                     continue
                 lineup_player_team = normalize_team_abbr(entry.get("player_team"))
-                if pos in {"QB", "RB", "WR", "TE"}:
-                    if lineup_player_team and lineup_player_team != team_normalized:
-                        continue
+                mismatch = (
+                    pos in {"QB", "RB", "WR", "TE"}
+                    and lineup_player_team
+                    and lineup_player_team != team_normalized
+                )
+                if mismatch:
+                    player_label = entry.get("player_name") or entry.get("player_id") or ""
+                    log_key = (team_normalized, lineup_player_team, player_label)
+                    if log_key not in mismatch_logged:
+                        logging.debug(
+                            "lineup: overriding team %s from payload team %s for player %s",
+                            team_normalized,
+                            lineup_player_team,
+                            player_label or "<unknown>",
+                        )
+                        mismatch_logged.add(log_key)
                 pid = (entry.get("player_id") or "").strip()
                 pname = (entry.get("player_name") or "").strip()
                 if not pname and not pid:
