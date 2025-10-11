@@ -72,11 +72,13 @@ from sqlalchemy import (
     String,
     Table,
     UniqueConstraint,
+    and_,
     create_engine,
     func,
+    inspect,
+    or_,
     select,
     text,
-    inspect,
 )
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
@@ -1791,6 +1793,43 @@ class NFLDatabase:
     def upsert_game_rosters(self, rows: Iterable[Dict[str, Any]]) -> None:
         self.upsert_rows(self.game_rosters, list(rows), ["game_id", "team", "player_id", "player_name"])
 
+    def delete_game_roster_entries(
+        self, game_id: Union[str, int], teams: Iterable[Optional[str]]
+    ) -> None:
+        normalized = {
+            normalize_team_abbr(team)
+            for team in teams
+            if team is not None and normalize_team_abbr(team)
+        }
+        if not normalized:
+            return
+        condition = and_(
+            self.game_rosters.c.game_id == str(game_id),
+            self.game_rosters.c.team.in_(sorted(normalized)),
+        )
+        with self.engine.begin() as conn:
+            conn.execute(self.game_rosters.delete().where(condition))
+
+    def delete_team_lineup_depth(self, teams: Iterable[Optional[str]]) -> None:
+        normalized = {
+            normalize_team_abbr(team)
+            for team in teams
+            if team is not None and normalize_team_abbr(team)
+        }
+        if not normalized:
+            return
+        source_filter = self.depth_charts.c.source.in_(("msf-lineup", "msf-team-lineup"))
+        depth_filter = or_(
+            self.depth_charts.c.depth_id.like("msf-lineup:%"),
+            self.depth_charts.c.depth_id.like("msf-team-lineup:%"),
+        )
+        condition = and_(
+            self.depth_charts.c.team.in_(sorted(normalized)),
+            or_(source_filter, depth_filter),
+        )
+        with self.engine.begin() as conn:
+            conn.execute(self.depth_charts.delete().where(condition))
+
     def fetch_game_roster(self, game_id: str) -> pd.DataFrame:
         with self.engine.begin() as conn:
             q = select(self.game_rosters).where(self.game_rosters.c.game_id == str(game_id))
@@ -2053,6 +2092,7 @@ class NFLIngestor:
         injury_rows_all: List[Dict[str, Any]] = []
         depth_rows_map: Dict[str, Dict[str, Any]] = {}
         advanced_rows_map: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+        lineup_depth_teams: Set[str] = set()
 
         for season in seasons:
             games = self.msf_client.fetch_games(season)
@@ -2116,6 +2156,15 @@ class NFLIngestor:
                     self._msf_creds,
                     lineup_cache,
                 )
+                lineup_teams = {
+                    normalize_team_abbr(row.get("team"))
+                    for row in lineup_rows
+                    if row.get("team")
+                }
+                lineup_teams = {team for team in lineup_teams if team}
+                if lineup_teams:
+                    self.db.delete_game_roster_entries(game_id_str, lineup_teams)
+                    lineup_depth_teams.update(lineup_teams)
                 try:
                     roster_rows = self._build_game_roster_rows(
                         game_id_str,
@@ -2329,6 +2378,8 @@ class NFLIngestor:
         if injury_rows_all:
             self.db.upsert_rows(self.db.injury_reports, injury_rows_all, ["injury_id"])
         if depth_rows_map:
+            if lineup_depth_teams:
+                self.db.delete_team_lineup_depth(lineup_depth_teams)
             self.db.upsert_rows(
                 self.db.depth_charts,
                 list(depth_rows_map.values()),
