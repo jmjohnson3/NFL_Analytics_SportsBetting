@@ -5401,6 +5401,158 @@ class ModelTrainer:
 
         merged["_lineup_hit"] = merged["depth_rank"].notna()
 
+        def _build_placeholder_row(lineup_row: pd.Series) -> Optional[Dict[str, Any]]:
+            game_id_value = str(lineup_row.get("game_id", "")).strip()
+            team_value = normalize_team_abbr(lineup_row.get("team"))
+            position_value = normalize_position(lineup_row.get("position"))
+            if not game_id_value or not team_value or not position_value:
+                return None
+
+            name_key = lineup_row.get("__pname_key", "") or ""
+            if not name_key:
+                name_seed = " ".join(
+                    part
+                    for part in [
+                        str(lineup_row.get("first_name", "")).strip(),
+                        str(lineup_row.get("last_name", "")).strip(),
+                    ]
+                    if part
+                ) or str(lineup_row.get("player_name", "")).strip()
+                name_key = robust_player_name_key(name_seed)
+            if not name_key:
+                return None
+
+            template_pool = merged[
+                (merged["game_id"].astype(str) == game_id_value)
+                & (merged["team"] == team_value)
+            ]
+            if template_pool.empty:
+                template_pool = merged[merged["game_id"].astype(str) == game_id_value]
+            if template_pool.empty:
+                base_values = {col: np.nan for col in merged.columns}
+            else:
+                base_row = template_pool.iloc[0]
+                base_values = {col: base_row.get(col, np.nan) for col in merged.columns}
+
+            player_name_value = str(lineup_row.get("player_name", "")).strip()
+            if not player_name_value:
+                first = str(lineup_row.get("first_name", "")).strip()
+                last = str(lineup_row.get("last_name", "")).strip()
+                player_name_value = " ".join(part for part in [first, last] if part)
+
+            placeholder: Dict[str, Any] = dict(base_values)
+            placeholder["game_id"] = game_id_value
+            placeholder["team"] = team_value
+            if "opponent" in placeholder and pd.isna(placeholder["opponent"]):
+                opp_pool = merged[
+                    (merged["game_id"].astype(str) == game_id_value)
+                    & (merged["team"] != team_value)
+                ]
+                if not opp_pool.empty:
+                    placeholder["opponent"] = opp_pool.iloc[0].get("team")
+            placeholder["position"] = position_value
+            placeholder["player_name"] = player_name_value
+            if "player_name_norm" in placeholder:
+                placeholder["player_name_norm"] = normalize_player_name(
+                    player_name_value
+                )
+            placeholder["__pname_key"] = name_key
+
+            raw_player_id = lineup_row.get("player_id")
+            if isinstance(raw_player_id, str) and raw_player_id.strip():
+                player_id_value = raw_player_id.strip()
+            else:
+                player_id_value = f"lineup_{team_value}_{name_key}"
+            placeholder["player_id"] = player_id_value
+
+            depth_rank_value = parse_depth_rank(lineup_row.get("rank"))
+            placeholder["depth_rank"] = depth_rank_value
+            starter_flag = 1 if self._is_lineup_starter(position_value, depth_rank_value) else 0
+            placeholder["is_starter"] = starter_flag
+            placeholder["_lineup_hit"] = True
+
+            status_bucket = lineup_row.get("status_bucket")
+            practice_status = lineup_row.get("practice_status")
+            if status_bucket:
+                status_bucket = normalize_injury_status(status_bucket)
+                practice_status = normalize_practice_status(practice_status)
+            else:
+                status_bucket, practice_status = interpret_playing_probability(
+                    lineup_row.get("playing_probability")
+                )
+                status_bucket = normalize_injury_status(status_bucket)
+                practice_status = normalize_practice_status(practice_status)
+            placeholder["status_bucket"] = status_bucket
+            placeholder["practice_status"] = practice_status
+            if "injury_priority" in placeholder:
+                placeholder["injury_priority"] = INJURY_STATUS_PRIORITY.get(
+                    status_bucket, INJURY_STATUS_PRIORITY.get("other", 1)
+                )
+            if "practice_priority" in placeholder:
+                placeholder["practice_priority"] = PRACTICE_STATUS_PRIORITY.get(
+                    practice_status, PRACTICE_STATUS_PRIORITY.get("available", 1)
+                )
+
+            updated_at = lineup_row.get("updated_at")
+            if "updated_at" in placeholder:
+                placeholder["updated_at"] = updated_at
+            game_start_value = lineup_row.get("game_start")
+            if "game_start" in placeholder:
+                placeholder["game_start"] = game_start_value
+            if "first_name" in placeholder:
+                placeholder["first_name"] = lineup_row.get("first_name", "")
+            if "last_name" in placeholder:
+                placeholder["last_name"] = lineup_row.get("last_name", "")
+            if "source" in placeholder and not placeholder.get("source"):
+                placeholder["source"] = "msf-lineup"
+            if "is_projected_starter" in placeholder:
+                placeholder["is_projected_starter"] = True
+
+            return placeholder
+
+        if respect_lineups and not lineup_roster_full.empty:
+            normalized_lineup = lineup_roster_full.copy()
+            normalized_lineup["game_id"] = normalized_lineup["game_id"].astype(str)
+            normalized_lineup["team"] = normalized_lineup["team"].apply(normalize_team_abbr)
+            normalized_lineup["position"] = normalized_lineup["position"].apply(normalize_position)
+            if "__pname_key" not in normalized_lineup.columns:
+                normalized_lineup["__pname_key"] = normalized_lineup["player_name"].map(
+                    robust_player_name_key
+                )
+            normalized_lineup["__pname_key"] = normalized_lineup["__pname_key"].fillna("")
+            normalized_lineup = normalized_lineup[normalized_lineup["__pname_key"] != ""]
+
+            existing_lineup_keys: Set[Tuple[str, str, str, str]] = set(
+                zip(
+                    merged["game_id"].astype(str),
+                    merged["team"],
+                    merged["__pname_key"],
+                    merged["position"].apply(normalize_position),
+                )
+            )
+
+            placeholder_rows: List[Dict[str, Any]] = []
+            for _, lineup_row in normalized_lineup.iterrows():
+                key = (
+                    lineup_row.get("game_id", ""),
+                    lineup_row.get("team"),
+                    lineup_row.get("__pname_key", ""),
+                    normalize_position(lineup_row.get("position")),
+                )
+                if key in existing_lineup_keys:
+                    continue
+                placeholder = _build_placeholder_row(lineup_row)
+                if placeholder is None:
+                    continue
+                placeholder_rows.append(placeholder)
+                existing_lineup_keys.add(key)
+
+            if placeholder_rows:
+                placeholder_df = pd.DataFrame(placeholder_rows)
+                merged = safe_concat([merged, placeholder_df], ignore_index=True, sort=False)
+
+        merged["_lineup_hit"] = merged["depth_rank"].notna()
+
         if respect_lineups and not lineup_audit_frame.empty:
             self._audit_lineup_matches(lineup_audit_frame, player_df, merged)
 
