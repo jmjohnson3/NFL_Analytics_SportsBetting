@@ -1830,27 +1830,6 @@ class NFLDatabase:
         with self.engine.begin() as conn:
             conn.execute(self.depth_charts.delete().where(condition))
 
-    def fetch_game_roster(self, game_id: str) -> pd.DataFrame:
-        with self.engine.begin() as conn:
-            q = select(self.game_rosters).where(self.game_rosters.c.game_id == str(game_id))
-            rows = conn.execute(q).mappings().all()
-        if rows:
-            return pd.DataFrame(rows)
-        return pd.DataFrame(
-            columns=[
-                "game_id",
-                "team",
-                "player_id",
-                "player_name",
-                "position",
-                "depth_rank",
-                "is_starter",
-                "source",
-                "updated_at",
-                "ingested_at",
-            ]
-        )
-
     def fetch_existing_game_ids(self) -> set[str]:
         with self.engine.begin() as conn:
             rows = conn.execute(select(self.games.c.game_id)).fetchall()
@@ -5527,14 +5506,9 @@ class ModelTrainer:
                         lineup_export[col] = np.nan
                 roster_frames.append(lineup_export[needed_cols])
 
-        for gid in game_ids:
-            roster_frame = self.db.fetch_game_roster(gid)
-            if not roster_frame.empty:
-                roster_frames.append(roster_frame)
-
         if not roster_frames:
             logging.info(
-                "No roster rows found for %d games; leaving player pool unchanged",
+                "No lineup rows supplied for %d games; leaving player pool unchanged",
                 len(game_ids),
             )
             return player_df
