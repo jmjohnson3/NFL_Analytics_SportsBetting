@@ -5165,6 +5165,7 @@ class ModelTrainer:
         roster_frames: List[pd.DataFrame] = []
         allowed_lineup_keys: Set[Tuple[str, str, str, str]] = set()
         lineup_audit_frame = pd.DataFrame()
+        lineup_roster_full = pd.DataFrame()
 
         if lineup_df is not None and not lineup_df.empty:
             lineup_roster = lineup_df.copy()
@@ -5226,6 +5227,7 @@ class ModelTrainer:
                         )
                         if name
                     }
+                lineup_roster_full = lineup_roster.copy()
                 lineup_audit_frame = lineup_roster.copy()
                 lineup_export = lineup_roster.drop(columns=["__pname_key"], errors="ignore")
                 needed_cols = [
@@ -5282,6 +5284,58 @@ class ModelTrainer:
             player_df["position"] = ""
         player_df["__pname_key"] = _nname(player_df["player_name"])
 
+        if not lineup_roster_full.empty:
+            overrides = lineup_roster_full[
+                ["game_id", "team", "player_id", "__pname_key", "position"]
+            ].copy()
+            overrides["game_id"] = overrides["game_id"].astype(str)
+            overrides["team"] = overrides["team"].apply(normalize_team_abbr)
+            overrides["player_id"] = overrides["player_id"].fillna("").astype(str)
+            overrides["__pname_key"] = overrides["__pname_key"].fillna("")
+            overrides["position"] = overrides["position"].apply(normalize_position)
+
+            pid_override: Dict[Tuple[str, str], Tuple[str, str]] = {}
+            name_override: Dict[Tuple[str, str], Tuple[str, str]] = {}
+
+            for row in overrides.itertuples(index=False):
+                team_pos = (row.team, row.position)
+                if row.player_id:
+                    pid_override[(row.game_id, row.player_id)] = team_pos
+                if row.__pname_key:
+                    name_override[(row.game_id, row.__pname_key)] = team_pos
+
+            player_df["_gid"] = player_df["game_id"].astype(str)
+            player_df["_pid"] = player_df.get("player_id", "").fillna("").astype(str)
+
+            team_overrides: List[Optional[str]] = []
+            pos_overrides: List[Optional[str]] = []
+
+            name_keys = player_df["__pname_key"].fillna("")
+            for gid, pid, name_key in zip(player_df["_gid"], player_df["_pid"], name_keys):
+                override = pid_override.get((gid, pid)) if pid else None
+                if override is None and name_key:
+                    override = name_override.get((gid, name_key))
+                if override is None:
+                    team_overrides.append(None)
+                    pos_overrides.append(None)
+                else:
+                    team_overrides.append(override[0])
+                    pos_overrides.append(override[1])
+
+            team_overrides_series = pd.Series(team_overrides, index=player_df.index)
+            pos_overrides_series = pd.Series(pos_overrides, index=player_df.index)
+
+            team_mask = team_overrides_series.notna()
+            if team_mask.any():
+                player_df.loc[team_mask, "team"] = team_overrides_series[team_mask]
+
+            pos_mask = pos_overrides_series.notna()
+            if pos_mask.any():
+                player_df.loc[pos_mask, "position"] = pos_overrides_series[pos_mask]
+
+            player_df.drop(columns=["_gid", "_pid"], inplace=True)
+
+        player_df["team"] = player_df["team"].apply(normalize_team_abbr)
         roster = roster.copy()
         roster["player_id"] = roster["player_id"].fillna("").astype(str)
         roster["team"] = roster["team"].apply(normalize_team_abbr)
