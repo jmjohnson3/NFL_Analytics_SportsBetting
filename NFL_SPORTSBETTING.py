@@ -5297,12 +5297,20 @@ class ModelTrainer:
             pid_override: Dict[Tuple[str, str], Tuple[str, str]] = {}
             name_override: Dict[Tuple[str, str], Tuple[str, str]] = {}
 
-            for row in overrides.itertuples(index=False):
-                team_pos = (row.team, row.position)
-                if row.player_id:
-                    pid_override[(row.game_id, row.player_id)] = team_pos
-                if row.__pname_key:
-                    name_override[(row.game_id, row.__pname_key)] = team_pos
+            for _, row in overrides.iterrows():
+                team_pos = (row["team"], row["position"])
+
+                player_id_value = row.get("player_id", "")
+                if isinstance(player_id_value, str):
+                    player_id_value = player_id_value.strip()
+                if player_id_value:
+                    pid_override[(row["game_id"], player_id_value)] = team_pos
+
+                name_key_value = row.get("__pname_key", "")
+                if isinstance(name_key_value, str):
+                    name_key_value = name_key_value.strip()
+                if name_key_value:
+                    name_override[(row["game_id"], name_key_value)] = team_pos
 
             player_df["_gid"] = player_df["game_id"].astype(str)
             player_df["_pid"] = player_df.get("player_id", "").fillna("").astype(str)
@@ -5561,28 +5569,33 @@ class ModelTrainer:
             )
 
             reported: Set[Tuple[str, str, str]] = set()
-            for row in lineup.itertuples():
-                key = (row.game_id, row.team, row.__pname_key, row.position)
+            for _, row in lineup.iterrows():
+                game_id_value = str(row.get("game_id"))
+                team_value = row.get("team")
+                pname_key_value = row.get("__pname_key", "")
+                position_value = normalize_position(row.get("position", ""))
+
+                key = (game_id_value, team_value, pname_key_value, position_value)
                 if key in matched_keys:
                     continue
-                summary_key = (row.game_id, row.team, row.__pname_key)
+                summary_key = (game_id_value, team_value, pname_key_value)
                 if summary_key in reported:
                     continue
                 team_pool = players[
-                    (players["game_id"] == row.game_id)
-                    & (players["team"] == row.team)
+                    (players["game_id"] == game_id_value)
+                    & (players["team"] == team_value)
                 ]
                 reasons: List[str] = []
                 if team_pool.empty:
                     reasons.append("team missing in features")
                 else:
-                    name_pool = team_pool[team_pool["__pname_key"] == row.__pname_key]
+                    name_pool = team_pool[team_pool["__pname_key"] == pname_key_value]
                     if name_pool.empty:
                         reasons.append("not in latest_players")
                     else:
                         pos_pool = name_pool[
                             name_pool["position"].apply(normalize_position)
-                            == row.position
+                            == position_value
                         ]
                         if pos_pool.empty:
                             reasons.append("position mismatch")
@@ -5600,22 +5613,21 @@ class ModelTrainer:
                 if not reasons:
                     reasons.append("unmatched")
 
-                player_label = getattr(row, "player_name", "").strip() or (
-                    " ".join(
-                        part
-                        for part in [
-                            getattr(row, "first_name", ""),
-                            getattr(row, "last_name", ""),
-                        ]
-                        if part
-                    )
-                )
+                player_label = str(row.get("player_name", "")).strip()
+                if not player_label:
+                    first = str(row.get("first_name", "")).strip()
+                    last = str(row.get("last_name", "")).strip()
+                    player_label = " ".join(
+                        part for part in [first, last] if part
+                    ).strip()
+                player_label = player_label or pname_key_value or "(unknown)"
+
                 logging.warning(
                     "[%s %s %s-%s] %s: %s",
-                    row.game_id,
-                    row.team,
-                    row.position,
-                    getattr(row, "rank", ""),
+                    game_id_value,
+                    team_value,
+                    position_value,
+                    row.get("rank", ""),
                     player_label,
                     ", ".join(reasons),
                 )
