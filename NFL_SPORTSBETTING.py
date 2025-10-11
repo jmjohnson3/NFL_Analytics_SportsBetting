@@ -76,7 +76,6 @@ from sqlalchemy import (
     create_engine,
     func,
     inspect,
-    or_,
     select,
     text,
 )
@@ -1535,20 +1534,6 @@ class NFLDatabase:
         if "injury_summary" not in game_columns:
             statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS injury_summary TEXT")
 
-        if "nfl_game_rosters" in table_names:
-            try:
-                roster_columns = {col["name"] for col in inspector.get_columns("nfl_game_rosters")}
-            except Exception:
-                roster_columns = set()
-            for coldef in [
-                "ADD COLUMN IF NOT EXISTS depth_rank INTEGER",
-                "ADD COLUMN IF NOT EXISTS is_starter INTEGER",
-                "ADD COLUMN IF NOT EXISTS source TEXT",
-                "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ",
-                "ADD COLUMN IF NOT EXISTS ingested_at TIMESTAMPTZ",
-            ]:
-                statements.append(f"ALTER TABLE nfl_game_rosters {coldef}")
-
         if "nfl_depth_charts" in table_names:
             try:
                 depth_columns = {col["name"] for col in inspector.get_columns("nfl_depth_charts")}
@@ -1631,23 +1616,6 @@ class NFLDatabase:
             Column("snap_count", Float),
             Column("ingested_at", DateTime(timezone=True), default=default_now_utc),
             UniqueConstraint("game_id", "player_id", name="uq_player_game"),
-        )
-
-        # NEW: per-game roster derived from MSF lineup.json
-        self.game_rosters = Table(
-            "nfl_game_rosters",
-            self.meta,
-            Column("game_id", String, nullable=False),
-            Column("team", String, nullable=False),
-            Column("player_id", String),
-            Column("player_name", String, nullable=False),
-            Column("position", String, nullable=False),
-            Column("depth_rank", Integer),
-            Column("is_starter", Integer),
-            Column("source", String, nullable=False),
-            Column("updated_at", DateTime(timezone=True), default=default_now_utc),
-            Column("ingested_at", DateTime(timezone=True), default=default_now_utc),
-            UniqueConstraint("game_id", "team", "player_id", "player_name", name="uq_game_roster"),
         )
 
         self.team_unit_ratings = Table(
@@ -1789,46 +1757,6 @@ class NFLDatabase:
         except SQLAlchemyError:
             logging.exception("Failed to upsert rows into %s", table.name)
             raise
-
-    def upsert_game_rosters(self, rows: Iterable[Dict[str, Any]]) -> None:
-        self.upsert_rows(self.game_rosters, list(rows), ["game_id", "team", "player_id", "player_name"])
-
-    def delete_game_roster_entries(
-        self, game_id: Union[str, int], teams: Iterable[Optional[str]]
-    ) -> None:
-        normalized = {
-            normalize_team_abbr(team)
-            for team in teams
-            if team is not None and normalize_team_abbr(team)
-        }
-        if not normalized:
-            return
-        condition = and_(
-            self.game_rosters.c.game_id == str(game_id),
-            self.game_rosters.c.team.in_(sorted(normalized)),
-        )
-        with self.engine.begin() as conn:
-            conn.execute(self.game_rosters.delete().where(condition))
-
-    def delete_team_lineup_depth(self, teams: Iterable[Optional[str]]) -> None:
-        normalized = {
-            normalize_team_abbr(team)
-            for team in teams
-            if team is not None and normalize_team_abbr(team)
-        }
-        if not normalized:
-            return
-        source_filter = self.depth_charts.c.source.in_(("msf-lineup", "msf-team-lineup"))
-        depth_filter = or_(
-            self.depth_charts.c.depth_id.like("msf-lineup:%"),
-            self.depth_charts.c.depth_id.like("msf-team-lineup:%"),
-        )
-        condition = and_(
-            self.depth_charts.c.team.in_(sorted(normalized)),
-            or_(source_filter, depth_filter),
-        )
-        with self.engine.begin() as conn:
-            conn.execute(self.depth_charts.delete().where(condition))
 
     def fetch_existing_game_ids(self) -> set[str]:
         with self.engine.begin() as conn:
@@ -2069,7 +1997,6 @@ class NFLIngestor:
         lineup_cache: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
 
         injury_rows_all: List[Dict[str, Any]] = []
-        depth_rows_map: Dict[str, Dict[str, Any]] = {}
         advanced_rows_map: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
         lineup_depth_teams: Set[str] = set()
 
@@ -2124,10 +2051,6 @@ class NFLIngestor:
                 if injuries:
                     injury_rows_all.extend(injuries)
 
-                for team_code in filter(None, {home_team_abbr, away_team_abbr}):
-                    for depth_row in self.supplemental_loader.depth_chart_rows(team_code):
-                        depth_rows_map[depth_row["depth_id"]] = depth_row
-
                 lineup_rows = self._lineup_rows_from_msf(
                     start_time,
                     away_team_abbr,
@@ -2135,47 +2058,9 @@ class NFLIngestor:
                     self._msf_creds,
                     lineup_cache,
                 )
-                lineup_teams = {
-                    normalize_team_abbr(row.get("team"))
-                    for row in lineup_rows
-                    if row.get("team")
-                }
-                lineup_teams = {team for team in lineup_teams if team}
-                if lineup_teams:
-                    self.db.delete_game_roster_entries(game_id_str, lineup_teams)
-                    lineup_depth_teams.update(lineup_teams)
-                try:
-                    roster_rows = self._build_game_roster_rows(
-                        game_id_str,
-                        start_time,
-                        home_team_abbr,
-                        away_team_abbr,
-                        lineup_rows,
-                    )
-                    if roster_rows:
-                        self.db.upsert_game_rosters(roster_rows)
-                        starters = sum(1 for row in roster_rows if row.get("is_starter") == 1)
-                        logging.debug(
-                            "Game %s roster upserted (rows=%d, starters=%d)",
-                            game_id_str,
-                            len(roster_rows),
-                            starters,
-                        )
-                    else:
-                        logging.info(
-                            "No lineup roster rows for game %s (season=%s)",
-                            game_id_str,
-                            season,
-                        )
-                except Exception:
-                    logging.exception(
-                        "Failed building game roster rows for game %s",
-                        game_id_str,
-                    )
                 for lineup_row in lineup_rows:
                     if lineup_row.get("game_start") is None:
                         lineup_row["game_start"] = start_time
-                    depth_rows_map[lineup_row["depth_id"]] = lineup_row
 
                 week_value = schedule.get("week")
                 try:
@@ -2356,14 +2241,6 @@ class NFLIngestor:
 
         if injury_rows_all:
             self.db.upsert_rows(self.db.injury_reports, injury_rows_all, ["injury_id"])
-        if depth_rows_map:
-            if lineup_depth_teams:
-                self.db.delete_team_lineup_depth(lineup_depth_teams)
-            self.db.upsert_rows(
-                self.db.depth_charts,
-                list(depth_rows_map.values()),
-                ["depth_id"],
-            )
         if advanced_rows_map:
             self.db.upsert_rows(
                 self.db.team_advanced_metrics,
@@ -3068,146 +2945,6 @@ class NFLIngestor:
             return (rank or 99) == 1
         return False
 
-    def _build_game_roster_rows(
-        self,
-        game_id: str,
-        start_time: Optional[dt.datetime],
-        home_team_abbr: Optional[str],
-        away_team_abbr: Optional[str],
-        lineup_rows: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        if not lineup_rows:
-            return []
-
-        rows: List[Dict[str, Any]] = []
-        lineup_by_team: Dict[str, List[Dict[str, Any]]] = {}
-        mismatch_logged: Set[Tuple[str, str, str]] = set()
-        for record in lineup_rows:
-            team_code = normalize_team_abbr(record.get("team"))
-            if not team_code:
-                continue
-            lineup_by_team.setdefault(team_code, []).append(record)
-
-        for team in filter(None, {home_team_abbr, away_team_abbr}):
-            team_normalized = normalize_team_abbr(team)
-            if not team_normalized:
-                continue
-            team_entries = lineup_by_team.get(team_normalized, [])
-            if not team_entries:
-                continue
-
-            by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
-            for entry in team_entries:
-                pos = normalize_position(entry.get("position"))
-                if not self._skill_pos(pos):
-                    continue
-                lineup_player_team = normalize_team_abbr(entry.get("player_team"))
-                mismatch = (
-                    pos in {"QB", "RB", "WR", "TE"}
-                    and lineup_player_team
-                    and lineup_player_team != team_normalized
-                )
-                if mismatch:
-                    player_label = entry.get("player_name") or entry.get("player_id") or ""
-                    log_key = (team_normalized, lineup_player_team, player_label)
-                    if log_key not in mismatch_logged:
-                        logging.debug(
-                            "lineup: overriding team %s from payload team %s for player %s",
-                            team_normalized,
-                            lineup_player_team,
-                            player_label or "<unknown>",
-                        )
-                        mismatch_logged.add(log_key)
-                pid = (entry.get("player_id") or "").strip()
-                pname = (entry.get("player_name") or "").strip()
-                if not pname and not pid:
-                    continue
-                key = (pid or "", pname)
-                rank_val = entry.get("rank")
-                parsed_rank: Optional[int]
-                if isinstance(rank_val, (int, float)) and not math.isnan(rank_val):
-                    parsed_rank = int(rank_val)
-                else:
-                    parsed_rank = None
-                status_bucket = entry.get("status_bucket") or "other"
-                practice_status = normalize_practice_status(
-                    entry.get("practice_status")
-                )
-                current = by_key.get(key)
-                current_rank = current.get("rank") if current else None
-                current_status = current.get("status_bucket") if current else None
-                new_rank_val = parsed_rank or 999
-                current_rank_val = current_rank or 999
-                replace_entry = False
-                if current is None:
-                    replace_entry = True
-                elif new_rank_val < current_rank_val:
-                    replace_entry = True
-                elif new_rank_val == current_rank_val:
-                    current_inactive = current_status in INACTIVE_INJURY_BUCKETS if current_status else False
-                    new_inactive = status_bucket in INACTIVE_INJURY_BUCKETS
-                    if current_inactive and not new_inactive:
-                        replace_entry = True
-                    elif not current_inactive and new_inactive:
-                        replace_entry = False
-                    else:
-                        existing_ts = current.get("updated_at")
-                        new_ts = entry.get("updated_at")
-                        existing_dt = (
-                            existing_ts
-                            if isinstance(existing_ts, dt.datetime)
-                            else parse_dt(existing_ts)
-                        )
-                        new_dt = (
-                            new_ts if isinstance(new_ts, dt.datetime) else parse_dt(new_ts)
-                        )
-                        if new_dt and (not existing_dt or new_dt > existing_dt):
-                            replace_entry = True
-
-                if replace_entry:
-                    by_key[key] = {
-                        "player_id": pid,
-                        "player_name": pname,
-                        "position": pos,
-                        "rank": parsed_rank,
-                        "source": entry.get("source", "msf-lineup"),
-                        "updated_at": entry.get("updated_at"),
-                        "status_bucket": status_bucket,
-                        "practice_status": practice_status,
-                    }
-
-            now_utc = default_now_utc()
-            for info in by_key.values():
-                updated_at = info.get("updated_at")
-                if isinstance(updated_at, str):
-                    updated_at_dt = parse_dt(updated_at)
-                elif isinstance(updated_at, dt.datetime):
-                    updated_at_dt = updated_at
-                else:
-                    updated_at_dt = None
-                if updated_at_dt is None:
-                    updated_at_dt = now_utc
-                rows.append(
-                    {
-                        "game_id": str(game_id),
-                        "team": team_normalized,
-                        "player_id": info["player_id"],
-                        "player_name": info["player_name"],
-                        "position": info["position"],
-                        "depth_rank": info["rank"],
-                        "is_starter": 1
-                        if (
-                            self._is_starter_label(info["position"], info["rank"])
-                            and info.get("status_bucket") not in INACTIVE_INJURY_BUCKETS
-                        )
-                        else 0,
-                        "source": info.get("source", "msf-lineup"),
-                        "updated_at": updated_at_dt,
-                        "game_start": start_time,
-                    }
-                )
-        return rows
-
     def fetch_lineup_rows(
         self,
         start_time: Optional[Union[dt.datetime, str]],
@@ -3471,7 +3208,7 @@ class FeatureBuilder:
         player_stats = pd.read_sql_table("nfl_player_stats", self.engine)
         team_ratings = pd.read_sql_table("nfl_team_unit_ratings", self.engine)
         injuries = pd.read_sql_table("nfl_injury_reports", self.engine)
-        depth_charts = pd.read_sql_table("nfl_depth_charts", self.engine)
+        depth_charts = pd.DataFrame()
         advanced_metrics = pd.read_sql_table("nfl_team_advanced_metrics", self.engine)
 
         # Normalize column names to plain strings so downstream pipelines see
