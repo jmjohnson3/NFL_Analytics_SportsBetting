@@ -899,6 +899,21 @@ def ensure_lineup_players_in_latest(
     if "player_name_norm" not in working.columns:
         working["player_name_norm"] = working["player_name"].map(normalize_player_name)
 
+    if "depth_rank" not in working.columns:
+        working["depth_rank"] = np.nan
+    if "status_bucket" not in working.columns:
+        working["status_bucket"] = np.nan
+    if "practice_status" not in working.columns:
+        working["practice_status"] = np.nan
+    if "injury_priority" not in working.columns:
+        working["injury_priority"] = np.nan
+    if "practice_priority" not in working.columns:
+        working["practice_priority"] = np.nan
+    if "_lineup_entry" not in working.columns:
+        working["_lineup_entry"] = False
+    if "is_projected_starter" not in working.columns:
+        working["is_projected_starter"] = False
+
     if "__pname_key" not in working.columns:
         working["__pname_key"] = working["player_name"].map(robust_player_name_key)
     else:
@@ -1013,10 +1028,12 @@ def ensure_lineup_players_in_latest(
                 practice_status, PRACTICE_STATUS_PRIORITY.get("available", 1)
             )
 
-        if "_lineup_entry" in placeholder:
-            placeholder["_lineup_entry"] = True
+        placeholder["_lineup_entry"] = True
         if "source" in placeholder:
             placeholder["source"] = "msf-lineup"
+
+        if "is_projected_starter" in placeholder:
+            placeholder["is_projected_starter"] = True
 
         updated_at = lineup_row.get("updated_at")
         game_start = lineup_row.get("game_start")
