@@ -5222,19 +5222,7 @@ class ModelTrainer:
                 )
                 lineup_roster["source"] = "msf-lineup"
                 if respect_lineups:
-                    allowed_lineup_keys = {
-                        (str(gid), team, name, pos)
-                        for gid, team, name, pos, starter in zip(
-                            lineup_roster["game_id"],
-                            lineup_roster["team"],
-                            lineup_roster["__pname_key"],
-                            lineup_roster["position"],
-                            lineup_roster["is_starter"],
-                        )
-                        if starter == 1 and name
-                    }
-                else:
-                    allowed_lineup_keys = {
+                    allowed_lineup_keys_all = {
                         (str(gid), team, name, pos)
                         for gid, team, name, pos in zip(
                             lineup_roster["game_id"],
@@ -5244,6 +5232,35 @@ class ModelTrainer:
                         )
                         if name
                     }
+                    allowed_lineup_keys_starters = {
+                        key
+                        for key, starter in zip(
+                            zip(
+                                lineup_roster["game_id"],
+                                lineup_roster["team"],
+                                lineup_roster["__pname_key"],
+                                lineup_roster["position"],
+                            ),
+                            lineup_roster["is_starter"],
+                        )
+                        if starter == 1 and key[2]
+                    }
+                    allowed_lineup_keys_starters = {
+                        (str(gid), team, name, pos)
+                        for gid, team, name, pos in allowed_lineup_keys_starters
+                    }
+                else:
+                    allowed_lineup_keys_all = {
+                        (str(gid), team, name, pos)
+                        for gid, team, name, pos in zip(
+                            lineup_roster["game_id"],
+                            lineup_roster["team"],
+                            lineup_roster["__pname_key"],
+                            lineup_roster["position"],
+                        )
+                        if name
+                    }
+                    allowed_lineup_keys_starters = allowed_lineup_keys_all.copy()
                 lineup_roster_full = lineup_roster.copy()
                 lineup_audit_frame = lineup_roster.copy()
                 lineup_export = lineup_roster.drop(columns=["__pname_key"], errors="ignore")
@@ -5557,6 +5574,10 @@ class ModelTrainer:
             self._audit_lineup_matches(lineup_audit_frame, player_df, merged)
 
         candidate_pool = merged.copy()
+        initial_candidate_count = len(candidate_pool)
+
+        allowed_lineup_keys = locals().get("allowed_lineup_keys_all", set())
+        starter_lineup_keys = locals().get("allowed_lineup_keys_starters", set())
 
         if respect_lineups and allowed_lineup_keys:
             key_series = pd.Series(
@@ -5574,6 +5595,18 @@ class ModelTrainer:
                 ["K", "DEF"]
             )
             merged = merged[allowed_mask]
+        else:
+            key_series = pd.Series(
+                list(
+                    zip(
+                        merged["game_id"].astype(str),
+                        merged["team"],
+                        merged["__pname_key"],
+                        merged["position"].apply(normalize_position),
+                    )
+                ),
+                index=merged.index,
+            )
 
         merged["depth_rank"] = merged["depth_rank"].fillna(9).astype(int)
         merged["is_starter"] = merged["is_starter"].fillna(0).astype(int)
@@ -5581,23 +5614,21 @@ class ModelTrainer:
         merged_before_filter = merged.copy()
 
         if respect_lineups:
-            before = len(merged)
-            merged = merged[
-                (merged["is_starter"] == 1)
-                | (merged["position"].isin(["K", "DEF"]))
-            ]
+            matched_count = int(merged_before_filter["_lineup_hit"].sum())
             logging.info(
-                "Roster gate: %d → %d players after filtering to starters (matches=%d)",
-                before,
+                "Roster gate respected lineups: kept %d of %d players (matched=%d)",
                 len(merged),
-                int(merged_before_filter["_lineup_hit"].sum()),
+                initial_candidate_count,
+                matched_count,
             )
 
             required_counts: Dict[str, int] = {"QB": 1, "RB": 2, "WR": 3, "TE": 1}
             additions: List[pd.DataFrame] = []
+
+            starter_mask = key_series.isin(starter_lineup_keys) if starter_lineup_keys else pd.Series(False, index=merged.index)
             starter_groups = {
                 key: grp
-                for key, grp in merged.groupby(["game_id", "team"], sort=False)
+                for key, grp in merged.loc[starter_mask].groupby(["game_id", "team"], sort=False)
             }
 
             def _make_key(pid_value: Any, name_value: Any) -> Tuple[str, str]:
