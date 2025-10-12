@@ -5417,6 +5417,38 @@ class ModelTrainer:
             suffixes=("", "_r"),
         )
 
+        merged["game_id"] = merged["game_id"].astype(str)
+        merged["team"] = merged["team"].apply(normalize_team_abbr)
+        merged["position"] = merged["position"].apply(normalize_position)
+
+        numeric_columns: List[str] = [
+            col
+            for col in merged.columns
+            if pd.api.types.is_numeric_dtype(merged[col])
+            and col not in {"depth_rank", "is_starter", "_lineup_hit"}
+        ]
+
+        if numeric_columns:
+            game_team_pos_baseline = (
+                merged.groupby(["game_id", "team", "position"], dropna=False)[
+                    numeric_columns
+                ]
+                .mean()
+            )
+            team_pos_baseline = (
+                merged.groupby(["team", "position"], dropna=False)[numeric_columns]
+                .mean()
+            )
+            pos_baseline = (
+                merged.groupby(["position"], dropna=False)[numeric_columns].mean()
+            )
+            league_baseline = merged[numeric_columns].mean()
+        else:
+            game_team_pos_baseline = pd.DataFrame()
+            team_pos_baseline = pd.DataFrame()
+            pos_baseline = pd.DataFrame()
+            league_baseline = pd.Series(dtype=float)
+
         mask_missing = merged["depth_rank"].isna()
         if mask_missing.any():
             fallback = (
@@ -5432,6 +5464,17 @@ class ModelTrainer:
                 merged.loc[fallback.index, column] = fallback[column]
 
         merged["_lineup_hit"] = merged["depth_rank"].notna()
+
+        def _assign_numeric_defaults(
+            placeholder: Dict[str, Any], values: Optional[pd.Series]
+        ) -> None:
+            if values is None:
+                return
+            if not numeric_columns:
+                return
+            for column in numeric_columns:
+                if column in values and pd.notna(values[column]):
+                    placeholder[column] = values[column]
 
         def _build_placeholder_row(lineup_row: pd.Series) -> Optional[Dict[str, Any]]:
             game_id_value = str(lineup_row.get("game_id", "")).strip()
@@ -5462,9 +5505,52 @@ class ModelTrainer:
                 template_pool = merged[merged["game_id"].astype(str) == game_id_value]
             if template_pool.empty:
                 base_values = {col: np.nan for col in merged.columns}
+                numeric_defaults: Optional[pd.Series] = None
             else:
-                base_row = template_pool.iloc[0]
+                position_pool = template_pool[template_pool["position"] == position_value]
+                if position_pool.empty:
+                    position_pool = template_pool
+                base_row = position_pool.iloc[0]
                 base_values = {col: base_row.get(col, np.nan) for col in merged.columns}
+                if numeric_columns:
+                    numeric_defaults = position_pool[numeric_columns].mean()
+                else:
+                    numeric_defaults = None
+
+            if not numeric_columns:
+                numeric_defaults = None
+            else:
+                if (
+                    numeric_defaults is None
+                    or all(pd.isna(numeric_defaults.get(col, np.nan)) for col in numeric_columns)
+                ):
+                    try:
+                        numeric_defaults = game_team_pos_baseline.loc[
+                            (game_id_value, team_value, position_value)
+                        ]
+                    except KeyError:
+                        numeric_defaults = None
+                if (
+                    numeric_defaults is None
+                    or all(pd.isna(numeric_defaults.get(col, np.nan)) for col in numeric_columns)
+                ):
+                    try:
+                        numeric_defaults = team_pos_baseline.loc[(team_value, position_value)]
+                    except KeyError:
+                        numeric_defaults = None
+                if (
+                    numeric_defaults is None
+                    or all(pd.isna(numeric_defaults.get(col, np.nan)) for col in numeric_columns)
+                ):
+                    try:
+                        numeric_defaults = pos_baseline.loc[position_value]
+                    except KeyError:
+                        numeric_defaults = None
+                if (
+                    numeric_defaults is None
+                    or all(pd.isna(numeric_defaults.get(col, np.nan)) for col in numeric_columns)
+                ):
+                    numeric_defaults = league_baseline
 
             player_name_value = str(lineup_row.get("player_name", "")).strip()
             if not player_name_value:
@@ -5502,6 +5588,8 @@ class ModelTrainer:
             starter_flag = 1 if self._is_lineup_starter(position_value, depth_rank_value) else 0
             placeholder["is_starter"] = starter_flag
             placeholder["_lineup_hit"] = True
+
+            _assign_numeric_defaults(placeholder, numeric_defaults)
 
             status_bucket = lineup_row.get("status_bucket")
             practice_status = lineup_row.get("practice_status")
