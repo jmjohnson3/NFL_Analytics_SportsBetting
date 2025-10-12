@@ -721,13 +721,28 @@ def normalize_player_name(value: Any) -> str:
 def normalize_position(value: Any) -> str:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return ""
+
     text = str(value).upper().strip()
     if not text:
         return ""
+
+    # First try an exact alias match (e.g., HB -> RB).
     text = POSITION_ALIAS_MAP.get(text, text)
-    for prefix, canonical in POSITION_PREFIX_MAP.items():
-        if text.startswith(prefix):
-            return canonical
+
+    # Many feeds (including MSF lineups) encode positions with prefixes such as
+    # "Offense-WR-1" or "SpecialTeams-K-1".  Break the string into alpha-only
+    # tokens so we can match the meaningful portion (WR, QB, etc.).
+    tokens = [text]
+    tokens.extend(token for token in re.split(r"[^A-Z]", text) if token)
+
+    for token in tokens:
+        # Allow alias substitution on each token (e.g., SLOT -> WR).
+        if token in POSITION_ALIAS_MAP:
+            return POSITION_ALIAS_MAP[token]
+        for prefix, canonical in POSITION_PREFIX_MAP.items():
+            if token.startswith(prefix):
+                return canonical
+
     return text
 
 
