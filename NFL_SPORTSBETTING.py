@@ -27,6 +27,8 @@ import time
 import unicodedata
 import uuid
 from collections import defaultdict
+from types import SimpleNamespace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
@@ -61,8 +63,9 @@ from sklearn.metrics import (
     r2_score,
     roc_auc_score,
 )
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression, PoissonRegressor
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
-from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -116,6 +119,508 @@ def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
         # Avoid returning a view into the input DataFrame which could be mutated upstream
         return cleaned[0].copy()
     return pd.concat(cleaned, **kwargs)
+
+
+# === PATCH: Pricing, Calibration & Modeling Utilities ========================
+def fair_american(prob: float) -> int:
+    """Convert a fair probability to a fair American price."""
+    prob = float(np.clip(prob, 1e-6, 1 - 1e-6))
+    dec = 1.0 / prob
+    american = -100 * (dec - 1) if prob >= 0.5 else 100 * (dec - 1)
+    return int(np.round(american))
+
+
+def american_to_decimal(american: float) -> float:
+    return 1 + (100.0 / american if american > 0 else 100.0 / abs(american))
+
+
+def ev_of_bet(prob: float, american_odds: float, stake: float = 1.0) -> float:
+    """Expected value per unit stake against American odds."""
+    dec = american_to_decimal(american_odds)
+    payout = stake * (dec - 1.0)
+    return prob * payout - (1.0 - prob) * stake
+
+
+def kelly_fraction(prob: float, american_odds: float, max_frac: float = 0.05) -> float:
+    """Quarter Kelly on US odds; clamp to sane max."""
+    dec = american_to_decimal(american_odds)
+    b = dec - 1.0
+    p = float(np.clip(prob, 1e-6, 1 - 1e-6))
+    q = 1 - p
+    k = (b * p - q) / b
+    k = max(0.0, k) * 0.25
+    return float(min(k, max_frac))
+
+
+def expected_calibration_error(p: np.ndarray, y: np.ndarray, bins: int = 10) -> float:
+    edges = np.linspace(0, 1, bins + 1)
+    ece = 0.0
+    for i in range(bins):
+        mask = (p >= edges[i]) & (p < edges[i + 1])
+        if mask.sum() == 0:
+            continue
+        ece += mask.mean() * abs(y[mask].mean() - p[mask].mean())
+    return float(ece)
+
+
+def oof_isotonic(
+    model, X: pd.DataFrame, y: pd.Series, n_splits: int = 5
+) -> Tuple[IsotonicRegression, np.ndarray]:
+    """Produce out-of-fold probs and fit isotonic calibration on them."""
+    tss = TimeSeriesSplit(n_splits=n_splits)
+    oof_pred = np.zeros(len(y), dtype=float)
+    for train_idx, valid_idx in tss.split(X):
+        clone_model = clone(model)
+        clone_model.fit(X.iloc[train_idx], y.iloc[train_idx])
+        oof_pred[valid_idx] = clone_model.predict_proba(X.iloc[valid_idx])[:, 1]
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(oof_pred, y.values.astype(float))
+    return iso, oof_pred
+
+
+@dataclass
+class HurdleTDModel:
+    clf: Optional[CalibratedClassifierCV] = None
+    reg: Optional[HistGradientBoostingRegressor] = None
+
+    def fit(
+        self, X_train: pd.DataFrame, y_train: pd.Series, *, n_splits: int = 5
+    ) -> None:
+        y_bin = (y_train > 0).astype(int)
+        base_clf = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.06, max_iter=350)
+        self.clf = CalibratedClassifierCV(base_clf, method="isotonic", cv=n_splits)
+        self.clf.fit(X_train, y_bin)
+
+        pos_mask = y_train > 0
+        X_pos = X_train[pos_mask]
+        y_pos = y_train[pos_mask].astype(float)
+        if len(y_pos) < 50:
+            self.reg = None
+            logging.warning("HurdleTDModel: insufficient positives; using μ=1.0 fallback.")
+        else:
+            self.reg = HistGradientBoostingRegressor(
+                max_depth=3, learning_rate=0.06, max_iter=450, loss="poisson"
+            )
+            self.reg.fit(X_pos, y_pos)
+
+    def pr_anytime(self, X: pd.DataFrame) -> np.ndarray:
+        if self.clf is None:
+            return np.zeros(len(X))
+        return self.clf.predict_proba(X)[:, 1]
+
+    def conditional_mean(self, X: pd.DataFrame) -> np.ndarray:
+        if self.reg is None:
+            return np.full(len(X), 1.0)
+        return np.clip(self.reg.predict(X), 0.2, 3.0)
+
+    def predict_mean(self, X: pd.DataFrame) -> np.ndarray:
+        p_any = self.pr_anytime(X)
+        mu = self.conditional_mean(X)
+        return p_any * mu
+
+
+class QuantileYards:
+    def __init__(self, quantiles: Iterable[float] = (0.1, 0.5, 0.9)):
+        self.quantiles = tuple(quantiles)
+        self.models: Dict[float, GradientBoostingRegressor] = {}
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
+        X_values = np.asarray(X)
+        for quantile in self.quantiles:
+            reg = GradientBoostingRegressor(
+                loss="quantile",
+                alpha=float(quantile),
+                max_depth=3,
+                n_estimators=350,
+                learning_rate=0.05,
+            )
+            reg.fit(X_values, y)
+            self.models[quantile] = reg
+
+    def predict_quantiles(self, X: pd.DataFrame) -> Dict[float, np.ndarray]:
+        X_values = np.asarray(X)
+        return {q: model.predict(X_values) for q, model in self.models.items()}
+
+    @staticmethod
+    def prob_over(line: float, q_preds: Dict[float, np.ndarray]) -> np.ndarray:
+        q10, q50, q90 = q_preds[0.1], q_preds[0.5], q_preds[0.9]
+        p_le = np.where(
+            line <= q10,
+            0.10,
+            np.where(
+                line <= q50,
+                0.50
+                - 0.40
+                * (line - q10)
+                / np.clip(q50 - q10, 1e-3, None),
+                np.where(
+                    line <= q90,
+                    0.90
+                    - 0.40
+                    * (line - q50)
+                    / np.clip(q90 - q50, 1e-3, None),
+                    0.95,
+                ),
+            ),
+        )
+        return np.clip(1.0 - p_le, 0.01, 0.99)
+
+
+class TeamPoissonTotals:
+    def __init__(self, alpha: float = 1.0):
+        self.home = PoissonRegressor(alpha=alpha, max_iter=600)
+        self.away = PoissonRegressor(alpha=alpha, max_iter=600)
+
+    def fit(
+        self,
+        X_home: pd.DataFrame,
+        y_home: pd.Series,
+        X_away: pd.DataFrame,
+        y_away: pd.Series,
+    ) -> None:
+        self.home.fit(X_home, y_home)
+        self.away.fit(X_away, y_away)
+
+    def predict_lambda(
+        self, X_home: pd.DataFrame, X_away: pd.DataFrame
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        lambda_home = np.clip(self.home.predict(X_home), 0.1, 60)
+        lambda_away = np.clip(self.away.predict(X_away), 0.1, 60)
+        return lambda_home, lambda_away
+
+    @staticmethod
+    def prob_total_over(
+        lambda_home: np.ndarray,
+        lambda_away: np.ndarray,
+        total: float,
+        sims: int = 5000,
+        seed: Optional[int] = None,
+    ) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        probabilities: List[float] = []
+        for home_val, away_val in zip(lambda_home, lambda_away):
+            home_sims = rng.poisson(home_val, sims)
+            away_sims = rng.poisson(away_val, sims)
+            probabilities.append(float(np.mean((home_sims + away_sims) > total)))
+        return np.asarray(probabilities, dtype=float)
+
+
+def pick_best_odds(odds_df: pd.DataFrame, by_cols: Iterable[str], price_col: str) -> pd.DataFrame:
+    out = (
+        odds_df.sort_values(
+            by=list(by_cols) + [price_col],
+            ascending=[True] * len(list(by_cols)) + [False],
+        ).drop_duplicates(subset=list(by_cols), keep="first")
+    )
+    return out
+
+
+def confidence_bucket(ev: float, prob: float) -> str:
+    if ev >= 0.05 and prob >= 0.60:
+        return "A"
+    if ev >= 0.03 and prob >= 0.55:
+        return "B"
+    if ev >= 0.02 and prob >= 0.53:
+        return "C"
+    return "Pass"
+
+
+EV_MIN_PROPS = 0.025
+EV_MIN_TOTALS = 0.020
+EV_MIN_SIDES = 0.020
+CONF_ECE_MAX = 0.035
+
+
+def filter_ev(df: pd.DataFrame, min_ev: float) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    return df[df["ev"] >= min_ev].copy()
+
+
+def write_csv_safely(df: pd.DataFrame, path: str) -> None:
+    try:
+        if df is None or df.empty:
+            logging.info("No rows to write for %s", path)
+            return
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+        logging.info("Wrote %d rows -> %s", len(df), path)
+    except Exception:
+        logging.exception("Failed to write %s", path)
+
+
+def pick_allowed_positions(target: str) -> Optional[Set[str]]:
+    return TARGET_ALLOWED_POSITIONS.get(target)
+
+
+# =============================================================================
+
+
+def build_player_prop_candidates(
+    pred_df: pd.DataFrame, odds_df: pd.DataFrame
+) -> pd.DataFrame:
+    if pred_df.empty or odds_df.empty:
+        return pd.DataFrame()
+
+    key_cols = ["market", "player_id"]
+    if "line" in odds_df.columns:
+        key_cols.append("line")
+    odds_best = pick_best_odds(odds_df, by_cols=key_cols, price_col="american_odds")
+
+    merged = pred_df.merge(odds_best, on=["market", "player_id"], how="inner", suffixes=("", "_book"))
+    rows: List[Dict[str, Any]] = []
+    for _, row in merged.iterrows():
+        market = row["market"]
+        american = float(row.get("american_odds", np.nan))
+        if market in {"receiving_yards", "passing_yards", "receptions"}:
+            line = float(row.get("line", np.nan))
+            quantiles = {
+                0.1: np.array([float(row.get("q10", np.nan))]),
+                0.5: np.array([float(row.get("pred_median", np.nan))]),
+                0.9: np.array([float(row.get("q90", np.nan))]),
+            }
+            if np.isnan(line) or any(np.isnan(vals[0]) for vals in quantiles.values()):
+                continue
+            prob_over = float(QuantileYards.prob_over(line, quantiles)[0])
+            ev = ev_of_bet(prob_over, american)
+            rows.append(
+                {
+                    "market": market,
+                    "player_id": row.get("player_id"),
+                    "player": row.get("player_name"),
+                    "team": row.get("team"),
+                    "opp": row.get("opponent"),
+                    "side": "Over",
+                    "line": line,
+                    "fair_prob": prob_over,
+                    "fair_american": fair_american(prob_over),
+                    "best_american": american,
+                    "ev": ev,
+                    "kelly_quarter": kelly_fraction(prob_over, american),
+                }
+            )
+        elif market == "anytime_td":
+            prob_any = float(row.get("anytime_prob", np.nan))
+            if np.isnan(prob_any):
+                continue
+            ev = ev_of_bet(prob_any, american)
+            rows.append(
+                {
+                    "market": market,
+                    "player_id": row.get("player_id"),
+                    "player": row.get("player_name"),
+                    "team": row.get("team"),
+                    "opp": row.get("opponent"),
+                    "side": "Yes",
+                    "line": np.nan,
+                    "fair_prob": prob_any,
+                    "fair_american": fair_american(prob_any),
+                    "best_american": american,
+                    "ev": ev,
+                    "kelly_quarter": kelly_fraction(prob_any, american),
+                }
+            )
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result["confidence"] = [
+            confidence_bucket(ev, prob) for ev, prob in zip(result["ev"], result["fair_prob"])
+        ]
+        result = result.sort_values(["confidence", "ev"], ascending=[True, False])
+    return result
+
+
+def build_game_totals_candidates(
+    week_games_df: pd.DataFrame,
+    feats_home: pd.DataFrame,
+    feats_away: pd.DataFrame,
+    odds_df: pd.DataFrame,
+    tpois: TeamPoissonTotals,
+) -> pd.DataFrame:
+    if odds_df.empty or week_games_df.empty:
+        return pd.DataFrame()
+    offers = odds_df.query("market == 'total'").copy()
+    if offers.empty:
+        return pd.DataFrame()
+
+    lam_home, lam_away = tpois.predict_lambda(feats_home, feats_away)
+    model_total = lam_home + lam_away
+    rows: List[Dict[str, Any]] = []
+    for idx, game in week_games_df.reset_index(drop=True).iterrows():
+        gid = game.get("game_id")
+        offers_game = offers[offers["game_id"] == gid]
+        if offers_game.empty:
+            continue
+        for _, offer in offers_game.iterrows():
+            side = offer.get("side")
+            line = float(offer.get("total", np.nan))
+            american = float(offer.get("american_odds", np.nan))
+            prob_over = float(
+                TeamPoissonTotals.prob_total_over(
+                    np.array([lam_home[idx]]), np.array([lam_away[idx]]), line
+                )[0]
+            )
+            prob = prob_over if str(side).lower() == "over" else 1.0 - prob_over
+            ev_val = ev_of_bet(prob, american)
+            rows.append(
+                {
+                    "market": "total",
+                    "game_id": gid,
+                    "away": game.get("away_team"),
+                    "home": game.get("home_team"),
+                    "side": side,
+                    "line": line,
+                    "fair_prob": prob,
+                    "fair_american": fair_american(prob),
+                    "best_american": american,
+                    "ev": ev_val,
+                    "kelly_quarter": kelly_fraction(prob, american),
+                    "model_total": float(model_total[idx]),
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["confidence"] = [
+            confidence_bucket(ev, prob) for ev, prob in zip(out["ev"], out["fair_prob"])
+        ]
+        out = out.sort_values(["confidence", "ev"], ascending=[True, False])
+    return out
+
+
+def emit_priced_picks(
+    week_key: str,
+    player_pred_tables: Dict[str, pd.DataFrame],
+    odds_players: pd.DataFrame,
+    week_games_df: pd.DataFrame,
+    feats_home: pd.DataFrame,
+    feats_away: pd.DataFrame,
+    odds_games: pd.DataFrame,
+    tpois: Optional[TeamPoissonTotals],
+    out_dir: Path,
+) -> Dict[str, pd.DataFrame]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    stacked = []
+    for market, table in player_pred_tables.items():
+        if table is None or table.empty:
+            continue
+        table = table.copy()
+        table["market"] = market
+        stacked.append(table)
+    preds_all = pd.concat(stacked, ignore_index=True) if stacked else pd.DataFrame()
+
+    props_priced = build_player_prop_candidates(preds_all, odds_players) if not preds_all.empty else pd.DataFrame()
+    props_filtered = filter_ev(props_priced, EV_MIN_PROPS)
+    write_csv_safely(props_filtered, str(out_dir / f"player_props_priced_{week_key}.csv"))
+
+    totals_priced = pd.DataFrame()
+    if tpois is not None and not feats_home.empty and not odds_games.empty:
+        totals_priced = build_game_totals_candidates(
+            week_games_df=week_games_df,
+            feats_home=feats_home,
+            feats_away=feats_away,
+            odds_df=odds_games,
+            tpois=tpois,
+        )
+        totals_filtered = filter_ev(totals_priced, EV_MIN_TOTALS)
+        write_csv_safely(totals_filtered, str(out_dir / f"game_totals_priced_{week_key}.csv"))
+    else:
+        totals_filtered = pd.DataFrame()
+
+    try:
+        if props_filtered is not None and not props_filtered.empty:
+            logging.info(
+                "Top player props:\n%s",
+                props_filtered.sort_values("ev", ascending=False)
+                .head(12)[
+                    [
+                        "market",
+                        "player",
+                        "team",
+                        "opp",
+                        "side",
+                        "line",
+                        "best_american",
+                        "fair_american",
+                        "ev",
+                        "confidence",
+                        "kelly_quarter",
+                    ]
+                ]
+                .to_string(index=False),
+            )
+        if totals_filtered is not None and not totals_filtered.empty:
+            logging.info(
+                "Top totals:\n%s",
+                totals_filtered.sort_values("ev", ascending=False)
+                .head(8)[
+                    [
+                        "away",
+                        "home",
+                        "side",
+                        "line",
+                        "best_american",
+                        "fair_american",
+                        "ev",
+                        "model_total",
+                        "kelly_quarter",
+                        "confidence",
+                    ]
+                ]
+                .to_string(index=False),
+            )
+    except Exception:
+        logging.debug("Failed to print priced pick summary", exc_info=True)
+
+    return {
+        "props": props_filtered if props_filtered is not None else pd.DataFrame(),
+        "totals": totals_filtered if totals_filtered is not None else pd.DataFrame(),
+    }
+
+
+def make_quantile_pred_table(
+    qmodel: QuantileYards,
+    preprocessor: ColumnTransformer,
+    X_week: pd.DataFrame,
+    player_index: pd.DataFrame,
+    market_name: str,
+) -> pd.DataFrame:
+    if X_week.empty:
+        return pd.DataFrame()
+    feature_names = list(preprocessor.get_feature_names_out())
+    processed = pd.DataFrame(
+        preprocessor.transform(X_week),
+        columns=feature_names,
+        index=X_week.index,
+    )
+    preds = qmodel.predict_quantiles(processed)
+    output = player_index.copy()
+    output["q10"] = preds[0.1]
+    output["pred_median"] = preds[0.5]
+    output["q90"] = preds[0.9]
+    output["market"] = market_name
+    return output
+
+
+def make_anytime_td_table(
+    hmodel: HurdleTDModel,
+    preprocessor: ColumnTransformer,
+    X_week: pd.DataFrame,
+    player_index: pd.DataFrame,
+) -> pd.DataFrame:
+    if X_week.empty:
+        return pd.DataFrame()
+    feature_names = list(preprocessor.get_feature_names_out())
+    processed = pd.DataFrame(
+        preprocessor.transform(X_week),
+        columns=feature_names,
+        index=X_week.index,
+    )
+    output = player_index.copy()
+    output["anytime_prob"] = hmodel.pr_anytime(processed)
+    output["market"] = "anytime_td"
+    return output
 
 
 def compute_recency_usage_weights(frame: pd.DataFrame) -> pd.Series:
@@ -5356,6 +5861,7 @@ class ModelTrainer:
         self.model_uncertainty: Dict[str, Dict[str, float]] = {}
         self.target_priors: Dict[str, Dict[str, Any]] = {}
         self.prior_engines: Dict[str, Optional[Dict[str, Any]]] = {}
+        self.special_models: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _is_lineup_starter(position: str, rank: Optional[int]) -> bool:
@@ -5649,8 +6155,8 @@ class ModelTrainer:
                 return pd.Series(result)
 
             baseline = (
-                frame.groupby(group_cols, dropna=False)
-                .apply(_agg)
+                frame.groupby(group_cols, dropna=False, group_keys=False)
+                .apply(_agg, include_groups=False)
                 .sort_index()
             )
             baseline.index = baseline.index.set_names(group_cols)
@@ -6893,6 +7399,126 @@ class ModelTrainer:
             final_fit_params = {
                 "regressor__sample_weight": final_weights_array,
             }
+
+        supplemental_model: Dict[str, Any] = {}
+        wants_quantile = target in {"passing_yards", "receiving_yards", "receptions"}
+        wants_hurdle = target in {"receiving_tds", "rushing_tds"}
+        if wants_quantile or wants_hurdle:
+            try:
+                supplemental_preprocessor = clone(preprocessor_template)
+                supplemental_preprocessor.fit(final_features)
+
+                transformed_final = supplemental_preprocessor.transform(final_features)
+                if hasattr(transformed_final, "toarray"):
+                    transformed_final = transformed_final.toarray()
+
+                try:
+                    feature_names_out = list(
+                        supplemental_preprocessor.get_feature_names_out()
+                    )
+                except Exception:
+                    feature_names_out = []
+
+                if not feature_names_out or len(feature_names_out) != transformed_final.shape[1]:
+                    logging.debug(
+                        "Supplemental preprocessor feature name mismatch for %s: "
+                        "expected %d, got %d; regenerating generic names.",
+                        target,
+                        transformed_final.shape[1],
+                        len(feature_names_out),
+                    )
+                    feature_names_out = [
+                        f"feature_{i}"
+                        for i in range(transformed_final.shape[1])
+                    ]
+
+                processed_final = pd.DataFrame(
+                    transformed_final,
+                    columns=feature_names_out,
+                    index=final_features.index,
+                )
+                processed_holdout: Optional[pd.DataFrame] = None
+                if not X_test_actual.empty:
+                    transformed_holdout = supplemental_preprocessor.transform(X_test_actual)
+                    if hasattr(transformed_holdout, "toarray"):
+                        transformed_holdout = transformed_holdout.toarray()
+                    processed_holdout = pd.DataFrame(
+                        transformed_holdout,
+                        columns=feature_names_out,
+                        index=X_test_actual.index,
+                    )
+
+                if wants_hurdle:
+                    hurdle = HurdleTDModel()
+                    splits = min(5, max(2, len(processed_final) // 20 or 2))
+                    hurdle.fit(processed_final, final_target, n_splits=splits)
+                    supplemental_model = {
+                        "type": "hurdle",
+                        "model": hurdle,
+                        "preprocessor": supplemental_preprocessor,
+                        "feature_columns": list(feature_columns),
+                        "feature_names": feature_names_out,
+                        "allowed_positions": pick_allowed_positions(target),
+                    }
+                    if processed_holdout is not None:
+                        try:
+                            y_bin = (y_test_actual > 0).astype(int)
+                            probs_any = hurdle.pr_anytime(processed_holdout)
+                            brier = brier_score_loss(y_bin, probs_any)
+                            ll = log_loss(y_bin, np.c_[1 - probs_any, probs_any], labels=[0, 1])
+                            logging.info(
+                                "%s hurdle eval | brier=%.3f logloss=%.3f",
+                                target,
+                                brier,
+                                ll,
+                            )
+                            supplemental_model["holdout"] = {"brier": brier, "log_loss": ll}
+                        except Exception as exc:
+                            logging.warning(
+                                "Calibration eval failed for %s hurdle model: %s",
+                                target,
+                                exc,
+                            )
+
+                if wants_quantile:
+                    quantile_model = QuantileYards(quantiles=(0.1, 0.5, 0.9))
+                    quantile_model.fit(processed_final, final_target)
+                    supplemental_model = {
+                        "type": "quantile",
+                        "model": quantile_model,
+                        "preprocessor": supplemental_preprocessor,
+                        "feature_columns": list(feature_columns),
+                        "feature_names": feature_names_out,
+                        "allowed_positions": pick_allowed_positions(target),
+                    }
+                    if processed_holdout is not None:
+                        try:
+                            qpreds = quantile_model.predict_quantiles(processed_holdout)
+                            mae_q = mean_absolute_error(y_test_actual, qpreds[0.5])
+                            rmse_q = mean_squared_error(
+                                y_test_actual,
+                                qpreds[0.5],
+                                squared=False,
+                            )
+                            logging.info(
+                                "%s quantile holdout | MAE=%.3f RMSE=%.3f",
+                                target,
+                                mae_q,
+                                rmse_q,
+                            )
+                            supplemental_model["holdout"] = {"mae": mae_q, "rmse": rmse_q}
+                        except Exception as exc:
+                            logging.warning(
+                                "Quantile evaluation failed for %s: %s",
+                                target,
+                                exc,
+                            )
+            except Exception:
+                logging.exception("Failed to build supplemental model for %s", target)
+
+        if supplemental_model:
+            self.special_models[target] = supplemental_model
+
         ensemble.fit(final_features, final_target, **final_fit_params)
         setattr(ensemble, "feature_columns", feature_columns)
         setattr(ensemble, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target))
@@ -7299,6 +7925,80 @@ class ModelTrainer:
             away_mae,
             away_rmse,
         )
+
+        # Supplemental Poisson totals model for pricing
+        try:
+            poisson_pre = clone(preprocessor)
+            poisson_pre.fit(sorted_df[feature_columns])
+
+            transformed_train = poisson_pre.transform(X_train)
+            transformed_test = poisson_pre.transform(X_test)
+            transformed_full = poisson_pre.transform(sorted_df[feature_columns])
+
+            if hasattr(transformed_train, "toarray"):
+                transformed_train = transformed_train.toarray()
+            if hasattr(transformed_test, "toarray"):
+                transformed_test = transformed_test.toarray()
+            if hasattr(transformed_full, "toarray"):
+                transformed_full = transformed_full.toarray()
+
+            try:
+                feature_names_out = list(poisson_pre.get_feature_names_out())
+            except Exception:
+                feature_names_out = []
+
+            expected_cols = transformed_train.shape[1]
+            if not feature_names_out or len(feature_names_out) != expected_cols:
+                logging.debug(
+                    "Poisson preprocessor feature name mismatch: expected %d, got %d; "
+                    "using generic feature names.",
+                    expected_cols,
+                    len(feature_names_out),
+                )
+                feature_names_out = [f"feature_{i}" for i in range(expected_cols)]
+
+            train_processed = pd.DataFrame(
+                transformed_train,
+                columns=feature_names_out,
+                index=X_train.index,
+            )
+            test_processed = pd.DataFrame(
+                transformed_test,
+                columns=feature_names_out,
+                index=X_test.index,
+            )
+            full_processed = pd.DataFrame(
+                transformed_full,
+                columns=feature_names_out,
+                index=sorted_df.index,
+            )
+
+            poisson_model = TeamPoissonTotals(alpha=1.0)
+            poisson_model.fit(train_processed, y_home_train, train_processed, y_away_train)
+            lam_home, lam_away = poisson_model.predict_lambda(test_processed, test_processed)
+            rmse_home_pois = mean_squared_error(y_home_test, lam_home, squared=False)
+            rmse_away_pois = mean_squared_error(y_away_test, lam_away, squared=False)
+            logging.info(
+                "Poisson team totals holdout | Home RMSE=%.2f Away RMSE=%.2f",
+                rmse_home_pois,
+                rmse_away_pois,
+            )
+
+            poisson_model.fit(
+                full_processed,
+                sorted_df["home_score"],
+                full_processed,
+                sorted_df["away_score"],
+            )
+            self.special_models["team_poisson"] = {
+                "type": "poisson",
+                "model": poisson_model,
+                "preprocessor": poisson_pre,
+                "feature_columns": list(feature_columns),
+                "feature_names": feature_names_out,
+            }
+        except Exception:
+            logging.exception("Failed to fit Poisson totals model", exc_info=True)
 
         self.db.record_backtest_metrics(
             self.run_id,
@@ -7766,6 +8466,163 @@ def predict_upcoming_games(
             + player_predictions["pred_passing_tds"].fillna(0)
         )
 
+    priced_results: Dict[str, pd.DataFrame] = {}
+    if trainer is not None and player_features is not None:
+        specials = getattr(trainer, "special_models", {}) or {}
+        player_pred_tables: Dict[str, pd.DataFrame] = {}
+
+        def _build_player_index(frame: pd.DataFrame) -> pd.DataFrame:
+            cols = [
+                col
+                for col in ["player_id", "player_name", "team", "opponent", "position"]
+                if col in frame.columns
+            ]
+            return frame[cols].copy()
+
+        for target in ("receiving_yards", "receptions", "passing_yards"):
+            info = specials.get(target)
+            if not info or info.get("type") != "quantile":
+                continue
+            allowed = info.get("allowed_positions")
+            mask = (
+                player_features["position"].isin(allowed)
+                if allowed and "position" in player_features.columns
+                else pd.Series(True, index=player_features.index)
+            )
+            subset = player_features.loc[mask].copy()
+            if subset.empty:
+                continue
+            features_subset = _ensure_model_features(
+                subset, SimpleNamespace(feature_columns=info.get("feature_columns", []))
+            )
+            player_index = _build_player_index(subset)
+            table = make_quantile_pred_table(
+                info["model"],
+                info["preprocessor"],
+                features_subset,
+                player_index,
+                target,
+            )
+            if not table.empty:
+                player_pred_tables[target] = table
+
+        anytime_table = pd.DataFrame()
+        for target in ("receiving_tds", "rushing_tds"):
+            info = specials.get(target)
+            if not info or info.get("type") != "hurdle":
+                continue
+            allowed = info.get("allowed_positions")
+            mask = (
+                player_features["position"].isin(allowed)
+                if allowed and "position" in player_features.columns
+                else pd.Series(True, index=player_features.index)
+            )
+            subset = player_features.loc[mask].copy()
+            if subset.empty:
+                continue
+            features_subset = _ensure_model_features(
+                subset, SimpleNamespace(feature_columns=info.get("feature_columns", []))
+            )
+            player_index = _build_player_index(subset)
+            table = make_anytime_td_table(
+                info["model"],
+                info["preprocessor"],
+                features_subset,
+                player_index,
+            )
+            if table.empty:
+                continue
+            if anytime_table.empty:
+                anytime_table = table
+            else:
+                key_cols = [col for col in ["player_id", "team", "opponent"] if col in table.columns]
+                merged = anytime_table.merge(
+                    table,
+                    on=key_cols,
+                    how="outer",
+                    suffixes=("_a", "_b"),
+                )
+                merged["anytime_prob"] = merged[["anytime_prob_a", "anytime_prob_b"]].mean(axis=1)
+                anytime_table = merged.drop(columns=["anytime_prob_a", "anytime_prob_b"], errors="ignore")
+        if not anytime_table.empty:
+            player_pred_tables["anytime_td"] = anytime_table
+
+        poisson_info = specials.get("team_poisson")
+        feats_home = pd.DataFrame()
+        feats_away = pd.DataFrame()
+        if poisson_info and not game_features.empty:
+            base_features = _ensure_model_features(
+                game_features,
+                SimpleNamespace(feature_columns=poisson_info.get("feature_columns", [])),
+            )
+            processed = pd.DataFrame(
+                poisson_info["preprocessor"].transform(base_features),
+                columns=poisson_info.get("feature_names", []),
+                index=base_features.index,
+            )
+            feats_home = processed.copy()
+            feats_away = processed.copy()
+
+        if player_pred_tables or not feats_home.empty:
+            start_min = upcoming["start_time"].min()
+            start_max = upcoming["start_time"].max()
+            if pd.isna(start_min) or pd.isna(start_max):
+                week_key = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
+            else:
+                start_min_ts = pd.to_datetime(start_min)
+                start_max_ts = pd.to_datetime(start_max)
+                if start_min_ts.tzinfo is None:
+                    start_min_ts = start_min_ts.tz_localize(dt.timezone.utc)
+                else:
+                    start_min_ts = start_min_ts.tz_convert(dt.timezone.utc)
+                if start_max_ts.tzinfo is None:
+                    start_max_ts = start_max_ts.tz_localize(dt.timezone.utc)
+                else:
+                    start_max_ts = start_max_ts.tz_convert(dt.timezone.utc)
+                start_min = start_min_ts.tz_localize(None)
+                start_max = start_max_ts.tz_localize(None)
+                week_key = f"{start_min.strftime('%Y%m%d')}_{start_max.strftime('%Y%m%d')}"
+
+            odds_players_df = pd.DataFrame(
+                columns=[
+                    "market",
+                    "player_id",
+                    "player_name",
+                    "team",
+                    "opponent",
+                    "line",
+                    "american_odds",
+                    "sportsbook",
+                    "event_id",
+                ]
+            )
+            odds_games_df = pd.DataFrame(
+                columns=[
+                    "market",
+                    "game_id",
+                    "away_team",
+                    "home_team",
+                    "side",
+                    "total",
+                    "american_odds",
+                    "sportsbook",
+                    "event_id",
+                ]
+            )
+
+            out_dir = Path("pricing_outputs")
+            priced_results = emit_priced_picks(
+                week_key=week_key,
+                player_pred_tables=player_pred_tables,
+                odds_players=odds_players_df,
+                week_games_df=upcoming[["game_id", "away_team", "home_team"]].copy(),
+                feats_home=feats_home,
+                feats_away=feats_away,
+                odds_games=odds_games_df,
+                tpois=(poisson_info or {}).get("model") if poisson_info else None,
+                out_dir=out_dir,
+            )
+
     # Reporting output
     def _format_table(headers: Sequence[str], rows: Sequence[Sequence[str]], aligns=None) -> List[str]:
         if aligns is None:
@@ -7948,7 +8805,10 @@ def predict_upcoming_games(
         output_path.write_text(json.dumps(output_payload, indent=2))
         logging.info("Saved prediction summary to %s", output_path)
 
-    return {"games": scoreboard, "players": player_predictions}
+    result_payload = {"games": scoreboard, "players": player_predictions}
+    if priced_results:
+        result_payload["priced"] = priced_results
+    return result_payload
 
 
 # ---------------------------------------------------------------------------
