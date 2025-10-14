@@ -6407,6 +6407,17 @@ class ModelTrainer:
                     )
 
         for idx, (row_idx, row) in enumerate(features.iterrows()):
+            confidence = (
+                float(usage_conf.loc[row_idx]) if row_idx in usage_conf.index else 0.5
+            )
+            placeholder_flag = (
+                bool(is_placeholder.loc[row_idx]) if row_idx in is_placeholder.index else False
+            )
+
+            # Skip calibration when we already have a confident, data-backed projection.
+            if not placeholder_flag and confidence >= 0.6:
+                continue
+
             prior_mean, prior_weight = self._resolve_prior(
                 target,
                 row.get("team"),
@@ -6438,19 +6449,21 @@ class ModelTrainer:
                 if np.isnan(combined_mean):
                     continue
 
-            confidence = float(usage_conf.loc[row_idx]) if row_idx in usage_conf.index else 0.5
-            placeholder_flag = (
-                bool(is_placeholder.loc[row_idx]) if row_idx in is_placeholder.index else False
-            )
+            prior_strength = 0.0
+            if combined_weight > 0:
+                prior_strength = combined_weight / (combined_weight + 25.0)
 
-            usage_penalty = 1.0 - confidence
+            mix_strength = max(prior_strength, neighbor_conf)
+
             if placeholder_flag:
-                usage_penalty = max(usage_penalty, 0.6)
+                base_alpha = max(0.35, 1.0 - confidence) * mix_strength
+                alpha = np.clip(base_alpha, 0.0, 0.45)
             else:
-                usage_penalty = max(usage_penalty * 0.5, 0.15)
+                base_alpha = (1.0 - confidence) * mix_strength
+                alpha = np.clip(base_alpha, 0.0, 0.25)
 
-            support = max(combined_weight, 0.0)
-            alpha = np.clip(usage_penalty * (support / (support + 25.0)), 0.0, 0.9)
+            if alpha <= 0:
+                continue
 
             current_pred = preds[idx]
             if np.isnan(current_pred) or np.isinf(current_pred):
