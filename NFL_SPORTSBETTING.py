@@ -37,6 +37,7 @@ import requests
 from requests import HTTPError
 from requests.auth import HTTPBasicAuth
 from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
+from sklearn import set_config
 from sklearn.base import clone
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
@@ -75,6 +76,7 @@ from sqlalchemy import (
     String,
     Table,
     UniqueConstraint,
+    and_,
     create_engine,
     func,
     inspect,
@@ -2122,6 +2124,7 @@ class NFLIngestor:
 
         injury_rows_all: List[Dict[str, Any]] = []
         advanced_rows_map: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+        lineup_depth_teams: Set[str] = set()
 
         for season in seasons:
             games = self.msf_client.fetch_games(season)
