@@ -26,6 +26,7 @@ import re
 import time
 import unicodedata
 import uuid
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
@@ -56,6 +57,7 @@ from sklearn.metrics import (
     log_loss,
     mean_absolute_error,
     mean_squared_error,
+    r2_score,
     roc_auc_score,
 )
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
@@ -110,6 +112,92 @@ def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
         # Avoid returning a view into the input DataFrame which could be mutated upstream
         return cleaned[0].copy()
     return pd.concat(cleaned, **kwargs)
+
+
+def compute_recency_usage_weights(frame: pd.DataFrame) -> pd.Series:
+    """Compute recency- and usage-based weights for player rows."""
+
+    if frame is None or frame.empty:
+        return pd.Series(dtype=float, index=getattr(frame, "index", None))
+
+    recency_cols = [
+        "start_time",
+        "local_start_time",
+        "game_datetime",
+        "game_date",
+        "kickoff",
+    ]
+    recency_weight = pd.Series(1.0, index=frame.index, dtype=float)
+    found_time = False
+    for col in recency_cols:
+        if col in frame.columns:
+            candidate = pd.to_datetime(frame[col], errors="coerce")
+            if candidate.notna().any():
+                latest = candidate.max()
+                age_days = (latest - candidate).dt.total_seconds() / 86400.0
+                age_days = age_days.fillna(age_days.max() or 0.0)
+                halflife_days = 21.0
+                recency_weight = np.exp(-age_days / halflife_days)
+                found_time = True
+                break
+    if not found_time and {"season", "week"}.issubset(frame.columns):
+        season_vals = pd.to_numeric(frame["season"], errors="coerce").fillna(0)
+        week_vals = pd.to_numeric(frame["week"], errors="coerce").fillna(0)
+        order = season_vals * 32 + week_vals
+        max_order = float(order.max())
+        min_order = float(order.min())
+        span = max(max_order - min_order, 1.0)
+        age_weeks = (max_order - order) / span
+        recency_weight = np.exp(-age_weeks * 0.75)
+
+    if recency_weight.max() > 0:
+        recency_weight = recency_weight / recency_weight.max()
+    else:
+        recency_weight = pd.Series(1.0, index=frame.index, dtype=float)
+
+    usage_weights = {
+        "snap_count": 1.2,
+        "season_snap_count": 0.6,
+        "receiving_targets": 1.5,
+        "season_receiving_targets": 0.9,
+        "rushing_attempts": 1.0,
+        "season_rushing_attempts": 0.6,
+        "routes_run": 1.2,
+        "season_routes_run": 0.7,
+        "touches": 1.2,
+        "season_touches": 0.7,
+        "fantasy_points": 0.5,
+        "season_fantasy_points": 0.3,
+    }
+    usage_scores = pd.Series(0.0, index=frame.index, dtype=float)
+    for col, weight in usage_weights.items():
+        if col in frame.columns:
+            usage_scores = usage_scores + frame[col].fillna(0).astype(float) * weight
+
+    if usage_scores.max() > 0:
+        usage_scores = usage_scores / usage_scores.max()
+    else:
+        usage_scores = pd.Series(0.0, index=frame.index, dtype=float)
+
+    if {"team", "position"}.issubset(frame.columns):
+        team_keys = (
+            frame["team"].fillna("").astype(str)
+            + "|"
+            + frame["position"].fillna("").astype(str)
+        )
+        group_max = usage_scores.groupby(team_keys).transform(
+            lambda s: max(float(s.max()), 1.0)
+        )
+        usage_share = usage_scores / group_max
+    else:
+        usage_share = usage_scores
+
+    usage_share = usage_share.clip(lower=0.0, upper=1.0)
+    recency_component = recency_weight.clip(lower=1e-3)
+    weights = recency_component * (0.35 + 0.65 * usage_share + 0.05)
+    if weights.max() > 0:
+        weights = weights / weights.max()
+    return weights.clip(lower=1e-4)
 
 def coerce_boolean_mask(mask_like) -> pd.Series:
     """
@@ -3552,14 +3640,103 @@ class FeatureBuilder:
             player_stats = player_stats.drop(columns=["player_name_norm"], errors="ignore")
 
             def add_dataset(target: str, positions: Iterable[str]) -> None:
-                subset = player_stats[player_stats["position"].isin(list(positions))].copy()
-                subset = subset[subset[target].notna()]
-                if subset.empty:
+                subset_all = player_stats[
+                    player_stats["position"].isin(list(positions))
+                ].copy()
+                if subset_all.empty:
                     logging.debug(
-                        "Skipping %s dataset because no rows remained after filtering", target
+                        "Skipping %s dataset because no positional rows are available", target
                     )
                     return
-                datasets[target] = subset
+
+                subset_all["team"] = subset_all["team"].apply(normalize_team_abbr)
+                subset_all["position"] = subset_all["position"].apply(normalize_position)
+                subset_all["_usage_weight"] = compute_recency_usage_weights(subset_all)
+                subset_all["_usage_weight"] = (
+                    subset_all["_usage_weight"].replace([np.inf, -np.inf], np.nan).fillna(1.0)
+                )
+
+                labeled = subset_all[subset_all[target].notna()].copy()
+                if labeled.empty:
+                    logging.debug(
+                        "Skipping %s dataset because no labeled rows are available", target
+                    )
+                    return
+
+                labeled["is_synthetic"] = False
+                labeled["sample_weight"] = labeled["_usage_weight"].clip(lower=1e-4)
+
+                def _group_stats(frame: pd.DataFrame, cols: List[str]) -> Dict[Any, Dict[str, float]]:
+                    if frame.empty:
+                        return {}
+                    stats: Dict[Any, Dict[str, float]] = {}
+                    for key, group in frame.groupby(cols):
+                        weights = group["_usage_weight"].clip(lower=1e-4)
+                        values = group[target].astype(float)
+                        if weights.sum() <= 0:
+                            weights = pd.Series(1.0, index=values.index)
+                        mean_val = float(np.average(values, weights=weights))
+                        stats[key if isinstance(key, tuple) else key] = {
+                            "mean": mean_val,
+                            "weight": float(weights.sum()),
+                        }
+                    return stats
+
+                team_pos_prior = _group_stats(labeled, ["team", "position"])
+                pos_prior = _group_stats(labeled, ["position"])
+                league_weights = labeled["_usage_weight"].clip(lower=1e-4)
+                league_mean = float(np.average(labeled[target].astype(float), weights=league_weights))
+                league_weight = float(league_weights.sum())
+
+                placeholders = subset_all[subset_all[target].isna()].copy()
+                synthetic_rows: List[Dict[str, Any]] = []
+                if not placeholders.empty:
+                    for _, row in placeholders.iterrows():
+                        team_key = (row.get("team"), row.get("position"))
+                        pos_key = row.get("position")
+                        numerator = 0.0
+                        weight_sum = 0.0
+                        effective_weight = 0.0
+
+                        team_stats = team_pos_prior.get(team_key)
+                        if team_stats:
+                            w = max(team_stats["weight"], 1e-4)
+                            numerator += team_stats["mean"] * w
+                            weight_sum += w
+                            effective_weight += w
+
+                        pos_stats = pos_prior.get(pos_key)
+                        if pos_stats:
+                            w = max(pos_stats["weight"] * 0.5, 1e-4)
+                            numerator += pos_stats["mean"] * w
+                            weight_sum += w
+                            effective_weight += pos_stats["weight"]
+
+                        if league_weight > 0:
+                            league_w = max(league_weight * 0.25, 1e-4)
+                            numerator += league_mean * league_w
+                            weight_sum += league_w
+                            effective_weight += league_weight
+
+                        if weight_sum <= 0:
+                            continue
+
+                        target_estimate = numerator / weight_sum
+                        synthetic = row.to_dict()
+                        synthetic[target] = float(target_estimate)
+                        synthetic["is_synthetic"] = True
+                        influence = effective_weight / (effective_weight + 25.0)
+                        synthetic["sample_weight"] = float(np.clip(influence, 0.05, 0.4))
+                        synthetic_rows.append(synthetic)
+
+                if synthetic_rows:
+                    synthetic_df = pd.DataFrame(synthetic_rows)
+                    combined = safe_concat([labeled, synthetic_df], ignore_index=True, sort=False)
+                else:
+                    combined = labeled
+
+                combined = combined.drop(columns=["_usage_weight"], errors="ignore")
+                datasets[target] = combined
 
             ordered_targets = [
                 "passing_yards",
@@ -5170,6 +5347,7 @@ class ModelTrainer:
         self.feature_builder = FeatureBuilder(engine)
         self.run_id = run_id or uuid.uuid4().hex
         self.model_uncertainty: Dict[str, Dict[str, float]] = {}
+        self.target_priors: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _is_lineup_starter(position: str, rank: Optional[int]) -> bool:
@@ -5415,7 +5593,95 @@ class ModelTrainer:
             left_on=["game_id", "team", "player_id"],
             right_on=["game_id", "team", "player_id"],
             suffixes=("", "_r"),
-        )
+        ).copy()
+
+        merged["game_id"] = merged["game_id"].astype(str)
+        merged["team"] = merged["team"].apply(normalize_team_abbr)
+        merged["position"] = merged["position"].apply(normalize_position)
+        if "is_placeholder" not in merged.columns:
+            merged["is_placeholder"] = False
+        else:
+            merged["is_placeholder"] = merged["is_placeholder"].fillna(False)
+
+        numeric_columns: List[str] = [
+            col
+            for col in merged.columns
+            if pd.api.types.is_numeric_dtype(merged[col])
+            and col not in {"depth_rank", "is_starter", "_lineup_hit"}
+        ]
+
+        merged["_placeholder_weight"] = compute_recency_usage_weights(merged)
+
+        def _compute_weighted_baseline(
+            frame: pd.DataFrame, group_cols: List[str]
+        ) -> pd.DataFrame:
+            if frame.empty or not numeric_columns:
+                return pd.DataFrame()
+
+            def _agg(group: pd.DataFrame) -> pd.Series:
+                weights = group["_placeholder_weight"].fillna(0.0)
+                positive_weight = float(weights[weights > 0].sum())
+                result: Dict[str, float] = {}
+                for column in numeric_columns:
+                    values = group[column]
+                    mask = values.notna()
+                    if mask.any():
+                        use_weights = weights[mask]
+                        if use_weights.sum() > 0:
+                            result[column] = float(
+                                np.average(values[mask], weights=use_weights)
+                            )
+                        else:
+                            result[column] = float(values[mask].mean())
+                    else:
+                        result[column] = np.nan
+                if positive_weight <= 0:
+                    positive_weight = float(len(group))
+                result["_weight"] = positive_weight
+                return pd.Series(result)
+
+            baseline = (
+                frame.groupby(group_cols, dropna=False)
+                .apply(_agg)
+                .sort_index()
+            )
+            baseline.index = baseline.index.set_names(group_cols)
+            return baseline
+
+        if numeric_columns:
+            game_team_pos_baseline = _compute_weighted_baseline(
+                merged, ["game_id", "team", "position"]
+            )
+            team_context_baseline = _compute_weighted_baseline(merged, ["game_id", "team"])
+            team_pos_baseline = _compute_weighted_baseline(merged, ["team", "position"])
+            pos_baseline = _compute_weighted_baseline(merged, ["position"])
+
+            weights_all = merged["_placeholder_weight"].fillna(0.0)
+            league_stats: Dict[str, float] = {}
+            for column in numeric_columns:
+                values = merged[column]
+                mask = values.notna()
+                if mask.any():
+                    use_weights = weights_all[mask]
+                    if use_weights.sum() > 0:
+                        league_stats[column] = float(
+                            np.average(values[mask], weights=use_weights)
+                        )
+                    else:
+                        league_stats[column] = float(values[mask].mean())
+                else:
+                    league_stats[column] = np.nan
+            positive_weight = float(weights_all[weights_all > 0].sum())
+            if positive_weight <= 0:
+                positive_weight = float(len(merged))
+            league_stats["_weight"] = positive_weight
+            league_baseline = pd.Series(league_stats)
+        else:
+            game_team_pos_baseline = pd.DataFrame()
+            team_context_baseline = pd.DataFrame()
+            team_pos_baseline = pd.DataFrame()
+            pos_baseline = pd.DataFrame()
+            league_baseline = pd.Series(dtype=float)
 
         merged["game_id"] = merged["game_id"].astype(str)
         merged["team"] = merged["team"].apply(normalize_team_abbr)
@@ -5468,13 +5734,16 @@ class ModelTrainer:
         def _assign_numeric_defaults(
             placeholder: Dict[str, Any], values: Optional[pd.Series]
         ) -> None:
-            if values is None:
-                return
-            if not numeric_columns:
+            if values is None or not numeric_columns:
                 return
             for column in numeric_columns:
-                if column in values and pd.notna(values[column]):
-                    placeholder[column] = values[column]
+                if column not in values:
+                    continue
+                value = values[column]
+                if pd.isna(value):
+                    continue
+                if column not in placeholder or pd.isna(placeholder[column]):
+                    placeholder[column] = value
 
         def _build_placeholder_row(lineup_row: pd.Series) -> Optional[Dict[str, Any]]:
             game_id_value = str(lineup_row.get("game_id", "")).strip()
@@ -5503,54 +5772,54 @@ class ModelTrainer:
             ]
             if template_pool.empty:
                 template_pool = merged[merged["game_id"].astype(str) == game_id_value]
+            position_pool = pd.DataFrame()
             if template_pool.empty:
                 base_values = {col: np.nan for col in merged.columns}
-                numeric_defaults: Optional[pd.Series] = None
             else:
                 position_pool = template_pool[template_pool["position"] == position_value]
                 if position_pool.empty:
                     position_pool = template_pool
                 base_row = position_pool.iloc[0]
                 base_values = {col: base_row.get(col, np.nan) for col in merged.columns}
-                if numeric_columns:
+            fallback_candidates: List[pd.Series] = []
+            if numeric_columns:
+                if not position_pool.empty:
                     numeric_defaults = position_pool[numeric_columns].mean()
-                else:
-                    numeric_defaults = None
+                    numeric_defaults = numeric_defaults.reindex(numeric_columns)
+                    try:
+                        pool_weight = float(
+                            position_pool["_placeholder_weight"].fillna(0.0).sum()
+                        )
+                    except KeyError:
+                        pool_weight = float(len(position_pool))
+                    numeric_defaults.loc["_weight"] = pool_weight
+                    fallback_candidates.append(numeric_defaults)
 
-            if not numeric_columns:
-                numeric_defaults = None
-            else:
-                if (
-                    numeric_defaults is None
-                    or all(pd.isna(numeric_defaults.get(col, np.nan)) for col in numeric_columns)
-                ):
+                def _append_baseline(
+                    source: pd.DataFrame, key: Tuple[Any, ...]
+                ) -> None:
+                    if source is None or getattr(source, "empty", True):
+                        return
                     try:
-                        numeric_defaults = game_team_pos_baseline.loc[
-                            (game_id_value, team_value, position_value)
-                        ]
+                        series = source.loc[key]
                     except KeyError:
-                        numeric_defaults = None
-                if (
-                    numeric_defaults is None
-                    or all(pd.isna(numeric_defaults.get(col, np.nan)) for col in numeric_columns)
-                ):
-                    try:
-                        numeric_defaults = team_pos_baseline.loc[(team_value, position_value)]
-                    except KeyError:
-                        numeric_defaults = None
-                if (
-                    numeric_defaults is None
-                    or all(pd.isna(numeric_defaults.get(col, np.nan)) for col in numeric_columns)
-                ):
-                    try:
-                        numeric_defaults = pos_baseline.loc[position_value]
-                    except KeyError:
-                        numeric_defaults = None
-                if (
-                    numeric_defaults is None
-                    or all(pd.isna(numeric_defaults.get(col, np.nan)) for col in numeric_columns)
-                ):
-                    numeric_defaults = league_baseline
+                        return
+                    if isinstance(series, pd.DataFrame):
+                        if series.empty:
+                            return
+                        series = series.iloc[0]
+                    fallback_candidates.append(series)
+
+                _append_baseline(
+                    team_context_baseline, (game_id_value, team_value)
+                )
+                _append_baseline(
+                    game_team_pos_baseline, (game_id_value, team_value, position_value)
+                )
+                _append_baseline(team_pos_baseline, (team_value, position_value))
+                _append_baseline(pos_baseline, (position_value,))
+                if isinstance(league_baseline, pd.Series) and not league_baseline.empty:
+                    fallback_candidates.append(league_baseline)
 
             player_name_value = str(lineup_row.get("player_name", "")).strip()
             if not player_name_value:
@@ -5559,6 +5828,7 @@ class ModelTrainer:
                 player_name_value = " ".join(part for part in [first, last] if part)
 
             placeholder: Dict[str, Any] = dict(base_values)
+            placeholder.pop("_placeholder_weight", None)
             placeholder["game_id"] = game_id_value
             placeholder["team"] = team_value
             if "opponent" in placeholder and pd.isna(placeholder["opponent"]):
@@ -5588,8 +5858,10 @@ class ModelTrainer:
             starter_flag = 1 if self._is_lineup_starter(position_value, depth_rank_value) else 0
             placeholder["is_starter"] = starter_flag
             placeholder["_lineup_hit"] = True
+            placeholder["is_placeholder"] = True
 
-            _assign_numeric_defaults(placeholder, numeric_defaults)
+            for defaults in fallback_candidates:
+                _assign_numeric_defaults(placeholder, defaults)
 
             status_bucket = lineup_row.get("status_bucket")
             practice_status = lineup_row.get("practice_status")
@@ -5711,8 +5983,8 @@ class ModelTrainer:
                 index=merged.index,
             )
 
-        merged["depth_rank"] = merged["depth_rank"].fillna(9).astype(int)
-        merged["is_starter"] = merged["is_starter"].fillna(0).astype(int)
+        merged.loc[:, "depth_rank"] = merged["depth_rank"].fillna(9).astype(int)
+        merged.loc[:, "is_starter"] = merged["is_starter"].fillna(0).astype(int)
 
         merged_before_filter = merged.copy()
 
@@ -5814,6 +6086,8 @@ class ModelTrainer:
             if additions:
                 merged = safe_concat([merged] + additions, ignore_index=True, sort=False)
 
+        merged["_usage_confidence"] = compute_recency_usage_weights(merged)
+        merged = merged.drop(columns=["_placeholder_weight"], errors="ignore")
         return merged.drop(columns=["__pname_key", "_lineup_hit"], errors="ignore")
 
     def _audit_lineup_matches(
@@ -5938,6 +6212,150 @@ class ModelTrainer:
         except Exception:
             logging.debug("Lineup audit diagnostics failed", exc_info=True)
 
+    def _compute_target_priors(self, df: pd.DataFrame, target: str) -> Dict[str, Any]:
+        priors: Dict[str, Any] = {
+            "league": {"mean": np.nan, "weight": 0.0},
+            "position": {},
+            "team_position": {},
+        }
+        if df.empty or target not in df.columns:
+            return priors
+
+        working = df.copy()
+        if "team" in working.columns:
+            working["team"] = working["team"].apply(normalize_team_abbr)
+        if "position" in working.columns:
+            working["position"] = working["position"].apply(normalize_position)
+
+        mask_actual = working[target].notna()
+        if "is_synthetic" in working.columns:
+            mask_actual &= ~working["is_synthetic"].astype(bool)
+        actual = working[mask_actual]
+        if actual.empty:
+            return priors
+
+        weights_all = (
+            actual.get("sample_weight", pd.Series(1.0, index=actual.index))
+            .astype(float)
+            .clip(lower=1e-4)
+        )
+        values_all = actual[target].astype(float)
+        priors["league"] = {
+            "mean": float(np.average(values_all, weights=weights_all)),
+            "weight": float(weights_all.sum()),
+        }
+
+        for (team, position), group in actual.groupby(["team", "position"]):
+            group_weights = (
+                group.get("sample_weight", pd.Series(1.0, index=group.index))
+                .astype(float)
+                .clip(lower=1e-4)
+            )
+            group_values = group[target].astype(float)
+            priors["team_position"][(team, position)] = {
+                "mean": float(np.average(group_values, weights=group_weights)),
+                "weight": float(group_weights.sum()),
+            }
+
+        for position, group in actual.groupby(["position"]):
+            group_weights = (
+                group.get("sample_weight", pd.Series(1.0, index=group.index))
+                .astype(float)
+                .clip(lower=1e-4)
+            )
+            group_values = group[target].astype(float)
+            priors["position"][position] = {
+                "mean": float(np.average(group_values, weights=group_weights)),
+                "weight": float(group_weights.sum()),
+            }
+
+        return priors
+
+    def _resolve_prior(
+        self,
+        target: str,
+        team: Optional[str],
+        position: Optional[str],
+    ) -> Tuple[float, float]:
+        priors = self.target_priors.get(target)
+        if not priors:
+            return (np.nan, 0.0)
+
+        team_norm = normalize_team_abbr(team) if team else None
+        pos_norm = normalize_position(position) if position else None
+
+        if team_norm and pos_norm:
+            entry = priors["team_position"].get((team_norm, pos_norm))
+            if entry:
+                return (entry.get("mean", np.nan), entry.get("weight", 0.0))
+
+        if pos_norm:
+            entry = priors["position"].get(pos_norm)
+            if entry:
+                return (entry.get("mean", np.nan), entry.get("weight", 0.0))
+
+        league_entry = priors.get("league", {})
+        return (
+            league_entry.get("mean", np.nan),
+            league_entry.get("weight", 0.0),
+        )
+
+    def calibrate_player_predictions(
+        self,
+        target: str,
+        feature_slice: pd.DataFrame,
+        predictions: np.ndarray,
+    ) -> np.ndarray:
+        if feature_slice is None or feature_slice.empty:
+            return predictions
+
+        priors = self.target_priors.get(target)
+        if not priors:
+            return predictions
+
+        preds = np.asarray(predictions, dtype=float)
+        if preds.size == 0:
+            return preds
+
+        features = feature_slice.copy()
+        if "team" in features.columns:
+            features["team"] = features["team"].apply(normalize_team_abbr)
+        if "position" in features.columns:
+            features["position"] = features["position"].apply(normalize_position)
+
+        usage_conf = features.get("_usage_confidence", pd.Series(0.5, index=features.index))
+        usage_conf = pd.to_numeric(usage_conf, errors="coerce").fillna(0.5).clip(0.0, 1.0)
+        is_placeholder = features.get("is_placeholder", pd.Series(False, index=features.index))
+        is_placeholder = coerce_boolean_mask(is_placeholder)
+
+        for idx, (i, row) in enumerate(features.iterrows()):
+            prior_mean, prior_weight = self._resolve_prior(
+                target,
+                row.get("team"),
+                row.get("position"),
+            )
+            if np.isnan(prior_mean) or prior_weight <= 0:
+                continue
+
+            confidence = float(usage_conf.loc[i]) if i in usage_conf.index else 0.5
+            placeholder_flag = bool(is_placeholder.loc[i]) if i in is_placeholder.index else False
+
+            weight_factor = prior_weight / (prior_weight + 25.0)
+            shrink_base = 1.0 - confidence
+            if placeholder_flag:
+                shrink_base = max(shrink_base, 0.4)
+            else:
+                shrink_base = max(shrink_base * 0.5, 0.0)
+            alpha = np.clip(shrink_base * (0.4 + 0.6 * weight_factor), 0.0, 0.85)
+
+            current_pred = preds[idx]
+            if np.isnan(current_pred) or np.isinf(current_pred):
+                preds[idx] = prior_mean
+            else:
+                preds[idx] = (1 - alpha) * current_pred + alpha * prior_mean
+
+        return preds
+
     # ------------------------------------------------------------------
     # Chronological splitting utilities
     # ------------------------------------------------------------------
@@ -6010,12 +6428,29 @@ class ModelTrainer:
     def _train_regression_model(self, df: pd.DataFrame, target: str) -> Optional[Pipeline]:
         if len(df) < 20 or df[target].nunique() <= 1:
             logging.warning(
-                "Not enough data to train %s model (rows=%d, unique targets=%d).", 
+                "Not enough data to train %s model (rows=%d, unique targets=%d).",
                 target,
                 len(df),
                 df[target].nunique(),
             )
             return None
+
+        df = df.copy()
+        if "sample_weight" not in df.columns:
+            df["sample_weight"] = 1.0
+        else:
+            df["sample_weight"] = (
+                pd.to_numeric(df["sample_weight"], errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(1.0)
+                .clip(lower=1e-4)
+            )
+        if "is_synthetic" not in df.columns:
+            df["is_synthetic"] = False
+        else:
+            df["is_synthetic"] = df["is_synthetic"].fillna(False).astype(bool)
+
+        self.target_priors[target] = self._compute_target_priors(df, target)
 
         numeric_features = [
             "week",
@@ -6109,6 +6544,67 @@ class ModelTrainer:
         X_test = test_df[feature_columns]
         y_test = test_df[target]
 
+        def _weights_from(frame: pd.DataFrame) -> pd.Series:
+            series = frame.get("sample_weight")
+            if series is None:
+                return pd.Series(1.0, index=frame.index)
+            return (
+                pd.to_numeric(series, errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(1.0)
+                .clip(lower=1e-4)
+            )
+
+        train_weights = _weights_from(train_df)
+        test_weights = _weights_from(test_df)
+        sorted_weights = _weights_from(sorted_df)
+
+        def _as_weight_array(series: Optional[pd.Series]) -> Optional[np.ndarray]:
+            if series is None or series.empty:
+                return None
+            return series.astype(float).to_numpy()
+
+        train_weight_array = _as_weight_array(train_weights)
+
+        def _weighted_metrics(
+            y_true: pd.Series,
+            y_pred: np.ndarray,
+            weights: Optional[np.ndarray],
+        ) -> Tuple[float, float, float]:
+            if len(y_true) == 0:
+                return (np.nan, np.nan, np.nan)
+            if weights is not None and len(weights) == len(y_true):
+                w = np.clip(weights.astype(float), 1e-6, None)
+                diff = y_pred - y_true.to_numpy(dtype=float)
+                mae = float(np.average(np.abs(diff), weights=w))
+                mse = float(np.average(diff ** 2, weights=w))
+                rmse = float(np.sqrt(mse))
+                if len(y_true) > 1:
+                    try:
+                        r2 = float(r2_score(y_true, y_pred, sample_weight=w))
+                    except ValueError:
+                        r2 = np.nan
+                else:
+                    r2 = np.nan
+                return (r2, mae, rmse)
+            diff = y_pred - y_true.to_numpy(dtype=float)
+            mae = float(mean_absolute_error(y_true, y_pred))
+            rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+            r2 = float(r2_score(y_true, y_pred)) if len(y_true) > 1 else np.nan
+            return (r2, mae, rmse)
+
+        actual_mask = (~test_df.get("is_synthetic", False).astype(bool)) & y_test.notna()
+        if not actual_mask.any():
+            logging.warning(
+                "Holdout set for %s contains no non-synthetic observations; evaluating on available rows.",
+                target,
+            )
+            actual_mask = y_test.notna()
+
+        X_test_actual = X_test.loc[actual_mask]
+        y_test_actual = y_test.loc[actual_mask]
+        test_weight_array = _as_weight_array(test_weights.loc[actual_mask])
+
         transformers = []
         if available_numeric:
             transformers.append(
@@ -6140,23 +6636,33 @@ class ModelTrainer:
             ("regressor", GradientBoostingRegressor(random_state=42)),
         ])
 
-        baseline_model.fit(X_train, y_train)
-        baseline_pred = baseline_model.predict(X_test)
-        baseline_r2 = baseline_model.score(X_test, y_test)
-        baseline_mae = mean_absolute_error(y_test, baseline_pred)
-        baseline_rmse = float(np.sqrt(mean_squared_error(y_test, baseline_pred)))
+        baseline_fit_params: Dict[str, Any] = {}
+        if train_weight_array is not None:
+            baseline_fit_params["regressor__sample_weight"] = train_weight_array
+
+        baseline_model.fit(X_train, y_train, **baseline_fit_params)
+
+        if len(X_test_actual) > 0:
+            baseline_pred_actual = baseline_model.predict(X_test_actual)
+        else:
+            baseline_pred_actual = np.array([], dtype=float)
+
+        baseline_r2, baseline_mae, baseline_rmse = _weighted_metrics(
+            y_test_actual, baseline_pred_actual, test_weight_array
+        )
         logging.info(
-            "Trained %s model (baseline GBM), R^2=%.3f on holdout (MAE=%.3f, RMSE=%.3f)",
+            "Trained %s model (baseline GBM), R^2=%.3f on holdout (MAE=%.3f, RMSE=%.3f, n=%d)",
             target,
             baseline_r2,
             baseline_mae,
             baseline_rmse,
+            len(y_test_actual),
         )
         self.db.record_backtest_metrics(
             self.run_id,
             f"{target}_baseline",
             {"r2": baseline_r2, "mae": baseline_mae, "rmse": baseline_rmse},
-            sample_size=len(y_test),
+            sample_size=len(y_test_actual),
         )
 
         tuned_model = Pipeline([
@@ -6172,8 +6678,19 @@ class ModelTrainer:
                 target,
                 exc,
             )
-            best_model = tuned_model.fit(X_train, y_train)
+            best_model = tuned_model.fit(
+                X_train,
+                y_train,
+                **(
+                    {"regressor__sample_weight": train_weight_array}
+                    if train_weight_array is not None
+                    else {}
+                ),
+            )
         else:
+            search_fit_params: Dict[str, Any] = {}
+            if train_weight_array is not None:
+                search_fit_params["regressor__sample_weight"] = train_weight_array
             search = RandomizedSearchCV(
                 estimator=tuned_model,
                 param_distributions=self._gb_param_grid("regressor__"),
@@ -6183,7 +6700,7 @@ class ModelTrainer:
                 random_state=42,
                 n_jobs=-1,
             )
-            search.fit(X_train, y_train)
+            search.fit(X_train, y_train, **search_fit_params)
             best_model: Pipeline = search.best_estimator_
             logging.info(
                 "Best parameters for %s model: %s (CV MAE=%.3f)",
@@ -6216,28 +6733,42 @@ class ModelTrainer:
             n_jobs=-1,
         )
 
-        ensemble.fit(X_train, y_train)
-        y_pred = ensemble.predict(X_test)
-        r2 = ensemble.score(X_test, y_test)
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+        ensemble_fit_params: Dict[str, Any] = {}
+        if train_weight_array is not None:
+            ensemble_fit_params["sample_weight"] = train_weight_array
+        ensemble.fit(X_train, y_train, **ensemble_fit_params)
+
+        if len(X_test_actual) > 0:
+            y_pred_actual = ensemble.predict(X_test_actual)
+        else:
+            y_pred_actual = np.array([], dtype=float)
+
+        r2, mae, rmse = _weighted_metrics(y_test_actual, y_pred_actual, test_weight_array)
         logging.info(
-            "%s holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            "%s holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f | n=%d",
             target,
             r2,
             mae,
             rmse,
+            len(y_test_actual),
         )
 
         self.db.record_backtest_metrics(
             self.run_id,
             target,
             {"r2": r2, "mae": mae, "rmse": rmse},
-            sample_size=len(y_test),
+            sample_size=len(y_test_actual),
         )
         self.model_uncertainty[target] = {"rmse": rmse, "mae": mae}
 
-        ensemble.fit(sorted_df[feature_columns], sorted_df[target])
+        final_mask = sorted_df[target].notna()
+        final_features = sorted_df.loc[final_mask, feature_columns]
+        final_target = sorted_df.loc[final_mask, target]
+        final_weights_array = _as_weight_array(sorted_weights.loc[final_mask])
+        final_fit_params: Dict[str, Any] = {}
+        if final_weights_array is not None:
+            final_fit_params["sample_weight"] = final_weights_array
+        ensemble.fit(final_features, final_target, **final_fit_params)
         setattr(ensemble, "feature_columns", feature_columns)
         setattr(ensemble, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target))
         setattr(ensemble, "target_name", target)
@@ -7006,6 +7537,14 @@ def predict_upcoming_games(
         player_predictions = player_features[
             ["game_id", "team", "player_id", "player_name", "position"]
         ].copy()
+        if "_usage_confidence" in player_features.columns:
+            player_predictions["_usage_confidence"] = player_features[
+                "_usage_confidence"
+            ].values
+        if "is_placeholder" in player_features.columns:
+            player_predictions["is_placeholder"] = (
+                player_features["is_placeholder"].astype(bool).values
+            )
 
         for target, model in models.items():
             if target in {"game_winner", "home_points", "away_points"}:
@@ -7029,6 +7568,12 @@ def predict_upcoming_games(
                 except Exception:
                     logging.exception("Failed to generate predictions for %s", target)
                     continue
+                if trainer is not None:
+                    preds = trainer.calibrate_player_predictions(
+                        target,
+                        player_features.loc[mask],
+                        preds,
+                    )
                 target_values.loc[mask] = preds
             player_predictions[f"pred_{target}"] = target_values.values
 
