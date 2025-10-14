@@ -26,6 +26,7 @@ import re
 import time
 import unicodedata
 import uuid
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
@@ -56,10 +57,12 @@ from sklearn.metrics import (
     log_loss,
     mean_absolute_error,
     mean_squared_error,
+    r2_score,
     roc_auc_score,
 )
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sqlalchemy import (
@@ -74,18 +77,16 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     func,
+    inspect,
     select,
     text,
-    inspect,
 )
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
-# ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
-from typing import Any, Dict, List, Optional, Tuple
-import pandas as pd
-import re
 
+
+# ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
 def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
     if df is None:
         return True
@@ -109,7 +110,96 @@ def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
     if not cleaned:
         # Return an empty but stable DataFrame if everything is empty
         return pd.DataFrame()
-    return safe_concat(cleaned, **kwargs)
+    if len(cleaned) == 1:
+        # Avoid returning a view into the input DataFrame which could be mutated upstream
+        return cleaned[0].copy()
+    return pd.concat(cleaned, **kwargs)
+
+
+def compute_recency_usage_weights(frame: pd.DataFrame) -> pd.Series:
+    """Compute recency- and usage-based weights for player rows."""
+
+    if frame is None or frame.empty:
+        return pd.Series(dtype=float, index=getattr(frame, "index", None))
+
+    recency_cols = [
+        "start_time",
+        "local_start_time",
+        "game_datetime",
+        "game_date",
+        "kickoff",
+    ]
+    recency_weight = pd.Series(1.0, index=frame.index, dtype=float)
+    found_time = False
+    for col in recency_cols:
+        if col in frame.columns:
+            candidate = pd.to_datetime(frame[col], errors="coerce")
+            if candidate.notna().any():
+                latest = candidate.max()
+                age_days = (latest - candidate).dt.total_seconds() / 86400.0
+                age_days = age_days.fillna(age_days.max() or 0.0)
+                halflife_days = 21.0
+                recency_weight = np.exp(-age_days / halflife_days)
+                found_time = True
+                break
+    if not found_time and {"season", "week"}.issubset(frame.columns):
+        season_vals = pd.to_numeric(frame["season"], errors="coerce").fillna(0)
+        week_vals = pd.to_numeric(frame["week"], errors="coerce").fillna(0)
+        order = season_vals * 32 + week_vals
+        max_order = float(order.max())
+        min_order = float(order.min())
+        span = max(max_order - min_order, 1.0)
+        age_weeks = (max_order - order) / span
+        recency_weight = np.exp(-age_weeks * 0.75)
+
+    if recency_weight.max() > 0:
+        recency_weight = recency_weight / recency_weight.max()
+    else:
+        recency_weight = pd.Series(1.0, index=frame.index, dtype=float)
+
+    usage_weights = {
+        "snap_count": 1.2,
+        "season_snap_count": 0.6,
+        "receiving_targets": 1.5,
+        "season_receiving_targets": 0.9,
+        "rushing_attempts": 1.0,
+        "season_rushing_attempts": 0.6,
+        "routes_run": 1.2,
+        "season_routes_run": 0.7,
+        "touches": 1.2,
+        "season_touches": 0.7,
+        "fantasy_points": 0.5,
+        "season_fantasy_points": 0.3,
+    }
+    usage_scores = pd.Series(0.0, index=frame.index, dtype=float)
+    for col, weight in usage_weights.items():
+        if col in frame.columns:
+            usage_scores = usage_scores + frame[col].fillna(0).astype(float) * weight
+
+    if usage_scores.max() > 0:
+        usage_scores = usage_scores / usage_scores.max()
+    else:
+        usage_scores = pd.Series(0.0, index=frame.index, dtype=float)
+
+    if {"team", "position"}.issubset(frame.columns):
+        team_keys = (
+            frame["team"].fillna("").astype(str)
+            + "|"
+            + frame["position"].fillna("").astype(str)
+        )
+        group_max = usage_scores.groupby(team_keys).transform(
+            lambda s: max(float(s.max()), 1.0)
+        )
+        usage_share = usage_scores / group_max
+    else:
+        usage_share = usage_scores
+
+    usage_share = usage_share.clip(lower=0.0, upper=1.0)
+    recency_component = recency_weight.clip(lower=1e-3)
+    weights = recency_component * (0.35 + 0.65 * usage_share + 0.05)
+    if weights.max() > 0:
+        weights = weights / weights.max()
+    return weights.clip(lower=1e-4)
 
 def coerce_boolean_mask(mask_like) -> pd.Series:
     """
@@ -142,10 +232,38 @@ _SLOT_TO_POS = {
     "RB": "RB",
     "WR": "WR",
     "TE": "TE",
+    # Explicit backfield/receiver aliases that occasionally appear without suffixes
+    "HB": "RB",
+    "FB": "RB",
+    "TB": "RB",
+    "SLOT": "WR",
     # OL/DEF/ST are ignored in player projections
 }
 
-def _parse_slot(slot: str) -> Tuple[str, Optional[int]]:
+_SLOT_PREFIX_MAP = {
+    "QB": "QB",
+    "RB": "RB",
+    "HB": "RB",
+    "FB": "RB",
+    "TB": "RB",
+    "WR": "WR",
+    "TE": "TE",
+    "SLOT": "WR",
+}
+
+
+def _slot_token_to_pos(token: Optional[str]) -> str:
+    token_upper = (token or "").strip().upper()
+    if not token_upper:
+        return ""
+    if token_upper in _SLOT_TO_POS:
+        return _SLOT_TO_POS[token_upper]
+    for prefix, canonical in _SLOT_PREFIX_MAP.items():
+        if token_upper.startswith(prefix):
+            return canonical
+    return ""
+
+def _parse_slot(slot: str) -> Tuple[str, Optional[int], Optional[str]]:
     """
     'Offense-WR-2' -> ('WR', 2)
     'Offense-QB-1' -> ('QB', 1)
@@ -154,20 +272,25 @@ def _parse_slot(slot: str) -> Tuple[str, Optional[int]]:
     """
     m = _POS_RE.match(slot or "")
     if not m:
-        return ("", None)
-    _, token, depth = m.groups()
-    pos = _SLOT_TO_POS.get(token, "")
+        return ("", None, None)
+    side_token, token, depth = m.groups()
+    pos = _slot_token_to_pos(token)
     d = int(depth) if depth and depth.isdigit() else None
-    return (pos, d)
+    side = side_token.title() if side_token else None
+    return (pos, d, side)
 
-def _prefer_actual_then_expected(team_entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _prefer_actual_then_expected(team_entry: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
     """
-    From a single team lineup block, return the best lineupPositions list:
-    prefer 'actual' if present and non-empty; else 'expected'; else [].
+    From a single team lineup block, return the best lineupPositions list and the section label.
+    Prefers 'actual' if present and non-empty; else 'expected'; else [] with an empty label.
     """
     actual = (team_entry.get("actual") or {}).get("lineupPositions") or []
+    if actual:
+        return actual, "actual"
     expected = (team_entry.get("expected") or {}).get("lineupPositions") or []
-    return actual if len(actual) > 0 else expected
+    if expected:
+        return expected, "expected"
+    return [], ""
 
 def build_lineups_df(msf_json: Dict[str, Any]) -> pd.DataFrame:
     """
@@ -176,40 +299,77 @@ def build_lineups_df(msf_json: Dict[str, Any]) -> pd.DataFrame:
     - Normalizes slots, keeps only QB/RB/WR/TE up to configured depth caps.
     - Collapses duplicates to shallowest depth per team/pos/player.
     Returns columns:
-      ['team_id','team_abbr','pos','depth','player_id','first','last','full_name','_lineup_entry']
+      [
+          'team_id','team_abbr','pos','depth','side','slot','player_id','first','last',
+          'full_name','player_team_abbr','playing_probability'
+      ]
     """
-    team_meta = {t["id"]: t for t in (msf_json.get("references", {}) or {}).get("teamReferences", [])}
+    references = msf_json.get("references") or {}
+    team_meta = {t.get("id"): t for t in references.get("teamReferences", []) or []}
+    player_meta = {p.get("id"): p for p in references.get("playerReferences", []) or []}
     rows: List[Dict[str, Any]] = []
 
     for team_block in msf_json.get("teamLineups", []) or []:
         team = team_block.get("team") or {}
         team_id = team.get("id")
         abbr = team.get("abbreviation")
-        positions = _prefer_actual_then_expected(team_block)
+        positions, section_label = _prefer_actual_then_expected(team_block)
 
         for p in positions:
             slot = p.get("position")
-            player = p.get("player")
-            pos, depth = _parse_slot(slot)
+            player = p.get("player") or {}
+            if not player and p.get("playerId") is not None:
+                player = player_meta.get(p.get("playerId"), {})
+            pos, depth, side = _parse_slot(slot)
             if pos not in _OFFENSE_KEEP:
                 continue
             if depth is None or depth > _OFFENSE_KEEP[pos]:
                 continue
-            if not player:
-                # Keep a row to record an empty slot only if you want to see holes; otherwise skip.
-                # We skip empty because it can incorrectly “win” later merges.
+            player_id = player.get("id") or p.get("playerId")
+            first = (player.get("firstName") or "").strip()
+            last = (player.get("lastName") or "").strip()
+            display = (player.get("displayName") or player.get("fullName") or "").strip()
+            full_name = " ".join(part for part in [first, last] if part) or display
+            if not full_name and player_id in player_meta:
+                meta = player_meta.get(player_id) or {}
+                first = first or (meta.get("firstName") or "").strip()
+                last = last or (meta.get("lastName") or "").strip()
+                display = display or (meta.get("displayName") or meta.get("fullName") or "")
+                full_name = " ".join(part for part in [first, last] if part) or display.strip()
+            if not full_name and player_id in (None, ""):
+                # Without a name or identifier we cannot reconcile the player later.
                 continue
 
+            current_team_info = (
+                player.get("currentTeam")
+                or player.get("team")
+                or (player_meta.get(player_id, {}) or {}).get("currentTeam")
+                or {}
+            )
+            player_team_abbr = (
+                current_team_info.get("abbreviation")
+                or current_team_info.get("name")
+                or ""
+            )
+            playing_probability = (
+                p.get("playingProbability")
+                or player.get("playingProbability")
+                or (player_meta.get(player_id, {}) or {}).get("playingProbability")
+            )
             rows.append({
                 "team_id": team_id,
                 "team_abbr": abbr,
                 "pos": pos,
                 "depth": depth,
-                "player_id": player.get("id"),
-                "first": player.get("firstName"),
-                "last": player.get("lastName"),
-                "full_name": f"{player.get('firstName','')} {player.get('lastName','')}".strip(),
-                "_lineup_entry": True,
+                "side": side,
+                "slot": slot,
+                "player_id": player_id,
+                "first": first,
+                "last": last,
+                "full_name": full_name,
+                "player_team_abbr": player_team_abbr,
+                "playing_probability": playing_probability,
+                "source_section": section_label,
             })
 
     df = pd.DataFrame(rows)
@@ -218,8 +378,12 @@ def build_lineups_df(msf_json: Dict[str, Any]) -> pd.DataFrame:
         return df
 
     # Deduplicate: keep shallowest depth per team/pos/player
-    df.sort_values(["team_id", "pos", "player_id", "depth"], inplace=True)
-    df = df.groupby(["team_id", "pos", "player_id"], as_index=False).first()
+    sort_cols = [col for col in ["team_id", "team_abbr", "pos", "player_id", "depth"] if col in df.columns]
+    if sort_cols:
+        df.sort_values(sort_cols, inplace=True)
+    group_cols = [col for col in ["team_id", "pos", "player_id"] if col in df.columns]
+    if group_cols:
+        df = df.groupby(group_cols, as_index=False).first()
 
     # Also, per team/pos, keep at most the allowed number of depth slots
     df["rank_in_pos"] = df.groupby(["team_id", "pos"])["depth"].rank(method="first", ascending=True)
@@ -230,6 +394,12 @@ def build_lineups_df(msf_json: Dict[str, Any]) -> pd.DataFrame:
     df["team_abbr"] = df.apply(
         lambda r: r["team_abbr"] or (team_meta.get(r["team_id"], {}).get("abbreviation")), axis=1
     )
+    df["full_name"] = df.apply(
+        lambda r: r["full_name"]
+        or " ".join(part for part in [r.get("first", ""), r.get("last", "")] if part).strip(),
+        axis=1,
+    )
+    df = df[df["full_name"].fillna("") != ""]
     return df.reset_index(drop=True)
 # ==== END LINEUP + PANDAS PATCH HELPERS =====================================
 
@@ -238,7 +408,7 @@ def build_lineups_df(msf_json: Dict[str, Any]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 API_PREFIX_NFL = "https://api.mysportsfeeds.com/v2.1/pull/nfl"
-NFL_SEASONS = ["2024-regular", "2025-regular"]
+NFL_SEASONS = ["2025-regular", "2024-regular"]
 
 NFL_API_USER = "4359aa1b-cc29-4647-a3e5-7314e2"
 NFL_API_PASS = "MYSPORTSFEEDS"
@@ -545,6 +715,7 @@ PRACTICE_STATUS_PRIORITY = {
     "available": 2,
 }
 
+
 PRACTICE_STATUS_ALIASES = {
     "fp": "full",
     "full practice": "full",
@@ -599,6 +770,8 @@ TARGET_ALLOWED_POSITIONS: Dict[str, set[str]] = {
     "receiving_tds": {"RB", "HB", "FB", "WR", "TE"},
 }
 
+NON_NEGATIVE_TARGETS: set[str] = set(TARGET_ALLOWED_POSITIONS.keys())
+
 
 LINEUP_STALENESS_DAYS = 7
 LINEUP_MAX_AGE_BEFORE_GAME_DAYS = 21  # allow expected lineups up to 3 weeks old relative to kickoff
@@ -640,13 +813,28 @@ def normalize_player_name(value: Any) -> str:
 def normalize_position(value: Any) -> str:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return ""
+
     text = str(value).upper().strip()
     if not text:
         return ""
+
+    # First try an exact alias match (e.g., HB -> RB).
     text = POSITION_ALIAS_MAP.get(text, text)
-    for prefix, canonical in POSITION_PREFIX_MAP.items():
-        if text.startswith(prefix):
-            return canonical
+
+    # Many feeds (including MSF lineups) encode positions with prefixes such as
+    # "Offense-WR-1" or "SpecialTeams-K-1".  Break the string into alpha-only
+    # tokens so we can match the meaningful portion (WR, QB, etc.).
+    tokens = [text]
+    tokens.extend(token for token in re.split(r"[^A-Z]", text) if token)
+
+    for token in tokens:
+        # Allow alias substitution on each token (e.g., SLOT -> WR).
+        if token in POSITION_ALIAS_MAP:
+            return POSITION_ALIAS_MAP[token]
+        for prefix, canonical in POSITION_PREFIX_MAP.items():
+            if token.startswith(prefix):
+                return canonical
+
     return text
 
 
@@ -672,6 +860,54 @@ def normalize_practice_status(value: Any) -> str:
     if text not in PRACTICE_STATUS_PRIORITY:
         return "available"
     return text
+
+
+_PLAYING_PROBABILITY_ALIASES = {
+    "prob": "probable",
+    "probable": "probable",
+    "likely": "probable",
+    "expected": "probable",
+    "game-time decision": "questionable",
+    "gtd": "questionable",
+    "game time decision": "questionable",
+    "game-time": "questionable",
+    "uncertain": "questionable",
+    "na": "other",
+}
+
+
+def interpret_playing_probability(value: Any) -> Tuple[str, str]:
+    """Return (status_bucket, practice_status) derived from MSF playingProbability labels."""
+
+    text_raw = str(value or "").strip().lower()
+    if not text_raw:
+        return "other", "available"
+
+    cleaned = re.sub(r"[^a-z\s]", " ", text_raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return "other", "available"
+
+    canonical = _PLAYING_PROBABILITY_ALIASES.get(cleaned, cleaned)
+
+    keyword_rules = [
+        ("suspend", ("suspended", "dnp")),
+        ("doubt", ("doubtful", "limited")),
+        ("question", ("questionable", "limited")),
+        ("inactive", ("out", "dnp")),
+        ("out", ("out", "dnp")),
+        ("probable", ("probable", "available")),
+        ("likely", ("probable", "available")),
+        ("expect", ("probable", "available")),
+        ("available", ("other", "full")),
+        ("active", ("other", "full")),
+    ]
+
+    for keyword, outcome in keyword_rules:
+        if keyword in canonical:
+            return outcome
+
+    return "other", "available"
 
 
 def normalize_injury_status(value: Any) -> str:
@@ -770,6 +1006,21 @@ def ensure_lineup_players_in_latest(
     if "player_name_norm" not in working.columns:
         working["player_name_norm"] = working["player_name"].map(normalize_player_name)
 
+    if "depth_rank" not in working.columns:
+        working["depth_rank"] = np.nan
+    if "status_bucket" not in working.columns:
+        working["status_bucket"] = np.nan
+    if "practice_status" not in working.columns:
+        working["practice_status"] = np.nan
+    if "injury_priority" not in working.columns:
+        working["injury_priority"] = np.nan
+    if "practice_priority" not in working.columns:
+        working["practice_priority"] = np.nan
+    if "_lineup_entry" not in working.columns:
+        working["_lineup_entry"] = False
+    if "is_projected_starter" not in working.columns:
+        working["is_projected_starter"] = False
+
     if "__pname_key" not in working.columns:
         working["__pname_key"] = working["player_name"].map(robust_player_name_key)
     else:
@@ -863,19 +1114,33 @@ def ensure_lineup_players_in_latest(
         depth_rank = lineup_row.get("rank")
         placeholder["depth_rank"] = depth_rank if depth_rank not in (None, "") else 1
 
-        playing_prob = str(lineup_row.get("playing_probability", "") or "").lower()
-        status_bucket = "questionable" if playing_prob == "questionable" else "other"
+        lineup_status = lineup_row.get("status_bucket")
+        lineup_practice = lineup_row.get("practice_status")
+        if lineup_status:
+            status_bucket = normalize_injury_status(lineup_status)
+            practice_status = normalize_practice_status(lineup_practice)
+        else:
+            status_bucket, practice_status = interpret_playing_probability(
+                lineup_row.get("playing_probability")
+            )
+            status_bucket = normalize_injury_status(status_bucket)
+            practice_status = normalize_practice_status(practice_status)
+
         placeholder["status_bucket"] = status_bucket
-        placeholder["practice_status"] = "available"
+        placeholder["practice_status"] = practice_status
         if "injury_priority" in placeholder:
             placeholder["injury_priority"] = INJURY_STATUS_PRIORITY.get(status_bucket, 1)
         if "practice_priority" in placeholder:
-            placeholder["practice_priority"] = PRACTICE_STATUS_PRIORITY.get("available", 1)
+            placeholder["practice_priority"] = PRACTICE_STATUS_PRIORITY.get(
+                practice_status, PRACTICE_STATUS_PRIORITY.get("available", 1)
+            )
 
-        if "_lineup_entry" in placeholder:
-            placeholder["_lineup_entry"] = True
+        placeholder["_lineup_entry"] = True
         if "source" in placeholder:
             placeholder["source"] = "msf-lineup"
+
+        if "is_projected_starter" in placeholder:
+            placeholder["is_projected_starter"] = True
 
         updated_at = lineup_row.get("updated_at")
         game_start = lineup_row.get("game_start")
@@ -1287,50 +1552,49 @@ def _http_get_with_retry(
 
 
 def _extract_lineup_rows(json_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
-    output: List[Dict[str, Any]] = []
-    team_blocks = json_obj.get("teamLineups") or []
-    for team_block in team_blocks:
-        team_info = team_block.get("team") or {}
-        team_abbr = team_info.get("abbreviation") or team_info.get("name")
-        positions, section_label = _prefer_actual(team_block)
-        for position_entry in positions:
-            side, base_pos, rank = split_lineup_slot(position_entry.get("position") or "")
-            if base_pos not in {"QB", "RB", "WR", "TE"}:
-                continue
-            player_info = position_entry.get("player") or {}
-            current_team_info = player_info.get("currentTeam") or player_info.get("team") or {}
-            current_team_abbr = current_team_info.get("abbreviation") or current_team_info.get("name")
-            first = (player_info.get("firstName") or "").strip()
-            last = (player_info.get("lastName") or "").strip()
-            display = (player_info.get("displayName") or "").strip()
-            name = " ".join(part for part in [first, last] if part) or display
-            player_id = player_info.get("id")
-            if not name and player_id in (None, ""):
-                continue
-            playing_probability = (
-                position_entry.get("playingProbability")
-                or player_info.get("playingProbability")
-            )
-            name_key_source = " ".join(part for part in [first, last] if part) or name
-            output.append(
-                {
-                    "team": _msf_team_abbr(team_abbr),
-                    "player_id": str(player_id) if player_id is not None else "",
-                    "player_name": name,
-                    "first_name": first,
-                    "last_name": last,
-                    "position": base_pos,
-                    "base_pos": base_pos,
-                    "side": side,
-                    "rank": rank,
-                    "source_section": section_label,
-                    "player_team": _msf_team_abbr(current_team_abbr),
-                    "playing_probability": playing_probability,
-                    "slot": position_entry.get("position"),
-                    "__pname_key": robust_player_name_key(name_key_source),
-                }
-            )
-    return output
+    lineup_df = build_lineups_df(json_obj)
+    if lineup_df.empty:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    for record in lineup_df.to_dict(orient="records"):
+        team_abbr = record.get("team_abbr")
+        position = record.get("pos")
+        depth = record.get("depth")
+        if not team_abbr or not position:
+            continue
+        player_name = record.get("full_name") or ""
+        first = record.get("first") or ""
+        last = record.get("last") or ""
+        if not player_name:
+            player_name = " ".join(part for part in [first, last] if part)
+        if not player_name and not record.get("player_id"):
+            continue
+
+        pname_source = player_name or " ".join(part for part in [first, last] if part)
+        status_bucket, practice_status = interpret_playing_probability(
+            record.get("playing_probability")
+        )
+        entry = {
+            "team": _msf_team_abbr(team_abbr),
+            "player_id": str(record.get("player_id") or ""),
+            "player_name": player_name,
+            "first_name": first,
+            "last_name": last,
+            "position": position,
+            "base_pos": position,
+            "side": record.get("side"),
+            "rank": depth,
+            "source_section": record.get("source_section") or "actual",
+            "player_team": _msf_team_abbr(record.get("player_team_abbr")),
+            "playing_probability": record.get("playing_probability"),
+            "status_bucket": status_bucket,
+            "practice_status": practice_status,
+            "slot": record.get("slot"),
+            "__pname_key": robust_player_name_key(pname_source),
+        }
+        results.append(entry)
+    return results
 
 
 @dataclasses.dataclass
@@ -1393,20 +1657,6 @@ class NFLDatabase:
             statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS humidity DOUBLE PRECISION")
         if "injury_summary" not in game_columns:
             statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS injury_summary TEXT")
-
-        if "nfl_game_rosters" in table_names:
-            try:
-                roster_columns = {col["name"] for col in inspector.get_columns("nfl_game_rosters")}
-            except Exception:
-                roster_columns = set()
-            for coldef in [
-                "ADD COLUMN IF NOT EXISTS depth_rank INTEGER",
-                "ADD COLUMN IF NOT EXISTS is_starter INTEGER",
-                "ADD COLUMN IF NOT EXISTS source TEXT",
-                "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ",
-                "ADD COLUMN IF NOT EXISTS ingested_at TIMESTAMPTZ",
-            ]:
-                statements.append(f"ALTER TABLE nfl_game_rosters {coldef}")
 
         if "nfl_depth_charts" in table_names:
             try:
@@ -1490,23 +1740,6 @@ class NFLDatabase:
             Column("snap_count", Float),
             Column("ingested_at", DateTime(timezone=True), default=default_now_utc),
             UniqueConstraint("game_id", "player_id", name="uq_player_game"),
-        )
-
-        # NEW: per-game roster derived from MSF lineup.json
-        self.game_rosters = Table(
-            "nfl_game_rosters",
-            self.meta,
-            Column("game_id", String, nullable=False),
-            Column("team", String, nullable=False),
-            Column("player_id", String),
-            Column("player_name", String, nullable=False),
-            Column("position", String, nullable=False),
-            Column("depth_rank", Integer),
-            Column("is_starter", Integer),
-            Column("source", String, nullable=False),
-            Column("updated_at", DateTime(timezone=True), default=default_now_utc),
-            Column("ingested_at", DateTime(timezone=True), default=default_now_utc),
-            UniqueConstraint("game_id", "team", "player_id", "player_name", name="uq_game_roster"),
         )
 
         self.team_unit_ratings = Table(
@@ -1648,30 +1881,6 @@ class NFLDatabase:
         except SQLAlchemyError:
             logging.exception("Failed to upsert rows into %s", table.name)
             raise
-
-    def upsert_game_rosters(self, rows: Iterable[Dict[str, Any]]) -> None:
-        self.upsert_rows(self.game_rosters, list(rows), ["game_id", "team", "player_id", "player_name"])
-
-    def fetch_game_roster(self, game_id: str) -> pd.DataFrame:
-        with self.engine.begin() as conn:
-            q = select(self.game_rosters).where(self.game_rosters.c.game_id == str(game_id))
-            rows = conn.execute(q).mappings().all()
-        if rows:
-            return pd.DataFrame(rows)
-        return pd.DataFrame(
-            columns=[
-                "game_id",
-                "team",
-                "player_id",
-                "player_name",
-                "position",
-                "depth_rank",
-                "is_starter",
-                "source",
-                "updated_at",
-                "ingested_at",
-            ]
-        )
 
     def fetch_existing_game_ids(self) -> set[str]:
         with self.engine.begin() as conn:
@@ -1912,7 +2121,6 @@ class NFLIngestor:
         lineup_cache: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
 
         injury_rows_all: List[Dict[str, Any]] = []
-        depth_rows_map: Dict[str, Dict[str, Any]] = {}
         advanced_rows_map: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
 
         for season in seasons:
@@ -1966,10 +2174,6 @@ class NFLIngestor:
                 if injuries:
                     injury_rows_all.extend(injuries)
 
-                for team_code in filter(None, {home_team_abbr, away_team_abbr}):
-                    for depth_row in self.supplemental_loader.depth_chart_rows(team_code):
-                        depth_rows_map[depth_row["depth_id"]] = depth_row
-
                 lineup_rows = self._lineup_rows_from_msf(
                     start_time,
                     away_team_abbr,
@@ -1977,38 +2181,9 @@ class NFLIngestor:
                     self._msf_creds,
                     lineup_cache,
                 )
-                try:
-                    roster_rows = self._build_game_roster_rows(
-                        game_id_str,
-                        start_time,
-                        home_team_abbr,
-                        away_team_abbr,
-                        lineup_rows,
-                    )
-                    if roster_rows:
-                        self.db.upsert_game_rosters(roster_rows)
-                        starters = sum(1 for row in roster_rows if row.get("is_starter") == 1)
-                        logging.debug(
-                            "Game %s roster upserted (rows=%d, starters=%d)",
-                            game_id_str,
-                            len(roster_rows),
-                            starters,
-                        )
-                    else:
-                        logging.info(
-                            "No lineup roster rows for game %s (season=%s)",
-                            game_id_str,
-                            season,
-                        )
-                except Exception:
-                    logging.exception(
-                        "Failed building game roster rows for game %s",
-                        game_id_str,
-                    )
                 for lineup_row in lineup_rows:
                     if lineup_row.get("game_start") is None:
                         lineup_row["game_start"] = start_time
-                    depth_rows_map[lineup_row["depth_id"]] = lineup_row
 
                 week_value = schedule.get("week")
                 try:
@@ -2189,12 +2364,6 @@ class NFLIngestor:
 
         if injury_rows_all:
             self.db.upsert_rows(self.db.injury_reports, injury_rows_all, ["injury_id"])
-        if depth_rows_map:
-            self.db.upsert_rows(
-                self.db.depth_charts,
-                list(depth_rows_map.values()),
-                ["depth_id"],
-            )
         if advanced_rows_map:
             self.db.upsert_rows(
                 self.db.team_advanced_metrics,
@@ -2557,14 +2726,20 @@ class NFLIngestor:
 
         last_payload: Optional[Dict[str, Any]] = None
 
+        collected_by_team: Dict[str, List[Dict[str, Any]]] = {}
+        found_payload = False
+
         for date_key in date_candidates:
             for lineup_type in (None, "expected"):
-                cache_token = f"{date_key}|{lineup_type or 'default'}"
+                cache_token = f"{season_slug}|{date_key}|{lineup_type or 'default'}"
                 cache_key = (cache_token, away_norm, home_norm)
                 if cache_key in lineup_cache:
                     cached = lineup_cache[cache_key]
                     if cached:
-                        return cached
+                        for rec in cached:
+                            collected_by_team.setdefault(rec.get("team"), []).append(rec)
+                        found_payload = True
+                        break
                     continue
 
                 url = (
@@ -2691,12 +2866,183 @@ class NFLIngestor:
                             "side": record.get("side"),
                             "base_pos": record.get("base_pos") or position,
                             "playing_probability": record.get("playing_probability"),
+                            "status_bucket": record.get("status_bucket"),
+                            "practice_status": record.get("practice_status"),
                         }
                     )
 
                 lineup_cache[cache_key] = enriched_rows
                 if enriched_rows:
-                    return enriched_rows
+                    found_payload = True
+                    for rec in enriched_rows:
+                        collected_by_team.setdefault(rec.get("team"), []).append(rec)
+                    break
+            if found_payload:
+                break
+
+        def _lineup_needs_team(team_code: str) -> bool:
+            team_rows = collected_by_team.get(team_code) or []
+            if not team_rows:
+                return True
+            if not any(normalize_position(r.get("base_pos")) == "QB" for r in team_rows):
+                return True
+            for pos_key, max_count in _OFFENSE_KEEP.items():
+                pos_rows = [
+                    r
+                    for r in team_rows
+                    if normalize_position(r.get("base_pos")) == pos_key
+                ]
+                if not pos_rows:
+                    return True
+                if len(pos_rows) < max_count:
+                    return True
+            return False
+
+        def _merge_records(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            if not incoming:
+                return existing
+            merged = (existing or []) + incoming
+
+            def priority(rec: Dict[str, Any]) -> Tuple[int, int]:
+                source = rec.get("source") or ""
+                source_rank = 0 if str(source).startswith("msf-lineup") else 1
+                depth_val = rec.get("rank")
+                if depth_val is None:
+                    depth_val = 99
+                return (source_rank, depth_val)
+
+            deduped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            for rec in sorted(merged, key=priority):
+                team = rec.get("team")
+                pos = normalize_position(rec.get("base_pos"))
+                key = (team, f"{pos}:{rec.get('__pname_key')}")
+                if key not in deduped:
+                    deduped[key] = rec
+            return list(deduped.values())
+
+        def _fetch_team_depth(team_code: str) -> List[Dict[str, Any]]:
+            team_rows: List[Dict[str, Any]] = []
+            team_cache_prefix = f"{season_slug}|team|{team_code}"
+            for lineup_type in (None, "expected"):
+                cache_token = f"{team_cache_prefix}|{lineup_type or 'default'}"
+                cache_key = (cache_token, team_code, team_code)
+                if cache_key in lineup_cache:
+                    cached_rows = lineup_cache[cache_key]
+                    if cached_rows:
+                        team_rows = cached_rows
+                        break
+                    continue
+                url = (
+                    f"https://api.mysportsfeeds.com/v2.1/pull/nfl/{season_slug}/teams/"
+                    f"{team_code}/lineup.json"
+                )
+                params = {"lineupType": lineup_type} if lineup_type else None
+                response = _http_get_with_retry(
+                    url,
+                    auth,
+                    params=params,
+                    headers=accept_headers,
+                )
+                if response is None:
+                    lineup_cache[cache_key] = []
+                    continue
+                if response.status_code in {401, 404}:
+                    lineup_cache[cache_key] = []
+                    if response.status_code == 401:
+                        logging.warning(
+                            "lineup: 401 unauthorized for %s (check MSF credentials)",
+                            url,
+                        )
+                        return []
+                    continue
+                if response.status_code == 204:
+                    lineup_cache[cache_key] = []
+                    continue
+                if response.status_code != 200:
+                    logging.info("lineup: %s returned %s", url, response.status_code)
+                    lineup_cache[cache_key] = []
+                    continue
+                try:
+                    payload = response.json()
+                except Exception:
+                    logging.exception("lineup: JSON decode failed for %s", url)
+                    lineup_cache[cache_key] = []
+                    continue
+                rows = _extract_lineup_rows(payload if isinstance(payload, dict) else {})
+                enriched: List[Dict[str, Any]] = []
+                updated_at = (
+                    parse_dt(payload.get("lastUpdatedOn"))
+                    if isinstance(payload, dict)
+                    else None
+                )
+                for rec in rows:
+                    if _msf_team_abbr(rec.get("team")) != team_code:
+                        continue
+                    enriched.append(
+                        {
+                            "team": team_code,
+                            "position": rec.get("position"),
+                            "player_id": rec.get("player_id") or "",
+                            "player_name": rec.get("player_name"),
+                            "first_name": rec.get("first_name"),
+                            "last_name": rec.get("last_name"),
+                            "rank": rec.get("rank"),
+                            "depth_id": (
+                                f"msf-team-lineup:{team_code}:{rec.get('position')}:{rec.get('player_id') or rec.get('__pname_key')}"
+                            ),
+                            "updated_at": updated_at,
+                            "source": "msf-team-lineup",
+                            "player_team": rec.get("player_team"),
+                            "game_start": start_dt,
+                            "__pname_key": rec.get("__pname_key"),
+                            "side": rec.get("side"),
+                            "base_pos": rec.get("base_pos") or rec.get("position"),
+                            "playing_probability": rec.get("playing_probability"),
+                            "status_bucket": rec.get("status_bucket"),
+                            "practice_status": rec.get("practice_status"),
+                        }
+                    )
+                lineup_cache[cache_key] = enriched
+                if enriched:
+                    team_rows = enriched
+                    break
+            return team_rows
+
+        for team_code in (away_norm, home_norm):
+            if _lineup_needs_team(team_code):
+                supplemental = _fetch_team_depth(team_code)
+                if supplemental:
+                    collected_by_team[team_code] = _merge_records(
+                        collected_by_team.get(team_code, []), supplemental
+                    )
+
+        flattened: List[Dict[str, Any]] = []
+        for team_code, team_rows in collected_by_team.items():
+            if not team_rows:
+                continue
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for rec in team_rows:
+                pos = normalize_position(rec.get("base_pos"))
+                if pos not in _OFFENSE_KEEP:
+                    continue
+                grouped.setdefault(pos, []).append(rec)
+            for pos, recs in grouped.items():
+                recs_sorted = sorted(
+                    recs,
+                    key=lambda r: (
+                        0 if str(r.get("source", "")).startswith("msf-lineup") else 1,
+                        r.get("rank") if r.get("rank") is not None else 99,
+                        r.get("player_name") or r.get("__pname_key") or "",
+                    ),
+                )
+                keep = _OFFENSE_KEEP.get(pos, 0)
+                for rec in recs_sorted[:keep]:
+                    if rec.get("game_start") is None:
+                        rec["game_start"] = start_dt
+                    flattened.append(rec)
+
+        if flattened:
+            return flattened
 
         if last_payload is not None:
             logging.debug(
@@ -2721,94 +3067,6 @@ class NFLIngestor:
         if base_pos == "TE":
             return (rank or 99) == 1
         return False
-
-    def _build_game_roster_rows(
-        self,
-        game_id: str,
-        start_time: Optional[dt.datetime],
-        home_team_abbr: Optional[str],
-        away_team_abbr: Optional[str],
-        lineup_rows: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        if not lineup_rows:
-            return []
-
-        rows: List[Dict[str, Any]] = []
-        lineup_by_team: Dict[str, List[Dict[str, Any]]] = {}
-        for record in lineup_rows:
-            team_code = normalize_team_abbr(record.get("team"))
-            if not team_code:
-                continue
-            lineup_by_team.setdefault(team_code, []).append(record)
-
-        for team in filter(None, {home_team_abbr, away_team_abbr}):
-            team_normalized = normalize_team_abbr(team)
-            if not team_normalized:
-                continue
-            team_entries = lineup_by_team.get(team_normalized, [])
-            if not team_entries:
-                continue
-
-            by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
-            for entry in team_entries:
-                pos = normalize_position(entry.get("position"))
-                if not self._skill_pos(pos):
-                    continue
-                lineup_player_team = normalize_team_abbr(entry.get("player_team"))
-                if pos in {"QB", "RB", "WR", "TE"}:
-                    if lineup_player_team and lineup_player_team != team_normalized:
-                        continue
-                pid = (entry.get("player_id") or "").strip()
-                pname = (entry.get("player_name") or "").strip()
-                if not pname and not pid:
-                    continue
-                key = (pid or "", pname)
-                rank_val = entry.get("rank")
-                parsed_rank: Optional[int]
-                if isinstance(rank_val, (int, float)) and not math.isnan(rank_val):
-                    parsed_rank = int(rank_val)
-                else:
-                    parsed_rank = None
-                current = by_key.get(key)
-                current_rank = current.get("rank") if current else None
-                if current is None or ((parsed_rank or 999) < (current_rank or 999)):
-                    by_key[key] = {
-                        "player_id": pid,
-                        "player_name": pname,
-                        "position": pos,
-                        "rank": parsed_rank,
-                        "source": entry.get("source", "msf-lineup"),
-                        "updated_at": entry.get("updated_at"),
-                    }
-
-            now_utc = default_now_utc()
-            for info in by_key.values():
-                updated_at = info.get("updated_at")
-                if isinstance(updated_at, str):
-                    updated_at_dt = parse_dt(updated_at)
-                elif isinstance(updated_at, dt.datetime):
-                    updated_at_dt = updated_at
-                else:
-                    updated_at_dt = None
-                if updated_at_dt is None:
-                    updated_at_dt = now_utc
-                rows.append(
-                    {
-                        "game_id": str(game_id),
-                        "team": team_normalized,
-                        "player_id": info["player_id"],
-                        "player_name": info["player_name"],
-                        "position": info["position"],
-                        "depth_rank": info["rank"],
-                        "is_starter": 1
-                        if self._is_starter_label(info["position"], info["rank"])
-                        else 0,
-                        "source": info.get("source", "msf-lineup"),
-                        "updated_at": updated_at_dt,
-                        "game_start": start_time,
-                    }
-                )
-        return rows
 
     def fetch_lineup_rows(
         self,
@@ -3073,7 +3331,7 @@ class FeatureBuilder:
         player_stats = pd.read_sql_table("nfl_player_stats", self.engine)
         team_ratings = pd.read_sql_table("nfl_team_unit_ratings", self.engine)
         injuries = pd.read_sql_table("nfl_injury_reports", self.engine)
-        depth_charts = pd.read_sql_table("nfl_depth_charts", self.engine)
+        depth_charts = pd.DataFrame()
         advanced_metrics = pd.read_sql_table("nfl_team_advanced_metrics", self.engine)
 
         # Normalize column names to plain strings so downstream pipelines see
@@ -3385,14 +3643,104 @@ class FeatureBuilder:
             player_stats = player_stats.drop(columns=["player_name_norm"], errors="ignore")
 
             def add_dataset(target: str, positions: Iterable[str]) -> None:
-                subset = player_stats[player_stats["position"].isin(list(positions))].copy()
-                subset = subset[subset[target].notna()]
-                if subset.empty:
+                subset_all = player_stats[
+                    player_stats["position"].isin(list(positions))
+                ].copy()
+                if subset_all.empty:
                     logging.debug(
-                        "Skipping %s dataset because no rows remained after filtering", target
+                        "Skipping %s dataset because no positional rows are available", target
                     )
                     return
-                datasets[target] = subset
+
+                subset_all["team"] = subset_all["team"].apply(normalize_team_abbr)
+                subset_all["position"] = subset_all["position"].apply(normalize_position)
+                subset_all["_usage_weight"] = compute_recency_usage_weights(subset_all)
+                subset_all["_usage_weight"] = (
+                    subset_all["_usage_weight"].replace([np.inf, -np.inf], np.nan).fillna(1.0)
+                )
+
+                labeled = subset_all[subset_all[target].notna()].copy()
+                if labeled.empty:
+                    logging.debug(
+                        "Skipping %s dataset because no labeled rows are available", target
+                    )
+                    return
+
+                labeled["is_synthetic"] = False
+                labeled["sample_weight"] = labeled["_usage_weight"].clip(lower=1e-4)
+
+                def _group_stats(frame: pd.DataFrame, cols: List[str]) -> Dict[Any, Dict[str, float]]:
+                    if frame.empty:
+                        return {}
+                    stats: Dict[Any, Dict[str, float]] = {}
+                    for key, group in frame.groupby(cols):
+                        weights = group["_usage_weight"].clip(lower=1e-4)
+                        values = group[target].astype(float)
+                        if weights.sum() <= 0:
+                            weights = pd.Series(1.0, index=values.index)
+                        mean_val = float(np.average(values, weights=weights))
+                        stats[key if isinstance(key, tuple) else key] = {
+                            "mean": mean_val,
+                            "weight": float(weights.sum()),
+                        }
+                    return stats
+
+                team_pos_prior = _group_stats(labeled, ["team", "position"])
+                pos_prior = _group_stats(labeled, ["position"])
+                league_weights = labeled["_usage_weight"].clip(lower=1e-4)
+                league_mean = float(np.average(labeled[target].astype(float), weights=league_weights))
+                league_weight = float(league_weights.sum())
+
+                placeholders = subset_all[subset_all[target].isna()].copy()
+                synthetic_rows: List[Dict[str, Any]] = []
+                if not placeholders.empty:
+                    for _, row in placeholders.iterrows():
+                        team_key = (row.get("team"), row.get("position"))
+                        pos_key = row.get("position")
+                        numerator = 0.0
+                        weight_sum = 0.0
+                        effective_weight = 0.0
+
+                        team_stats = team_pos_prior.get(team_key)
+                        if team_stats:
+                            w = max(team_stats["weight"], 1e-4)
+                            numerator += team_stats["mean"] * w
+                            weight_sum += w
+                            effective_weight += w
+
+                        pos_stats = pos_prior.get(pos_key)
+                        if pos_stats:
+                            w = max(pos_stats["weight"] * 0.5, 1e-4)
+                            numerator += pos_stats["mean"] * w
+                            weight_sum += w
+                            effective_weight += pos_stats["weight"]
+
+                        if league_weight > 0:
+                            league_w = max(league_weight * 0.25, 1e-4)
+                            numerator += league_mean * league_w
+                            weight_sum += league_w
+                            effective_weight += league_weight
+
+                        if weight_sum <= 0:
+                            continue
+
+                        target_estimate = numerator / weight_sum
+                        synthetic = row.to_dict()
+                        synthetic[target] = float(target_estimate)
+                        synthetic["is_synthetic"] = True
+                        influence = effective_weight / (effective_weight + 25.0)
+                        synthetic["sample_weight"] = float(np.clip(influence, 0.05, 0.4))
+                        synthetic_rows.append(synthetic)
+
+                if synthetic_rows:
+                    logging.debug(
+                        "Generated %d prior rows for %s but leaving them out of model training",
+                        len(synthetic_rows),
+                        target,
+                    )
+
+                combined = labeled.drop(columns=["_usage_weight"], errors="ignore")
+                datasets[target] = combined
 
             ordered_targets = [
                 "passing_yards",
@@ -5003,6 +5351,8 @@ class ModelTrainer:
         self.feature_builder = FeatureBuilder(engine)
         self.run_id = run_id or uuid.uuid4().hex
         self.model_uncertainty: Dict[str, Dict[str, float]] = {}
+        self.target_priors: Dict[str, Dict[str, Any]] = {}
+        self.prior_engines: Dict[str, Optional[Dict[str, Any]]] = {}
 
     @staticmethod
     def _is_lineup_starter(position: str, rank: Optional[int]) -> bool:
@@ -5030,6 +5380,7 @@ class ModelTrainer:
         roster_frames: List[pd.DataFrame] = []
         allowed_lineup_keys: Set[Tuple[str, str, str, str]] = set()
         lineup_audit_frame = pd.DataFrame()
+        lineup_roster_full = pd.DataFrame()
 
         if lineup_df is not None and not lineup_df.empty:
             lineup_roster = lineup_df.copy()
@@ -5069,19 +5420,7 @@ class ModelTrainer:
                 )
                 lineup_roster["source"] = "msf-lineup"
                 if respect_lineups:
-                    allowed_lineup_keys = {
-                        (str(gid), team, name, pos)
-                        for gid, team, name, pos, starter in zip(
-                            lineup_roster["game_id"],
-                            lineup_roster["team"],
-                            lineup_roster["__pname_key"],
-                            lineup_roster["position"],
-                            lineup_roster["is_starter"],
-                        )
-                        if starter == 1 and name
-                    }
-                else:
-                    allowed_lineup_keys = {
+                    allowed_lineup_keys_all = {
                         (str(gid), team, name, pos)
                         for gid, team, name, pos in zip(
                             lineup_roster["game_id"],
@@ -5091,6 +5430,36 @@ class ModelTrainer:
                         )
                         if name
                     }
+                    allowed_lineup_keys_starters = {
+                        key
+                        for key, starter in zip(
+                            zip(
+                                lineup_roster["game_id"],
+                                lineup_roster["team"],
+                                lineup_roster["__pname_key"],
+                                lineup_roster["position"],
+                            ),
+                            lineup_roster["is_starter"],
+                        )
+                        if starter == 1 and key[2]
+                    }
+                    allowed_lineup_keys_starters = {
+                        (str(gid), team, name, pos)
+                        for gid, team, name, pos in allowed_lineup_keys_starters
+                    }
+                else:
+                    allowed_lineup_keys_all = {
+                        (str(gid), team, name, pos)
+                        for gid, team, name, pos in zip(
+                            lineup_roster["game_id"],
+                            lineup_roster["team"],
+                            lineup_roster["__pname_key"],
+                            lineup_roster["position"],
+                        )
+                        if name
+                    }
+                    allowed_lineup_keys_starters = allowed_lineup_keys_all.copy()
+                lineup_roster_full = lineup_roster.copy()
                 lineup_audit_frame = lineup_roster.copy()
                 lineup_export = lineup_roster.drop(columns=["__pname_key"], errors="ignore")
                 needed_cols = [
@@ -5108,14 +5477,9 @@ class ModelTrainer:
                         lineup_export[col] = np.nan
                 roster_frames.append(lineup_export[needed_cols])
 
-        for gid in game_ids:
-            roster_frame = self.db.fetch_game_roster(gid)
-            if not roster_frame.empty:
-                roster_frames.append(roster_frame)
-
         if not roster_frames:
             logging.info(
-                "No roster rows found for %d games; leaving player pool unchanged",
+                "No lineup rows supplied for %d games; leaving player pool unchanged",
                 len(game_ids),
             )
             return player_df
@@ -5152,6 +5516,66 @@ class ModelTrainer:
             player_df["position"] = ""
         player_df["__pname_key"] = _nname(player_df["player_name"])
 
+        if not lineup_roster_full.empty:
+            overrides = lineup_roster_full[
+                ["game_id", "team", "player_id", "__pname_key", "position"]
+            ].copy()
+            overrides["game_id"] = overrides["game_id"].astype(str)
+            overrides["team"] = overrides["team"].apply(normalize_team_abbr)
+            overrides["player_id"] = overrides["player_id"].fillna("").astype(str)
+            overrides["__pname_key"] = overrides["__pname_key"].fillna("")
+            overrides["position"] = overrides["position"].apply(normalize_position)
+
+            pid_override: Dict[Tuple[str, str], Tuple[str, str]] = {}
+            name_override: Dict[Tuple[str, str], Tuple[str, str]] = {}
+
+            for _, row in overrides.iterrows():
+                team_pos = (row["team"], row["position"])
+
+                player_id_value = row.get("player_id", "")
+                if isinstance(player_id_value, str):
+                    player_id_value = player_id_value.strip()
+                if player_id_value:
+                    pid_override[(row["game_id"], player_id_value)] = team_pos
+
+                name_key_value = row.get("__pname_key", "")
+                if isinstance(name_key_value, str):
+                    name_key_value = name_key_value.strip()
+                if name_key_value:
+                    name_override[(row["game_id"], name_key_value)] = team_pos
+
+            player_df["_gid"] = player_df["game_id"].astype(str)
+            player_df["_pid"] = player_df.get("player_id", "").fillna("").astype(str)
+
+            team_overrides: List[Optional[str]] = []
+            pos_overrides: List[Optional[str]] = []
+
+            name_keys = player_df["__pname_key"].fillna("")
+            for gid, pid, name_key in zip(player_df["_gid"], player_df["_pid"], name_keys):
+                override = pid_override.get((gid, pid)) if pid else None
+                if override is None and name_key:
+                    override = name_override.get((gid, name_key))
+                if override is None:
+                    team_overrides.append(None)
+                    pos_overrides.append(None)
+                else:
+                    team_overrides.append(override[0])
+                    pos_overrides.append(override[1])
+
+            team_overrides_series = pd.Series(team_overrides, index=player_df.index)
+            pos_overrides_series = pd.Series(pos_overrides, index=player_df.index)
+
+            team_mask = team_overrides_series.notna()
+            if team_mask.any():
+                player_df.loc[team_mask, "team"] = team_overrides_series[team_mask]
+
+            pos_mask = pos_overrides_series.notna()
+            if pos_mask.any():
+                player_df.loc[pos_mask, "position"] = pos_overrides_series[pos_mask]
+
+            player_df.drop(columns=["_gid", "_pid"], inplace=True)
+
+        player_df["team"] = player_df["team"].apply(normalize_team_abbr)
         roster = roster.copy()
         roster["player_id"] = roster["player_id"].fillna("").astype(str)
         roster["team"] = roster["team"].apply(normalize_team_abbr)
@@ -5174,7 +5598,95 @@ class ModelTrainer:
             left_on=["game_id", "team", "player_id"],
             right_on=["game_id", "team", "player_id"],
             suffixes=("", "_r"),
-        )
+        ).copy()
+
+        merged["game_id"] = merged["game_id"].astype(str)
+        merged["team"] = merged["team"].apply(normalize_team_abbr)
+        merged["position"] = merged["position"].apply(normalize_position)
+        if "is_placeholder" not in merged.columns:
+            merged["is_placeholder"] = False
+        else:
+            merged["is_placeholder"] = merged["is_placeholder"].fillna(False)
+
+        numeric_columns: List[str] = [
+            col
+            for col in merged.columns
+            if pd.api.types.is_numeric_dtype(merged[col])
+            and col not in {"depth_rank", "is_starter", "_lineup_hit"}
+        ]
+
+        merged["_placeholder_weight"] = compute_recency_usage_weights(merged)
+
+        def _compute_weighted_baseline(
+            frame: pd.DataFrame, group_cols: List[str]
+        ) -> pd.DataFrame:
+            if frame.empty or not numeric_columns:
+                return pd.DataFrame()
+
+            def _agg(group: pd.DataFrame) -> pd.Series:
+                weights = group["_placeholder_weight"].fillna(0.0)
+                positive_weight = float(weights[weights > 0].sum())
+                result: Dict[str, float] = {}
+                for column in numeric_columns:
+                    values = group[column]
+                    mask = values.notna()
+                    if mask.any():
+                        use_weights = weights[mask]
+                        if use_weights.sum() > 0:
+                            result[column] = float(
+                                np.average(values[mask], weights=use_weights)
+                            )
+                        else:
+                            result[column] = float(values[mask].mean())
+                    else:
+                        result[column] = np.nan
+                if positive_weight <= 0:
+                    positive_weight = float(len(group))
+                result["_weight"] = positive_weight
+                return pd.Series(result)
+
+            baseline = (
+                frame.groupby(group_cols, dropna=False)
+                .apply(_agg)
+                .sort_index()
+            )
+            baseline.index = baseline.index.set_names(group_cols)
+            return baseline
+
+        if numeric_columns:
+            game_team_pos_baseline = _compute_weighted_baseline(
+                merged, ["game_id", "team", "position"]
+            )
+            team_context_baseline = _compute_weighted_baseline(merged, ["game_id", "team"])
+            team_pos_baseline = _compute_weighted_baseline(merged, ["team", "position"])
+            pos_baseline = _compute_weighted_baseline(merged, ["position"])
+
+            weights_all = merged["_placeholder_weight"].fillna(0.0)
+            league_stats: Dict[str, float] = {}
+            for column in numeric_columns:
+                values = merged[column]
+                mask = values.notna()
+                if mask.any():
+                    use_weights = weights_all[mask]
+                    if use_weights.sum() > 0:
+                        league_stats[column] = float(
+                            np.average(values[mask], weights=use_weights)
+                        )
+                    else:
+                        league_stats[column] = float(values[mask].mean())
+                else:
+                    league_stats[column] = np.nan
+            positive_weight = float(weights_all[weights_all > 0].sum())
+            if positive_weight <= 0:
+                positive_weight = float(len(merged))
+            league_stats["_weight"] = positive_weight
+            league_baseline = pd.Series(league_stats)
+        else:
+            game_team_pos_baseline = pd.DataFrame()
+            team_context_baseline = pd.DataFrame()
+            team_pos_baseline = pd.DataFrame()
+            pos_baseline = pd.DataFrame()
+            league_baseline = pd.Series(dtype=float)
 
         mask_missing = merged["depth_rank"].isna()
         if mask_missing.any():
@@ -5192,10 +5704,228 @@ class ModelTrainer:
 
         merged["_lineup_hit"] = merged["depth_rank"].notna()
 
+        def _assign_numeric_defaults(
+            placeholder: Dict[str, Any], values: Optional[pd.Series]
+        ) -> None:
+            if values is None or not numeric_columns:
+                return
+            for column in numeric_columns:
+                if column not in values:
+                    continue
+                value = values[column]
+                if pd.isna(value):
+                    continue
+                if column not in placeholder or pd.isna(placeholder[column]):
+                    placeholder[column] = value
+
+        def _build_placeholder_row(lineup_row: pd.Series) -> Optional[Dict[str, Any]]:
+            game_id_value = str(lineup_row.get("game_id", "")).strip()
+            team_value = normalize_team_abbr(lineup_row.get("team"))
+            position_value = normalize_position(lineup_row.get("position"))
+            if not game_id_value or not team_value or not position_value:
+                return None
+
+            name_key = lineup_row.get("__pname_key", "") or ""
+            if not name_key:
+                name_seed = " ".join(
+                    part
+                    for part in [
+                        str(lineup_row.get("first_name", "")).strip(),
+                        str(lineup_row.get("last_name", "")).strip(),
+                    ]
+                    if part
+                ) or str(lineup_row.get("player_name", "")).strip()
+                name_key = robust_player_name_key(name_seed)
+            if not name_key:
+                return None
+
+            template_pool = merged[
+                (merged["game_id"].astype(str) == game_id_value)
+                & (merged["team"] == team_value)
+            ]
+            if template_pool.empty:
+                template_pool = merged[merged["game_id"].astype(str) == game_id_value]
+            position_pool = pd.DataFrame()
+            if template_pool.empty:
+                base_values = {col: np.nan for col in merged.columns}
+            else:
+                position_pool = template_pool[template_pool["position"] == position_value]
+                if position_pool.empty:
+                    position_pool = template_pool
+                base_row = position_pool.iloc[0]
+                base_values = {col: base_row.get(col, np.nan) for col in merged.columns}
+            fallback_candidates: List[pd.Series] = []
+            if numeric_columns:
+                if not position_pool.empty:
+                    numeric_defaults = position_pool[numeric_columns].mean()
+                    numeric_defaults = numeric_defaults.reindex(numeric_columns)
+                    try:
+                        pool_weight = float(
+                            position_pool["_placeholder_weight"].fillna(0.0).sum()
+                        )
+                    except KeyError:
+                        pool_weight = float(len(position_pool))
+                    numeric_defaults.loc["_weight"] = pool_weight
+                    fallback_candidates.append(numeric_defaults)
+
+                def _append_baseline(
+                    source: pd.DataFrame, key: Tuple[Any, ...]
+                ) -> None:
+                    if source is None or getattr(source, "empty", True):
+                        return
+                    try:
+                        series = source.loc[key]
+                    except KeyError:
+                        return
+                    if isinstance(series, pd.DataFrame):
+                        if series.empty:
+                            return
+                        series = series.iloc[0]
+                    fallback_candidates.append(series)
+
+                _append_baseline(
+                    team_context_baseline, (game_id_value, team_value)
+                )
+                _append_baseline(
+                    game_team_pos_baseline, (game_id_value, team_value, position_value)
+                )
+                _append_baseline(team_pos_baseline, (team_value, position_value))
+                _append_baseline(pos_baseline, (position_value,))
+                if isinstance(league_baseline, pd.Series) and not league_baseline.empty:
+                    fallback_candidates.append(league_baseline)
+
+            player_name_value = str(lineup_row.get("player_name", "")).strip()
+            if not player_name_value:
+                first = str(lineup_row.get("first_name", "")).strip()
+                last = str(lineup_row.get("last_name", "")).strip()
+                player_name_value = " ".join(part for part in [first, last] if part)
+
+            placeholder: Dict[str, Any] = dict(base_values)
+            placeholder.pop("_placeholder_weight", None)
+            placeholder["game_id"] = game_id_value
+            placeholder["team"] = team_value
+            if "opponent" in placeholder and pd.isna(placeholder["opponent"]):
+                opp_pool = merged[
+                    (merged["game_id"].astype(str) == game_id_value)
+                    & (merged["team"] != team_value)
+                ]
+                if not opp_pool.empty:
+                    placeholder["opponent"] = opp_pool.iloc[0].get("team")
+            placeholder["position"] = position_value
+            placeholder["player_name"] = player_name_value
+            if "player_name_norm" in placeholder:
+                placeholder["player_name_norm"] = normalize_player_name(
+                    player_name_value
+                )
+            placeholder["__pname_key"] = name_key
+
+            raw_player_id = lineup_row.get("player_id")
+            if isinstance(raw_player_id, str) and raw_player_id.strip():
+                player_id_value = raw_player_id.strip()
+            else:
+                player_id_value = f"lineup_{team_value}_{name_key}"
+            placeholder["player_id"] = player_id_value
+
+            depth_rank_value = parse_depth_rank(lineup_row.get("rank"))
+            placeholder["depth_rank"] = depth_rank_value
+            starter_flag = 1 if self._is_lineup_starter(position_value, depth_rank_value) else 0
+            placeholder["is_starter"] = starter_flag
+            placeholder["_lineup_hit"] = True
+            placeholder["is_placeholder"] = True
+
+            for defaults in fallback_candidates:
+                _assign_numeric_defaults(placeholder, defaults)
+
+            status_bucket = lineup_row.get("status_bucket")
+            practice_status = lineup_row.get("practice_status")
+            if status_bucket:
+                status_bucket = normalize_injury_status(status_bucket)
+                practice_status = normalize_practice_status(practice_status)
+            else:
+                status_bucket, practice_status = interpret_playing_probability(
+                    lineup_row.get("playing_probability")
+                )
+                status_bucket = normalize_injury_status(status_bucket)
+                practice_status = normalize_practice_status(practice_status)
+            placeholder["status_bucket"] = status_bucket
+            placeholder["practice_status"] = practice_status
+            if "injury_priority" in placeholder:
+                placeholder["injury_priority"] = INJURY_STATUS_PRIORITY.get(
+                    status_bucket, INJURY_STATUS_PRIORITY.get("other", 1)
+                )
+            if "practice_priority" in placeholder:
+                placeholder["practice_priority"] = PRACTICE_STATUS_PRIORITY.get(
+                    practice_status, PRACTICE_STATUS_PRIORITY.get("available", 1)
+                )
+
+            updated_at = lineup_row.get("updated_at")
+            if "updated_at" in placeholder:
+                placeholder["updated_at"] = updated_at
+            game_start_value = lineup_row.get("game_start")
+            if "game_start" in placeholder:
+                placeholder["game_start"] = game_start_value
+            if "first_name" in placeholder:
+                placeholder["first_name"] = lineup_row.get("first_name", "")
+            if "last_name" in placeholder:
+                placeholder["last_name"] = lineup_row.get("last_name", "")
+            if "source" in placeholder and not placeholder.get("source"):
+                placeholder["source"] = "msf-lineup"
+            if "is_projected_starter" in placeholder:
+                placeholder["is_projected_starter"] = True
+
+            return placeholder
+
+        if respect_lineups and not lineup_roster_full.empty:
+            normalized_lineup = lineup_roster_full.copy()
+            normalized_lineup["game_id"] = normalized_lineup["game_id"].astype(str)
+            normalized_lineup["team"] = normalized_lineup["team"].apply(normalize_team_abbr)
+            normalized_lineup["position"] = normalized_lineup["position"].apply(normalize_position)
+            if "__pname_key" not in normalized_lineup.columns:
+                normalized_lineup["__pname_key"] = normalized_lineup["player_name"].map(
+                    robust_player_name_key
+                )
+            normalized_lineup["__pname_key"] = normalized_lineup["__pname_key"].fillna("")
+            normalized_lineup = normalized_lineup[normalized_lineup["__pname_key"] != ""]
+
+            existing_lineup_keys: Set[Tuple[str, str, str, str]] = set(
+                zip(
+                    merged["game_id"].astype(str),
+                    merged["team"],
+                    merged["__pname_key"],
+                    merged["position"].apply(normalize_position),
+                )
+            )
+
+            placeholder_rows: List[Dict[str, Any]] = []
+            for _, lineup_row in normalized_lineup.iterrows():
+                key = (
+                    lineup_row.get("game_id", ""),
+                    lineup_row.get("team"),
+                    lineup_row.get("__pname_key", ""),
+                    normalize_position(lineup_row.get("position")),
+                )
+                if key in existing_lineup_keys:
+                    continue
+                placeholder = _build_placeholder_row(lineup_row)
+                if placeholder is None:
+                    continue
+                placeholder_rows.append(placeholder)
+                existing_lineup_keys.add(key)
+
+            if placeholder_rows:
+                placeholder_df = pd.DataFrame(placeholder_rows)
+                merged = safe_concat([merged, placeholder_df], ignore_index=True, sort=False)
+
+        merged["_lineup_hit"] = merged["depth_rank"].notna()
+
         if respect_lineups and not lineup_audit_frame.empty:
             self._audit_lineup_matches(lineup_audit_frame, player_df, merged)
 
         candidate_pool = merged.copy()
+        initial_candidate_count = len(candidate_pool)
+
+        allowed_lineup_keys = locals().get("allowed_lineup_keys_all", set())
+        starter_lineup_keys = locals().get("allowed_lineup_keys_starters", set())
 
         if respect_lineups and allowed_lineup_keys:
             key_series = pd.Series(
@@ -5213,30 +5943,40 @@ class ModelTrainer:
                 ["K", "DEF"]
             )
             merged = merged[allowed_mask]
+        else:
+            key_series = pd.Series(
+                list(
+                    zip(
+                        merged["game_id"].astype(str),
+                        merged["team"],
+                        merged["__pname_key"],
+                        merged["position"].apply(normalize_position),
+                    )
+                ),
+                index=merged.index,
+            )
 
-        merged["depth_rank"] = merged["depth_rank"].fillna(9).astype(int)
-        merged["is_starter"] = merged["is_starter"].fillna(0).astype(int)
+        merged.loc[:, "depth_rank"] = merged["depth_rank"].fillna(9).astype(int)
+        merged.loc[:, "is_starter"] = merged["is_starter"].fillna(0).astype(int)
 
         merged_before_filter = merged.copy()
 
         if respect_lineups:
-            before = len(merged)
-            merged = merged[
-                (merged["is_starter"] == 1)
-                | (merged["position"].isin(["K", "DEF"]))
-            ]
+            matched_count = int(merged_before_filter["_lineup_hit"].sum())
             logging.info(
-                "Roster gate: %d → %d players after filtering to starters (matches=%d)",
-                before,
+                "Roster gate respected lineups: kept %d of %d players (matched=%d)",
                 len(merged),
-                int(merged_before_filter["_lineup_hit"].sum()),
+                initial_candidate_count,
+                matched_count,
             )
 
             required_counts: Dict[str, int] = {"QB": 1, "RB": 2, "WR": 3, "TE": 1}
             additions: List[pd.DataFrame] = []
+
+            starter_mask = key_series.isin(starter_lineup_keys) if starter_lineup_keys else pd.Series(False, index=merged.index)
             starter_groups = {
                 key: grp
-                for key, grp in merged.groupby(["game_id", "team"], sort=False)
+                for key, grp in merged.loc[starter_mask].groupby(["game_id", "team"], sort=False)
             }
 
             def _make_key(pid_value: Any, name_value: Any) -> Tuple[str, str]:
@@ -5319,6 +6059,8 @@ class ModelTrainer:
             if additions:
                 merged = safe_concat([merged] + additions, ignore_index=True, sort=False)
 
+        merged["_usage_confidence"] = compute_recency_usage_weights(merged)
+        merged = merged.drop(columns=["_placeholder_weight"], errors="ignore")
         return merged.drop(columns=["__pname_key", "_lineup_hit"], errors="ignore")
 
     def _audit_lineup_matches(
@@ -5377,28 +6119,33 @@ class ModelTrainer:
             )
 
             reported: Set[Tuple[str, str, str]] = set()
-            for row in lineup.itertuples():
-                key = (row.game_id, row.team, row.__pname_key, row.position)
+            for _, row in lineup.iterrows():
+                game_id_value = str(row.get("game_id"))
+                team_value = row.get("team")
+                pname_key_value = row.get("__pname_key", "")
+                position_value = normalize_position(row.get("position", ""))
+
+                key = (game_id_value, team_value, pname_key_value, position_value)
                 if key in matched_keys:
                     continue
-                summary_key = (row.game_id, row.team, row.__pname_key)
+                summary_key = (game_id_value, team_value, pname_key_value)
                 if summary_key in reported:
                     continue
                 team_pool = players[
-                    (players["game_id"] == row.game_id)
-                    & (players["team"] == row.team)
+                    (players["game_id"] == game_id_value)
+                    & (players["team"] == team_value)
                 ]
                 reasons: List[str] = []
                 if team_pool.empty:
                     reasons.append("team missing in features")
                 else:
-                    name_pool = team_pool[team_pool["__pname_key"] == row.__pname_key]
+                    name_pool = team_pool[team_pool["__pname_key"] == pname_key_value]
                     if name_pool.empty:
                         reasons.append("not in latest_players")
                     else:
                         pos_pool = name_pool[
                             name_pool["position"].apply(normalize_position)
-                            == row.position
+                            == position_value
                         ]
                         if pos_pool.empty:
                             reasons.append("position mismatch")
@@ -5416,28 +6163,315 @@ class ModelTrainer:
                 if not reasons:
                     reasons.append("unmatched")
 
-                player_label = getattr(row, "player_name", "").strip() or (
-                    " ".join(
-                        part
-                        for part in [
-                            getattr(row, "first_name", ""),
-                            getattr(row, "last_name", ""),
-                        ]
-                        if part
-                    )
-                )
+                player_label = str(row.get("player_name", "")).strip()
+                if not player_label:
+                    first = str(row.get("first_name", "")).strip()
+                    last = str(row.get("last_name", "")).strip()
+                    player_label = " ".join(
+                        part for part in [first, last] if part
+                    ).strip()
+                player_label = player_label or pname_key_value or "(unknown)"
+
                 logging.warning(
                     "[%s %s %s-%s] %s: %s",
-                    row.game_id,
-                    row.team,
-                    row.position,
-                    getattr(row, "rank", ""),
+                    game_id_value,
+                    team_value,
+                    position_value,
+                    row.get("rank", ""),
                     player_label,
                     ", ".join(reasons),
                 )
                 reported.add(summary_key)
         except Exception:
             logging.debug("Lineup audit diagnostics failed", exc_info=True)
+
+    def _compute_target_priors(self, df: pd.DataFrame, target: str) -> Dict[str, Any]:
+        priors: Dict[str, Any] = {
+            "league": {"mean": np.nan, "weight": 0.0},
+            "position": {},
+            "team_position": {},
+        }
+        if df.empty or target not in df.columns:
+            return priors
+
+        working = df.copy()
+        if "team" in working.columns:
+            working["team"] = working["team"].apply(normalize_team_abbr)
+        if "position" in working.columns:
+            working["position"] = working["position"].apply(normalize_position)
+
+        mask_actual = working[target].notna()
+        if "is_synthetic" in working.columns:
+            mask_actual &= ~working["is_synthetic"].astype(bool)
+        actual = working[mask_actual]
+        if actual.empty:
+            return priors
+
+        weights_all = (
+            actual.get("sample_weight", pd.Series(1.0, index=actual.index))
+            .astype(float)
+            .clip(lower=1e-4)
+        )
+        values_all = actual[target].astype(float)
+        priors["league"] = {
+            "mean": float(np.average(values_all, weights=weights_all)),
+            "weight": float(weights_all.sum()),
+        }
+
+        for (team, position), group in actual.groupby(["team", "position"]):
+            group_weights = (
+                group.get("sample_weight", pd.Series(1.0, index=group.index))
+                .astype(float)
+                .clip(lower=1e-4)
+            )
+            group_values = group[target].astype(float)
+            priors["team_position"][(team, position)] = {
+                "mean": float(np.average(group_values, weights=group_weights)),
+                "weight": float(group_weights.sum()),
+            }
+
+        for position, group in actual.groupby(["position"]):
+            group_weights = (
+                group.get("sample_weight", pd.Series(1.0, index=group.index))
+                .astype(float)
+                .clip(lower=1e-4)
+            )
+            group_values = group[target].astype(float)
+            priors["position"][position] = {
+                "mean": float(np.average(group_values, weights=group_weights)),
+                "weight": float(group_weights.sum()),
+            }
+
+        return priors
+
+    def _resolve_prior(
+        self,
+        target: str,
+        team: Optional[str],
+        position: Optional[str],
+    ) -> Tuple[float, float]:
+        priors = self.target_priors.get(target)
+        if not priors:
+            return (np.nan, 0.0)
+
+        team_norm = normalize_team_abbr(team) if team else None
+        pos_norm = normalize_position(position) if position else None
+
+        if team_norm and pos_norm:
+            entry = priors["team_position"].get((team_norm, pos_norm))
+            if entry:
+                return (entry.get("mean", np.nan), entry.get("weight", 0.0))
+
+        if pos_norm:
+            entry = priors["position"].get(pos_norm)
+            if entry:
+                return (entry.get("mean", np.nan), entry.get("weight", 0.0))
+
+        league_entry = priors.get("league", {})
+        return (
+            league_entry.get("mean", np.nan),
+            league_entry.get("weight", 0.0),
+        )
+
+    def _build_neighbor_engine(
+        self,
+        transformer: ColumnTransformer,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        train_df: pd.DataFrame,
+        feature_columns: List[str],
+        train_weights: pd.Series,
+        target: str,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            mask = (~train_df.get("is_synthetic", False).astype(bool)) & y_train.notna()
+        except Exception:
+            mask = y_train.notna()
+
+        if not mask.any():
+            return None
+
+        feature_subset = X_train.loc[mask, feature_columns]
+        if feature_subset.empty:
+            return None
+
+        try:
+            transformed = transformer.transform(feature_subset)
+        except Exception:
+            logging.debug("Failed to transform features for neighbor prior on %s", target, exc_info=True)
+            return None
+
+        if hasattr(transformed, "toarray"):
+            matrix = transformed.toarray()
+        else:
+            matrix = np.asarray(transformed)
+
+        if matrix.shape[0] < 3:
+            return None
+
+        neighbor_count = int(min(25, matrix.shape[0]))
+        try:
+            nn = NearestNeighbors(n_neighbors=neighbor_count)
+            nn.fit(matrix)
+        except Exception:
+            logging.debug("Unable to fit neighbor model for %s", target, exc_info=True)
+            return None
+
+        weight_array = (
+            train_weights.loc[mask]
+            .astype(float)
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(1.0)
+            .clip(lower=1e-4)
+            .to_numpy()
+        )
+        target_array = y_train.loc[mask].astype(float).to_numpy()
+
+        smoothing = float(np.median(weight_array) * neighbor_count)
+        smoothing = max(smoothing, 5.0)
+
+        return {
+            "transformer": transformer,
+            "feature_columns": list(feature_columns),
+            "nn": nn,
+            "targets": target_array,
+            "weights": weight_array,
+            "smoothing": smoothing,
+            "n_neighbors": neighbor_count,
+        }
+
+    def calibrate_player_predictions(
+        self,
+        target: str,
+        feature_slice: pd.DataFrame,
+        predictions: np.ndarray,
+    ) -> np.ndarray:
+        if feature_slice is None or feature_slice.empty:
+            return predictions
+
+        preds = np.asarray(predictions, dtype=float)
+        if preds.size == 0:
+            return preds
+
+        features = feature_slice.copy()
+        if "team" in features.columns:
+            features["team"] = features["team"].apply(normalize_team_abbr)
+        if "position" in features.columns:
+            features["position"] = features["position"].apply(normalize_position)
+
+        usage_conf = features.get("_usage_confidence", pd.Series(0.5, index=features.index))
+        usage_conf = pd.to_numeric(usage_conf, errors="coerce").fillna(0.5).clip(0.0, 1.0)
+        is_placeholder = features.get("is_placeholder", pd.Series(False, index=features.index))
+        is_placeholder = coerce_boolean_mask(is_placeholder)
+
+        neighbor_engine = self.prior_engines.get(target)
+        neighbor_means = np.full(len(features), np.nan, dtype=float)
+        neighbor_supports = np.zeros(len(features), dtype=float)
+        neighbor_strengths = np.zeros(len(features), dtype=float)
+
+        if neighbor_engine:
+            required_cols = neighbor_engine.get("feature_columns", [])
+            if required_cols:
+                aligned = features.reindex(columns=required_cols, fill_value=np.nan)
+                try:
+                    transformed = neighbor_engine["transformer"].transform(aligned)
+                    if hasattr(transformed, "toarray"):
+                        matrix = transformed.toarray()
+                    else:
+                        matrix = np.asarray(transformed)
+                    distances, indices = neighbor_engine["nn"].kneighbors(
+                        matrix, return_distance=True
+                    )
+                    neighbor_targets = neighbor_engine["targets"][indices]
+                    base_weights = neighbor_engine["weights"][indices]
+                    inv_distance = 1.0 / (distances + 1e-6)
+                    weighted = base_weights * inv_distance
+                    weight_sums = weighted.sum(axis=1)
+                    valid_mask = weight_sums > 0
+                    if np.any(valid_mask):
+                        neighbor_means[valid_mask] = (
+                            (weighted[valid_mask] * neighbor_targets[valid_mask]).sum(axis=1)
+                            / weight_sums[valid_mask]
+                        )
+                        neighbor_supports[valid_mask] = weight_sums[valid_mask]
+                        smoothing = float(neighbor_engine.get("smoothing", 10.0))
+                        neighbor_strengths[valid_mask] = neighbor_supports[valid_mask] / (
+                            neighbor_supports[valid_mask] + smoothing
+                        )
+                except Exception:
+                    logging.debug(
+                        "Unable to apply neighbor prior for %s during calibration", target, exc_info=True
+                    )
+
+        for idx, (row_idx, row) in enumerate(features.iterrows()):
+            confidence = (
+                float(usage_conf.loc[row_idx]) if row_idx in usage_conf.index else 0.5
+            )
+            placeholder_flag = (
+                bool(is_placeholder.loc[row_idx]) if row_idx in is_placeholder.index else False
+            )
+
+            # Skip calibration when we already have a confident, data-backed projection.
+            if not placeholder_flag and confidence >= 0.6:
+                continue
+
+            prior_mean, prior_weight = self._resolve_prior(
+                target,
+                row.get("team"),
+                row.get("position"),
+            )
+
+            neighbor_mean = neighbor_means[idx]
+            neighbor_conf = neighbor_strengths[idx]
+            neighbor_weight = neighbor_supports[idx]
+
+            combined_mean = np.nan
+            combined_weight = 0.0
+
+            if not np.isnan(neighbor_mean) and neighbor_conf > 0:
+                neighbor_support = max(neighbor_weight, 0.0)
+                if not np.isnan(prior_mean) and prior_weight > 0:
+                    combined_mean = (
+                        neighbor_mean * neighbor_support + prior_mean * prior_weight
+                    ) / (neighbor_support + prior_weight)
+                    combined_weight = neighbor_support + prior_weight
+                else:
+                    combined_mean = neighbor_mean
+                    combined_weight = neighbor_support
+            elif not np.isnan(prior_mean) and prior_weight > 0:
+                combined_mean = prior_mean
+                combined_weight = prior_weight
+            else:
+                combined_mean = neighbor_mean if not np.isnan(neighbor_mean) else prior_mean
+                if np.isnan(combined_mean):
+                    continue
+
+            prior_strength = 0.0
+            if combined_weight > 0:
+                prior_strength = combined_weight / (combined_weight + 25.0)
+
+            mix_strength = max(prior_strength, neighbor_conf)
+
+            if placeholder_flag:
+                base_alpha = max(0.35, 1.0 - confidence) * mix_strength
+                alpha = np.clip(base_alpha, 0.0, 0.45)
+            else:
+                base_alpha = (1.0 - confidence) * mix_strength
+                alpha = np.clip(base_alpha, 0.0, 0.25)
+
+            if alpha <= 0:
+                continue
+
+            current_pred = preds[idx]
+            if np.isnan(current_pred) or np.isinf(current_pred):
+                preds[idx] = combined_mean
+            else:
+                preds[idx] = (1 - alpha) * current_pred + alpha * combined_mean
+
+        if target in NON_NEGATIVE_TARGETS:
+            np.maximum(preds, 0.0, out=preds)
+
+        return preds
 
     # ------------------------------------------------------------------
     # Chronological splitting utilities
@@ -5511,12 +6545,29 @@ class ModelTrainer:
     def _train_regression_model(self, df: pd.DataFrame, target: str) -> Optional[Pipeline]:
         if len(df) < 20 or df[target].nunique() <= 1:
             logging.warning(
-                "Not enough data to train %s model (rows=%d, unique targets=%d).", 
+                "Not enough data to train %s model (rows=%d, unique targets=%d).",
                 target,
                 len(df),
                 df[target].nunique(),
             )
             return None
+
+        df = df.copy()
+        if "sample_weight" not in df.columns:
+            df["sample_weight"] = 1.0
+        else:
+            df["sample_weight"] = (
+                pd.to_numeric(df["sample_weight"], errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(1.0)
+                .clip(lower=1e-4)
+            )
+        if "is_synthetic" not in df.columns:
+            df["is_synthetic"] = False
+        else:
+            df["is_synthetic"] = df["is_synthetic"].fillna(False).astype(bool)
+
+        self.target_priors[target] = self._compute_target_priors(df, target)
 
         numeric_features = [
             "week",
@@ -5610,6 +6661,67 @@ class ModelTrainer:
         X_test = test_df[feature_columns]
         y_test = test_df[target]
 
+        def _weights_from(frame: pd.DataFrame) -> pd.Series:
+            series = frame.get("sample_weight")
+            if series is None:
+                return pd.Series(1.0, index=frame.index)
+            return (
+                pd.to_numeric(series, errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(1.0)
+                .clip(lower=1e-4)
+            )
+
+        train_weights = _weights_from(train_df)
+        test_weights = _weights_from(test_df)
+        sorted_weights = _weights_from(sorted_df)
+
+        def _as_weight_array(series: Optional[pd.Series]) -> Optional[np.ndarray]:
+            if series is None or series.empty:
+                return None
+            return series.astype(float).to_numpy()
+
+        train_weight_array = _as_weight_array(train_weights)
+
+        def _weighted_metrics(
+            y_true: pd.Series,
+            y_pred: np.ndarray,
+            weights: Optional[np.ndarray],
+        ) -> Tuple[float, float, float]:
+            if len(y_true) == 0:
+                return (np.nan, np.nan, np.nan)
+            if weights is not None and len(weights) == len(y_true):
+                w = np.clip(weights.astype(float), 1e-6, None)
+                diff = y_pred - y_true.to_numpy(dtype=float)
+                mae = float(np.average(np.abs(diff), weights=w))
+                mse = float(np.average(diff ** 2, weights=w))
+                rmse = float(np.sqrt(mse))
+                if len(y_true) > 1:
+                    try:
+                        r2 = float(r2_score(y_true, y_pred, sample_weight=w))
+                    except ValueError:
+                        r2 = np.nan
+                else:
+                    r2 = np.nan
+                return (r2, mae, rmse)
+            diff = y_pred - y_true.to_numpy(dtype=float)
+            mae = float(mean_absolute_error(y_true, y_pred))
+            rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+            r2 = float(r2_score(y_true, y_pred)) if len(y_true) > 1 else np.nan
+            return (r2, mae, rmse)
+
+        actual_mask = (~test_df.get("is_synthetic", False).astype(bool)) & y_test.notna()
+        if not actual_mask.any():
+            logging.warning(
+                "Holdout set for %s contains no non-synthetic observations; evaluating on available rows.",
+                target,
+            )
+            actual_mask = y_test.notna()
+
+        X_test_actual = X_test.loc[actual_mask]
+        y_test_actual = y_test.loc[actual_mask]
+        test_weight_array = _as_weight_array(test_weights.loc[actual_mask])
+
         transformers = []
         if available_numeric:
             transformers.append(
@@ -5634,30 +6746,63 @@ class ModelTrainer:
                 )
             )
 
-        preprocessor = ColumnTransformer(transformers=transformers)
+        preprocessor_template = ColumnTransformer(transformers=transformers)
+
+        self.prior_engines[target] = None
+        prior_transformer = None
+        try:
+            prior_transformer = clone(preprocessor_template)
+            prior_transformer.fit(X_train)
+        except Exception:
+            logging.debug("Unable to fit prior transformer for %s", target, exc_info=True)
+            prior_transformer = None
+
+        if prior_transformer is not None:
+            neighbor_engine = self._build_neighbor_engine(
+                prior_transformer,
+                X_train,
+                y_train,
+                train_df,
+                feature_columns,
+                train_weights,
+                target,
+            )
+            self.prior_engines[target] = neighbor_engine
+
+        preprocessor = preprocessor_template
 
         baseline_model = Pipeline([
             ("preprocessor", clone(preprocessor)),
             ("regressor", GradientBoostingRegressor(random_state=42)),
         ])
 
-        baseline_model.fit(X_train, y_train)
-        baseline_pred = baseline_model.predict(X_test)
-        baseline_r2 = baseline_model.score(X_test, y_test)
-        baseline_mae = mean_absolute_error(y_test, baseline_pred)
-        baseline_rmse = float(np.sqrt(mean_squared_error(y_test, baseline_pred)))
+        baseline_fit_params: Dict[str, Any] = {}
+        if train_weight_array is not None:
+            baseline_fit_params["regressor__sample_weight"] = train_weight_array
+
+        baseline_model.fit(X_train, y_train, **baseline_fit_params)
+
+        if len(X_test_actual) > 0:
+            baseline_pred_actual = baseline_model.predict(X_test_actual)
+        else:
+            baseline_pred_actual = np.array([], dtype=float)
+
+        baseline_r2, baseline_mae, baseline_rmse = _weighted_metrics(
+            y_test_actual, baseline_pred_actual, test_weight_array
+        )
         logging.info(
-            "Trained %s model (baseline GBM), R^2=%.3f on holdout (MAE=%.3f, RMSE=%.3f)",
+            "Trained %s model (baseline GBM), R^2=%.3f on holdout (MAE=%.3f, RMSE=%.3f, n=%d)",
             target,
             baseline_r2,
             baseline_mae,
             baseline_rmse,
+            len(y_test_actual),
         )
         self.db.record_backtest_metrics(
             self.run_id,
             f"{target}_baseline",
             {"r2": baseline_r2, "mae": baseline_mae, "rmse": baseline_rmse},
-            sample_size=len(y_test),
+            sample_size=len(y_test_actual),
         )
 
         tuned_model = Pipeline([
@@ -5673,8 +6818,19 @@ class ModelTrainer:
                 target,
                 exc,
             )
-            best_model = tuned_model.fit(X_train, y_train)
+            best_model = tuned_model.fit(
+                X_train,
+                y_train,
+                **(
+                    {"regressor__sample_weight": train_weight_array}
+                    if train_weight_array is not None
+                    else {}
+                ),
+            )
         else:
+            search_fit_params: Dict[str, Any] = {}
+            if train_weight_array is not None:
+                search_fit_params["regressor__sample_weight"] = train_weight_array
             search = RandomizedSearchCV(
                 estimator=tuned_model,
                 param_distributions=self._gb_param_grid("regressor__"),
@@ -5684,7 +6840,7 @@ class ModelTrainer:
                 random_state=42,
                 n_jobs=-1,
             )
-            search.fit(X_train, y_train)
+            search.fit(X_train, y_train, **search_fit_params)
             best_model: Pipeline = search.best_estimator_
             logging.info(
                 "Best parameters for %s model: %s (CV MAE=%.3f)",
@@ -5693,52 +6849,48 @@ class ModelTrainer:
                 -search.best_score_,
             )
 
-        rf_pipeline = Pipeline([
-            ("preprocessor", clone(preprocessor)),
-            (
-                "regressor",
-                RandomForestRegressor(
-                    n_estimators=400, random_state=42, min_samples_leaf=2, n_jobs=-1
-                ),
-            ),
-        ])
+        ensemble = clone(best_model)
 
-        final_estimator = GradientBoostingRegressor(
-            random_state=42, learning_rate=0.05, max_depth=3, n_estimators=200
-        )
+        ensemble_fit_params: Dict[str, Any] = {}
+        if train_weight_array is not None:
+            ensemble_fit_params = {
+                "regressor__sample_weight": train_weight_array,
+            }
+        ensemble.fit(X_train, y_train, **ensemble_fit_params)
 
-        ensemble = StackingRegressor(
-            estimators=[
-                ("gbm", clone(best_model)),
-                ("rf", rf_pipeline),
-            ],
-            final_estimator=final_estimator,
-            passthrough=False,
-            n_jobs=-1,
-        )
+        if len(X_test_actual) > 0:
+            y_pred_actual = ensemble.predict(X_test_actual)
+        else:
+            y_pred_actual = np.array([], dtype=float)
 
-        ensemble.fit(X_train, y_train)
-        y_pred = ensemble.predict(X_test)
-        r2 = ensemble.score(X_test, y_test)
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+        r2, mae, rmse = _weighted_metrics(y_test_actual, y_pred_actual, test_weight_array)
         logging.info(
-            "%s holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            "%s holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f | n=%d",
             target,
             r2,
             mae,
             rmse,
+            len(y_test_actual),
         )
 
         self.db.record_backtest_metrics(
             self.run_id,
             target,
             {"r2": r2, "mae": mae, "rmse": rmse},
-            sample_size=len(y_test),
+            sample_size=len(y_test_actual),
         )
         self.model_uncertainty[target] = {"rmse": rmse, "mae": mae}
 
-        ensemble.fit(sorted_df[feature_columns], sorted_df[target])
+        final_mask = sorted_df[target].notna()
+        final_features = sorted_df.loc[final_mask, feature_columns]
+        final_target = sorted_df.loc[final_mask, target]
+        final_weights_array = _as_weight_array(sorted_weights.loc[final_mask])
+        final_fit_params: Dict[str, Any] = {}
+        if final_weights_array is not None:
+            final_fit_params = {
+                "regressor__sample_weight": final_weights_array,
+            }
+        ensemble.fit(final_features, final_target, **final_fit_params)
         setattr(ensemble, "feature_columns", feature_columns)
         setattr(ensemble, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target))
         setattr(ensemble, "target_name", target)
@@ -6443,6 +7595,18 @@ def predict_upcoming_games(
                 if not depth_id:
                     depth_id = f"msf-lineup:{team}:{position}:{pname_key}"
 
+                status_bucket = row.get("status_bucket")
+                practice_status = row.get("practice_status")
+                if status_bucket:
+                    status_bucket = normalize_injury_status(status_bucket)
+                    practice_status = normalize_practice_status(practice_status)
+                else:
+                    status_bucket, practice_status = interpret_playing_probability(
+                        row.get("playing_probability")
+                    )
+                    status_bucket = normalize_injury_status(status_bucket)
+                    practice_status = normalize_practice_status(practice_status)
+
                 record = {
                     "game_id": str(getattr(game, "game_id", "")),
                     "depth_id": depth_id,
@@ -6461,6 +7625,8 @@ def predict_upcoming_games(
                     "base_pos": row.get("base_pos") or position,
                     "playing_probability": row.get("playing_probability"),
                     "player_team": row.get("player_team"),
+                    "status_bucket": status_bucket,
+                    "practice_status": practice_status,
                 }
                 key = (record["game_id"], team, pname_key, position)
                 existing = lineup_records.get(key)
@@ -6493,6 +7659,14 @@ def predict_upcoming_games(
         player_predictions = player_features[
             ["game_id", "team", "player_id", "player_name", "position"]
         ].copy()
+        if "_usage_confidence" in player_features.columns:
+            player_predictions["_usage_confidence"] = player_features[
+                "_usage_confidence"
+            ].values
+        if "is_placeholder" in player_features.columns:
+            player_predictions["is_placeholder"] = (
+                player_features["is_placeholder"].astype(bool).values
+            )
 
         for target, model in models.items():
             if target in {"game_winner", "home_points", "away_points"}:
@@ -6516,6 +7690,14 @@ def predict_upcoming_games(
                 except Exception:
                     logging.exception("Failed to generate predictions for %s", target)
                     continue
+                if trainer is not None:
+                    preds = trainer.calibrate_player_predictions(
+                        target,
+                        player_features.loc[mask],
+                        preds,
+                    )
+                if target in NON_NEGATIVE_TARGETS:
+                    preds = np.maximum(np.asarray(preds, dtype=float), 0.0)
                 target_values.loc[mask] = preds
             player_predictions[f"pred_{target}"] = target_values.values
 
@@ -6540,7 +7722,9 @@ def predict_upcoming_games(
             "pred_receiving_tds",
             "pred_passing_tds",
         ]
-        player_predictions[value_columns] = player_predictions[value_columns].fillna(0.0)
+        player_predictions[value_columns] = (
+            player_predictions[value_columns].fillna(0.0).clip(lower=0.0)
+        )
 
         qb_mask = player_predictions["position"] == "QB"
         rb_mask = player_predictions["position"] == "RB"
@@ -6671,6 +7855,15 @@ def predict_upcoming_games(
                 )
 
                 rows: List[List[str]] = []
+                def _non_negative(val: float) -> float:
+                    try:
+                        numeric = float(val)
+                    except (TypeError, ValueError):
+                        return 0.0
+                    if math.isnan(numeric) or math.isinf(numeric):
+                        return 0.0
+                    return numeric if numeric >= 0.0 else 0.0
+
                 for player in team_players.itertuples(index=False):
                     name = player.player_name or "Unknown Player"
 
@@ -6689,12 +7882,12 @@ def predict_upcoming_games(
                         [
                             name,
                             player.position,
-                            f"{player.pred_passing_yards:.2f}",
-                            f"{player.pred_rushing_yards:.2f}",
-                            f"{player.pred_receiving_yards:.2f}",
-                            f"{player.pred_receptions:.2f}",
-                            f"{display_touchdowns:.2f}",
-                            f"{player.pred_passing_tds:.2f}",
+                            f"{_non_negative(player.pred_passing_yards):.2f}",
+                            f"{_non_negative(player.pred_rushing_yards):.2f}",
+                            f"{_non_negative(player.pred_receiving_yards):.2f}",
+                            f"{_non_negative(player.pred_receptions):.2f}",
+                            f"{_non_negative(display_touchdowns):.2f}",
+                            f"{_non_negative(player.pred_passing_tds):.2f}",
                         ]
                     )
 
