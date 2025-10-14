@@ -6680,39 +6680,12 @@ class ModelTrainer:
                 -search.best_score_,
             )
 
-        rf_pipeline = Pipeline([
-            ("preprocessor", clone(preprocessor)),
-            (
-                "regressor",
-                RandomForestRegressor(
-                    n_estimators=400, random_state=42, min_samples_leaf=2, n_jobs=-1
-                ),
-            ),
-        ])
-
-        final_estimator = GradientBoostingRegressor(
-            random_state=42, learning_rate=0.05, max_depth=3, n_estimators=200
-        )
-
-        gbm_stack_estimator = clone(best_model)
-        rf_stack_estimator = rf_pipeline
-
-        ensemble = StackingRegressor(
-            estimators=[
-                ("gbm", gbm_stack_estimator),
-                ("rf", rf_stack_estimator),
-            ],
-            final_estimator=final_estimator,
-            passthrough=False,
-            n_jobs=-1,
-        )
+        ensemble = clone(best_model)
 
         ensemble_fit_params: Dict[str, Any] = {}
         if train_weight_array is not None:
             ensemble_fit_params = {
-                "gbm__regressor__sample_weight": train_weight_array,
-                "rf__regressor__sample_weight": train_weight_array,
-                "final_estimator__sample_weight": train_weight_array,
+                "regressor__sample_weight": train_weight_array,
             }
         ensemble.fit(X_train, y_train, **ensemble_fit_params)
 
@@ -6746,9 +6719,7 @@ class ModelTrainer:
         final_fit_params: Dict[str, Any] = {}
         if final_weights_array is not None:
             final_fit_params = {
-                "gbm__regressor__sample_weight": final_weights_array,
-                "rf__regressor__sample_weight": final_weights_array,
-                "final_estimator__sample_weight": final_weights_array,
+                "regressor__sample_weight": final_weights_array,
             }
         ensemble.fit(final_features, final_target, **final_fit_params)
         setattr(ensemble, "feature_columns", feature_columns)
