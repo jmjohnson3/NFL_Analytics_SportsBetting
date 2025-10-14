@@ -63,6 +63,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sqlalchemy import (
@@ -770,6 +771,8 @@ TARGET_ALLOWED_POSITIONS: Dict[str, set[str]] = {
     "receptions": {"RB", "HB", "FB", "WR", "TE"},
     "receiving_tds": {"RB", "HB", "FB", "WR", "TE"},
 }
+
+NON_NEGATIVE_TARGETS: set[str] = set(TARGET_ALLOWED_POSITIONS.keys())
 
 
 LINEUP_STALENESS_DAYS = 7
@@ -3733,12 +3736,13 @@ class FeatureBuilder:
                         synthetic_rows.append(synthetic)
 
                 if synthetic_rows:
-                    synthetic_df = pd.DataFrame(synthetic_rows)
-                    combined = safe_concat([labeled, synthetic_df], ignore_index=True, sort=False)
-                else:
-                    combined = labeled
+                    logging.debug(
+                        "Generated %d prior rows for %s but leaving them out of model training",
+                        len(synthetic_rows),
+                        target,
+                    )
 
-                combined = combined.drop(columns=["_usage_weight"], errors="ignore")
+                combined = labeled.drop(columns=["_usage_weight"], errors="ignore")
                 datasets[target] = combined
 
             ordered_targets = [
@@ -5351,6 +5355,7 @@ class ModelTrainer:
         self.run_id = run_id or uuid.uuid4().hex
         self.model_uncertainty: Dict[str, Dict[str, float]] = {}
         self.target_priors: Dict[str, Dict[str, Any]] = {}
+        self.prior_engines: Dict[str, Optional[Dict[str, Any]]] = {}
 
     @staticmethod
     def _is_lineup_starter(position: str, rank: Optional[int]) -> bool:
@@ -6271,6 +6276,73 @@ class ModelTrainer:
             league_entry.get("weight", 0.0),
         )
 
+    def _build_neighbor_engine(
+        self,
+        transformer: ColumnTransformer,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        train_df: pd.DataFrame,
+        feature_columns: List[str],
+        train_weights: pd.Series,
+        target: str,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            mask = (~train_df.get("is_synthetic", False).astype(bool)) & y_train.notna()
+        except Exception:
+            mask = y_train.notna()
+
+        if not mask.any():
+            return None
+
+        feature_subset = X_train.loc[mask, feature_columns]
+        if feature_subset.empty:
+            return None
+
+        try:
+            transformed = transformer.transform(feature_subset)
+        except Exception:
+            logging.debug("Failed to transform features for neighbor prior on %s", target, exc_info=True)
+            return None
+
+        if hasattr(transformed, "toarray"):
+            matrix = transformed.toarray()
+        else:
+            matrix = np.asarray(transformed)
+
+        if matrix.shape[0] < 3:
+            return None
+
+        neighbor_count = int(min(25, matrix.shape[0]))
+        try:
+            nn = NearestNeighbors(n_neighbors=neighbor_count)
+            nn.fit(matrix)
+        except Exception:
+            logging.debug("Unable to fit neighbor model for %s", target, exc_info=True)
+            return None
+
+        weight_array = (
+            train_weights.loc[mask]
+            .astype(float)
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(1.0)
+            .clip(lower=1e-4)
+            .to_numpy()
+        )
+        target_array = y_train.loc[mask].astype(float).to_numpy()
+
+        smoothing = float(np.median(weight_array) * neighbor_count)
+        smoothing = max(smoothing, 5.0)
+
+        return {
+            "transformer": transformer,
+            "feature_columns": list(feature_columns),
+            "nn": nn,
+            "targets": target_array,
+            "weights": weight_array,
+            "smoothing": smoothing,
+            "n_neighbors": neighbor_count,
+        }
+
     def calibrate_player_predictions(
         self,
         target: str,
@@ -6278,10 +6350,6 @@ class ModelTrainer:
         predictions: np.ndarray,
     ) -> np.ndarray:
         if feature_slice is None or feature_slice.empty:
-            return predictions
-
-        priors = self.target_priors.get(target)
-        if not priors:
             return predictions
 
         preds = np.asarray(predictions, dtype=float)
@@ -6299,31 +6367,99 @@ class ModelTrainer:
         is_placeholder = features.get("is_placeholder", pd.Series(False, index=features.index))
         is_placeholder = coerce_boolean_mask(is_placeholder)
 
-        for idx, (i, row) in enumerate(features.iterrows()):
+        neighbor_engine = self.prior_engines.get(target)
+        neighbor_means = np.full(len(features), np.nan, dtype=float)
+        neighbor_supports = np.zeros(len(features), dtype=float)
+        neighbor_strengths = np.zeros(len(features), dtype=float)
+
+        if neighbor_engine:
+            required_cols = neighbor_engine.get("feature_columns", [])
+            if required_cols:
+                aligned = features.reindex(columns=required_cols, fill_value=np.nan)
+                try:
+                    transformed = neighbor_engine["transformer"].transform(aligned)
+                    if hasattr(transformed, "toarray"):
+                        matrix = transformed.toarray()
+                    else:
+                        matrix = np.asarray(transformed)
+                    distances, indices = neighbor_engine["nn"].kneighbors(
+                        matrix, return_distance=True
+                    )
+                    neighbor_targets = neighbor_engine["targets"][indices]
+                    base_weights = neighbor_engine["weights"][indices]
+                    inv_distance = 1.0 / (distances + 1e-6)
+                    weighted = base_weights * inv_distance
+                    weight_sums = weighted.sum(axis=1)
+                    valid_mask = weight_sums > 0
+                    if np.any(valid_mask):
+                        neighbor_means[valid_mask] = (
+                            (weighted[valid_mask] * neighbor_targets[valid_mask]).sum(axis=1)
+                            / weight_sums[valid_mask]
+                        )
+                        neighbor_supports[valid_mask] = weight_sums[valid_mask]
+                        smoothing = float(neighbor_engine.get("smoothing", 10.0))
+                        neighbor_strengths[valid_mask] = neighbor_supports[valid_mask] / (
+                            neighbor_supports[valid_mask] + smoothing
+                        )
+                except Exception:
+                    logging.debug(
+                        "Unable to apply neighbor prior for %s during calibration", target, exc_info=True
+                    )
+
+        for idx, (row_idx, row) in enumerate(features.iterrows()):
             prior_mean, prior_weight = self._resolve_prior(
                 target,
                 row.get("team"),
                 row.get("position"),
             )
-            if np.isnan(prior_mean) or prior_weight <= 0:
-                continue
 
-            confidence = float(usage_conf.loc[i]) if i in usage_conf.index else 0.5
-            placeholder_flag = bool(is_placeholder.loc[i]) if i in is_placeholder.index else False
+            neighbor_mean = neighbor_means[idx]
+            neighbor_conf = neighbor_strengths[idx]
+            neighbor_weight = neighbor_supports[idx]
 
-            weight_factor = prior_weight / (prior_weight + 25.0)
-            shrink_base = 1.0 - confidence
-            if placeholder_flag:
-                shrink_base = max(shrink_base, 0.4)
+            combined_mean = np.nan
+            combined_weight = 0.0
+
+            if not np.isnan(neighbor_mean) and neighbor_conf > 0:
+                neighbor_support = max(neighbor_weight, 0.0)
+                if not np.isnan(prior_mean) and prior_weight > 0:
+                    combined_mean = (
+                        neighbor_mean * neighbor_support + prior_mean * prior_weight
+                    ) / (neighbor_support + prior_weight)
+                    combined_weight = neighbor_support + prior_weight
+                else:
+                    combined_mean = neighbor_mean
+                    combined_weight = neighbor_support
+            elif not np.isnan(prior_mean) and prior_weight > 0:
+                combined_mean = prior_mean
+                combined_weight = prior_weight
             else:
-                shrink_base = max(shrink_base * 0.5, 0.0)
-            alpha = np.clip(shrink_base * (0.4 + 0.6 * weight_factor), 0.0, 0.85)
+                combined_mean = neighbor_mean if not np.isnan(neighbor_mean) else prior_mean
+                if np.isnan(combined_mean):
+                    continue
+
+            confidence = float(usage_conf.loc[row_idx]) if row_idx in usage_conf.index else 0.5
+            placeholder_flag = (
+                bool(is_placeholder.loc[row_idx]) if row_idx in is_placeholder.index else False
+            )
+
+            usage_penalty = 1.0 - confidence
+            if placeholder_flag:
+                usage_penalty = max(usage_penalty, 0.6)
+            else:
+                usage_penalty = max(usage_penalty * 0.5, 0.15)
+
+            support = max(combined_weight, 0.0)
+            alpha = np.clip(usage_penalty * (support / (support + 25.0)), 0.0, 0.9)
 
             current_pred = preds[idx]
             if np.isnan(current_pred) or np.isinf(current_pred):
-                preds[idx] = prior_mean
+                preds[idx] = combined_mean
             else:
-                preds[idx] = (1 - alpha) * current_pred + alpha * prior_mean
+                preds[idx] = (1 - alpha) * current_pred + alpha * combined_mean
+
+        if target in NON_NEGATIVE_TARGETS:
+            np.maximum(preds, 0.0, out=preds)
 
         return preds
 
@@ -6600,7 +6736,30 @@ class ModelTrainer:
                 )
             )
 
-        preprocessor = ColumnTransformer(transformers=transformers)
+        preprocessor_template = ColumnTransformer(transformers=transformers)
+
+        self.prior_engines[target] = None
+        prior_transformer = None
+        try:
+            prior_transformer = clone(preprocessor_template)
+            prior_transformer.fit(X_train)
+        except Exception:
+            logging.debug("Unable to fit prior transformer for %s", target, exc_info=True)
+            prior_transformer = None
+
+        if prior_transformer is not None:
+            neighbor_engine = self._build_neighbor_engine(
+                prior_transformer,
+                X_train,
+                y_train,
+                train_df,
+                feature_columns,
+                train_weights,
+                target,
+            )
+            self.prior_engines[target] = neighbor_engine
+
+        preprocessor = preprocessor_template
 
         baseline_model = Pipeline([
             ("preprocessor", clone(preprocessor)),
@@ -7527,6 +7686,8 @@ def predict_upcoming_games(
                         player_features.loc[mask],
                         preds,
                     )
+                if target in NON_NEGATIVE_TARGETS:
+                    preds = np.maximum(np.asarray(preds, dtype=float), 0.0)
                 target_values.loc[mask] = preds
             player_predictions[f"pred_{target}"] = target_values.values
 
@@ -7551,7 +7712,9 @@ def predict_upcoming_games(
             "pred_receiving_tds",
             "pred_passing_tds",
         ]
-        player_predictions[value_columns] = player_predictions[value_columns].fillna(0.0)
+        player_predictions[value_columns] = (
+            player_predictions[value_columns].fillna(0.0).clip(lower=0.0)
+        )
 
         qb_mask = player_predictions["position"] == "QB"
         rb_mask = player_predictions["position"] == "RB"
@@ -7682,6 +7845,15 @@ def predict_upcoming_games(
                 )
 
                 rows: List[List[str]] = []
+                def _non_negative(val: float) -> float:
+                    try:
+                        numeric = float(val)
+                    except (TypeError, ValueError):
+                        return 0.0
+                    if math.isnan(numeric) or math.isinf(numeric):
+                        return 0.0
+                    return numeric if numeric >= 0.0 else 0.0
+
                 for player in team_players.itertuples(index=False):
                     name = player.player_name or "Unknown Player"
 
@@ -7700,12 +7872,12 @@ def predict_upcoming_games(
                         [
                             name,
                             player.position,
-                            f"{player.pred_passing_yards:.2f}",
-                            f"{player.pred_rushing_yards:.2f}",
-                            f"{player.pred_receiving_yards:.2f}",
-                            f"{player.pred_receptions:.2f}",
-                            f"{display_touchdowns:.2f}",
-                            f"{player.pred_passing_tds:.2f}",
+                            f"{_non_negative(player.pred_passing_yards):.2f}",
+                            f"{_non_negative(player.pred_rushing_yards):.2f}",
+                            f"{_non_negative(player.pred_receiving_yards):.2f}",
+                            f"{_non_negative(player.pred_receptions):.2f}",
+                            f"{_non_negative(display_touchdowns):.2f}",
+                            f"{_non_negative(player.pred_passing_tds):.2f}",
                         ]
                     )
 
