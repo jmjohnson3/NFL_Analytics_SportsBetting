@@ -121,6 +121,57 @@ def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
     return pd.concat(cleaned, **kwargs)
 
 
+def compute_rmse(y_true: Union[pd.Series, np.ndarray], y_pred: Union[pd.Series, np.ndarray]) -> float:
+    """Backwards-compatible RMSE that tolerates older sklearn versions."""
+
+    try:
+        return float(mean_squared_error(y_true, y_pred, squared=False))
+    except TypeError:
+        mse = mean_squared_error(y_true, y_pred)
+        return float(np.sqrt(mse))
+
+
+def _transform_with_feature_names(
+    preprocessor: ColumnTransformer,
+    frame: pd.DataFrame,
+    feature_names: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Run a ColumnTransformer and ensure a dense DataFrame with aligned columns."""
+
+    if frame is None or frame.empty:
+        return pd.DataFrame(index=getattr(frame, "index", None))
+
+    transformed = preprocessor.transform(frame)
+
+    if isinstance(transformed, pd.DataFrame):
+        result = transformed.copy()
+    else:
+        if hasattr(transformed, "toarray"):
+            transformed = transformed.toarray()
+        else:
+            transformed = np.asarray(transformed)
+        if transformed.ndim == 1:
+            transformed = transformed.reshape(-1, 1)
+        result = pd.DataFrame(transformed)
+
+    if len(result) == len(frame):
+        result.index = frame.index
+    else:
+        result.index = range(len(result))
+
+    names: Optional[Sequence[str]] = feature_names
+    if not names and hasattr(preprocessor, "get_feature_names_out"):
+        try:
+            names = list(preprocessor.get_feature_names_out())
+        except Exception:
+            names = None
+    if not names or len(names) != result.shape[1]:
+        names = [f"feature_{idx}" for idx in range(result.shape[1])]
+
+    result.columns = list(names)
+    return result
+
+
 # === PATCH: Pricing, Calibration & Modeling Utilities ========================
 def fair_american(prob: float) -> int:
     """Convert a fair probability to a fair American price."""
@@ -582,18 +633,15 @@ def emit_priced_picks(
 def make_quantile_pred_table(
     qmodel: QuantileYards,
     preprocessor: ColumnTransformer,
+    feature_names: Optional[Sequence[str]],
     X_week: pd.DataFrame,
     player_index: pd.DataFrame,
     market_name: str,
 ) -> pd.DataFrame:
     if X_week.empty:
         return pd.DataFrame()
-    feature_names = list(preprocessor.get_feature_names_out())
-    processed = pd.DataFrame(
-        preprocessor.transform(X_week),
-        columns=feature_names,
-        index=X_week.index,
-    )
+
+    processed = _transform_with_feature_names(preprocessor, X_week, feature_names)
     preds = qmodel.predict_quantiles(processed)
     output = player_index.copy()
     output["q10"] = preds[0.1]
@@ -606,17 +654,13 @@ def make_quantile_pred_table(
 def make_anytime_td_table(
     hmodel: HurdleTDModel,
     preprocessor: ColumnTransformer,
+    feature_names: Optional[Sequence[str]],
     X_week: pd.DataFrame,
     player_index: pd.DataFrame,
 ) -> pd.DataFrame:
     if X_week.empty:
         return pd.DataFrame()
-    feature_names = list(preprocessor.get_feature_names_out())
-    processed = pd.DataFrame(
-        preprocessor.transform(X_week),
-        columns=feature_names,
-        index=X_week.index,
-    )
+    processed = _transform_with_feature_names(preprocessor, X_week, feature_names)
     output = player_index.copy()
     output["anytime_prob"] = hmodel.pr_anytime(processed)
     output["market"] = "anytime_td"
@@ -7495,11 +7539,7 @@ class ModelTrainer:
                         try:
                             qpreds = quantile_model.predict_quantiles(processed_holdout)
                             mae_q = mean_absolute_error(y_test_actual, qpreds[0.5])
-                            rmse_q = mean_squared_error(
-                                y_test_actual,
-                                qpreds[0.5],
-                                squared=False,
-                            )
+                            rmse_q = compute_rmse(y_test_actual, qpreds[0.5])
                             logging.info(
                                 "%s quantile holdout | MAE=%.3f RMSE=%.3f",
                                 target,
@@ -7976,8 +8016,8 @@ class ModelTrainer:
             poisson_model = TeamPoissonTotals(alpha=1.0)
             poisson_model.fit(train_processed, y_home_train, train_processed, y_away_train)
             lam_home, lam_away = poisson_model.predict_lambda(test_processed, test_processed)
-            rmse_home_pois = mean_squared_error(y_home_test, lam_home, squared=False)
-            rmse_away_pois = mean_squared_error(y_away_test, lam_away, squared=False)
+            rmse_home_pois = compute_rmse(y_home_test, lam_home)
+            rmse_away_pois = compute_rmse(y_away_test, lam_away)
             logging.info(
                 "Poisson team totals holdout | Home RMSE=%.2f Away RMSE=%.2f",
                 rmse_home_pois,
@@ -8499,6 +8539,7 @@ def predict_upcoming_games(
             table = make_quantile_pred_table(
                 info["model"],
                 info["preprocessor"],
+                info.get("feature_names"),
                 features_subset,
                 player_index,
                 target,
@@ -8527,6 +8568,7 @@ def predict_upcoming_games(
             table = make_anytime_td_table(
                 info["model"],
                 info["preprocessor"],
+                info.get("feature_names"),
                 features_subset,
                 player_index,
             )
@@ -8555,10 +8597,10 @@ def predict_upcoming_games(
                 game_features,
                 SimpleNamespace(feature_columns=poisson_info.get("feature_columns", [])),
             )
-            processed = pd.DataFrame(
-                poisson_info["preprocessor"].transform(base_features),
-                columns=poisson_info.get("feature_names", []),
-                index=base_features.index,
+            processed = _transform_with_feature_names(
+                poisson_info["preprocessor"],
+                base_features,
+                poisson_info.get("feature_names"),
             )
             feats_home = processed.copy()
             feats_away = processed.copy()
