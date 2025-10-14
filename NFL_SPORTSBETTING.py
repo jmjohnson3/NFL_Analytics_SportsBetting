@@ -7407,16 +7407,43 @@ class ModelTrainer:
             try:
                 supplemental_preprocessor = clone(preprocessor_template)
                 supplemental_preprocessor.fit(final_features)
-                feature_names_out = list(supplemental_preprocessor.get_feature_names_out())
+
+                transformed_final = supplemental_preprocessor.transform(final_features)
+                if hasattr(transformed_final, "toarray"):
+                    transformed_final = transformed_final.toarray()
+
+                try:
+                    feature_names_out = list(
+                        supplemental_preprocessor.get_feature_names_out()
+                    )
+                except Exception:
+                    feature_names_out = []
+
+                if not feature_names_out or len(feature_names_out) != transformed_final.shape[1]:
+                    logging.debug(
+                        "Supplemental preprocessor feature name mismatch for %s: "
+                        "expected %d, got %d; regenerating generic names.",
+                        target,
+                        transformed_final.shape[1],
+                        len(feature_names_out),
+                    )
+                    feature_names_out = [
+                        f"feature_{i}"
+                        for i in range(transformed_final.shape[1])
+                    ]
+
                 processed_final = pd.DataFrame(
-                    supplemental_preprocessor.transform(final_features),
+                    transformed_final,
                     columns=feature_names_out,
                     index=final_features.index,
                 )
                 processed_holdout: Optional[pd.DataFrame] = None
                 if not X_test_actual.empty:
+                    transformed_holdout = supplemental_preprocessor.transform(X_test_actual)
+                    if hasattr(transformed_holdout, "toarray"):
+                        transformed_holdout = transformed_holdout.toarray()
                     processed_holdout = pd.DataFrame(
-                        supplemental_preprocessor.transform(X_test_actual),
+                        transformed_holdout,
                         columns=feature_names_out,
                         index=X_test_actual.index,
                     )
@@ -7903,20 +7930,45 @@ class ModelTrainer:
         try:
             poisson_pre = clone(preprocessor)
             poisson_pre.fit(sorted_df[feature_columns])
-            feature_names_out = list(poisson_pre.get_feature_names_out())
+
+            transformed_train = poisson_pre.transform(X_train)
+            transformed_test = poisson_pre.transform(X_test)
+            transformed_full = poisson_pre.transform(sorted_df[feature_columns])
+
+            if hasattr(transformed_train, "toarray"):
+                transformed_train = transformed_train.toarray()
+            if hasattr(transformed_test, "toarray"):
+                transformed_test = transformed_test.toarray()
+            if hasattr(transformed_full, "toarray"):
+                transformed_full = transformed_full.toarray()
+
+            try:
+                feature_names_out = list(poisson_pre.get_feature_names_out())
+            except Exception:
+                feature_names_out = []
+
+            expected_cols = transformed_train.shape[1]
+            if not feature_names_out or len(feature_names_out) != expected_cols:
+                logging.debug(
+                    "Poisson preprocessor feature name mismatch: expected %d, got %d; "
+                    "using generic feature names.",
+                    expected_cols,
+                    len(feature_names_out),
+                )
+                feature_names_out = [f"feature_{i}" for i in range(expected_cols)]
 
             train_processed = pd.DataFrame(
-                poisson_pre.transform(X_train),
+                transformed_train,
                 columns=feature_names_out,
                 index=X_train.index,
             )
             test_processed = pd.DataFrame(
-                poisson_pre.transform(X_test),
+                transformed_test,
                 columns=feature_names_out,
                 index=X_test.index,
             )
             full_processed = pd.DataFrame(
-                poisson_pre.transform(sorted_df[feature_columns]),
+                transformed_full,
                 columns=feature_names_out,
                 index=sorted_df.index,
             )
