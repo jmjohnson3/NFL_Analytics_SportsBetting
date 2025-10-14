@@ -74,6 +74,7 @@ from sqlalchemy import (
     String,
     Table,
     UniqueConstraint,
+    and_,
     create_engine,
     func,
     inspect,
@@ -2117,6 +2118,7 @@ class NFLIngestor:
 
         injury_rows_all: List[Dict[str, Any]] = []
         advanced_rows_map: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+        lineup_depth_teams: Set[str] = set()
 
         for season in seasons:
             games = self.msf_client.fetch_games(season)
