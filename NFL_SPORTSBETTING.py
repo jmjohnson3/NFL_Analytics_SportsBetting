@@ -86,7 +86,6 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-set_config(enable_metadata_routing=True)
 
 # ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
 def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
@@ -6698,12 +6697,6 @@ class ModelTrainer:
         gbm_stack_estimator = clone(best_model)
         rf_stack_estimator = rf_pipeline
 
-        for estimator in (gbm_stack_estimator, rf_stack_estimator):
-            if hasattr(estimator, "set_fit_request"):
-                estimator.set_fit_request(sample_weight=True)
-        if hasattr(final_estimator, "set_fit_request"):
-            final_estimator.set_fit_request(sample_weight=True)
-
         ensemble = StackingRegressor(
             estimators=[
                 ("gbm", gbm_stack_estimator),
@@ -6714,9 +6707,14 @@ class ModelTrainer:
             n_jobs=-1,
         )
 
-        if hasattr(ensemble, "set_fit_request"):
-            ensemble.set_fit_request(sample_weight=True)
-        ensemble.fit(X_train, y_train, sample_weight=train_weight_array)
+        ensemble_fit_params: Dict[str, Any] = {}
+        if train_weight_array is not None:
+            ensemble_fit_params = {
+                "gbm__regressor__sample_weight": train_weight_array,
+                "rf__regressor__sample_weight": train_weight_array,
+                "final_estimator__sample_weight": train_weight_array,
+            }
+        ensemble.fit(X_train, y_train, **ensemble_fit_params)
 
         if len(X_test_actual) > 0:
             y_pred_actual = ensemble.predict(X_test_actual)
@@ -6745,11 +6743,14 @@ class ModelTrainer:
         final_features = sorted_df.loc[final_mask, feature_columns]
         final_target = sorted_df.loc[final_mask, target]
         final_weights_array = _as_weight_array(sorted_weights.loc[final_mask])
-        if hasattr(ensemble, "set_fit_request"):
-            ensemble.set_fit_request(sample_weight=True)
-        ensemble.fit(
-            final_features, final_target, sample_weight=final_weights_array
-        )
+        final_fit_params: Dict[str, Any] = {}
+        if final_weights_array is not None:
+            final_fit_params = {
+                "gbm__regressor__sample_weight": final_weights_array,
+                "rf__regressor__sample_weight": final_weights_array,
+                "final_estimator__sample_weight": final_weights_array,
+            }
+        ensemble.fit(final_features, final_target, **final_fit_params)
         setattr(ensemble, "feature_columns", feature_columns)
         setattr(ensemble, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target))
         setattr(ensemble, "target_name", target)
