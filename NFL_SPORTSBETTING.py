@@ -5683,38 +5683,6 @@ class ModelTrainer:
             pos_baseline = pd.DataFrame()
             league_baseline = pd.Series(dtype=float)
 
-        merged["game_id"] = merged["game_id"].astype(str)
-        merged["team"] = merged["team"].apply(normalize_team_abbr)
-        merged["position"] = merged["position"].apply(normalize_position)
-
-        numeric_columns: List[str] = [
-            col
-            for col in merged.columns
-            if pd.api.types.is_numeric_dtype(merged[col])
-            and col not in {"depth_rank", "is_starter", "_lineup_hit"}
-        ]
-
-        if numeric_columns:
-            game_team_pos_baseline = (
-                merged.groupby(["game_id", "team", "position"], dropna=False)[
-                    numeric_columns
-                ]
-                .mean()
-            )
-            team_pos_baseline = (
-                merged.groupby(["team", "position"], dropna=False)[numeric_columns]
-                .mean()
-            )
-            pos_baseline = (
-                merged.groupby(["position"], dropna=False)[numeric_columns].mean()
-            )
-            league_baseline = merged[numeric_columns].mean()
-        else:
-            game_team_pos_baseline = pd.DataFrame()
-            team_pos_baseline = pd.DataFrame()
-            pos_baseline = pd.DataFrame()
-            league_baseline = pd.Series(dtype=float)
-
         mask_missing = merged["depth_rank"].isna()
         if mask_missing.any():
             fallback = (
@@ -6735,7 +6703,11 @@ class ModelTrainer:
 
         ensemble_fit_params: Dict[str, Any] = {}
         if train_weight_array is not None:
-            ensemble_fit_params["sample_weight"] = train_weight_array
+            ensemble_fit_params = {
+                "gbm__regressor__sample_weight": train_weight_array,
+                "rf__regressor__sample_weight": train_weight_array,
+                "final_estimator__sample_weight": train_weight_array,
+            }
         ensemble.fit(X_train, y_train, **ensemble_fit_params)
 
         if len(X_test_actual) > 0:
@@ -6767,7 +6739,11 @@ class ModelTrainer:
         final_weights_array = _as_weight_array(sorted_weights.loc[final_mask])
         final_fit_params: Dict[str, Any] = {}
         if final_weights_array is not None:
-            final_fit_params["sample_weight"] = final_weights_array
+            final_fit_params = {
+                "gbm__regressor__sample_weight": final_weights_array,
+                "rf__regressor__sample_weight": final_weights_array,
+                "final_estimator__sample_weight": final_weights_array,
+            }
         ensemble.fit(final_features, final_target, **final_fit_params)
         setattr(ensemble, "feature_columns", feature_columns)
         setattr(ensemble, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target))
