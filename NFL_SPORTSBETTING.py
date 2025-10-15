@@ -7079,6 +7079,42 @@ class ModelTrainer:
 
         df = sorted_df.copy()
 
+        def _as_weight_array(series: Optional[pd.Series]) -> Optional[np.ndarray]:
+            if series is None:
+                return None
+            if isinstance(series, pd.Series):
+                arr = (
+                    pd.to_numeric(series, errors="coerce")
+                    .fillna(1.0)
+                    .clip(lower=1e-6)
+                    .astype(float)
+                    .to_numpy()
+                )
+            else:
+                arr = np.asarray(series, dtype=float)
+                arr = np.where(np.isfinite(arr), arr, 1.0)
+                arr = np.clip(arr, 1e-6, None)
+            return arr
+
+        def _weighted_metrics(
+            y_true: Union[pd.Series, np.ndarray],
+            y_pred: Union[pd.Series, np.ndarray],
+            weights: Optional[Union[pd.Series, np.ndarray]],
+        ) -> Tuple[float, float, float]:
+            from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+            y_t = np.asarray(y_true, dtype=float)
+            y_p = np.asarray(y_pred, dtype=float)
+            w = None if weights is None else np.asarray(weights, dtype=float)
+            if w is not None and w.shape != y_t.shape:
+                w = None
+            r2 = float(r2_score(y_t, y_p, sample_weight=w)) if y_t.size else float("nan")
+            mae = float(mean_absolute_error(y_t, y_p, sample_weight=w)) if y_t.size else float("nan")
+            rmse = float(
+                mean_squared_error(y_t, y_p, sample_weight=w, squared=False)
+            ) if y_t.size else float("nan")
+            return r2, mae, rmse
+
         # Require time keys
         if not {"season", "week"}.issubset(df.columns):
             raise ValueError(f"{target}: requires 'season' and 'week' columns for walk-forward CV")
