@@ -1625,187 +1625,15 @@ def parse_depth_rank(value: Any) -> Optional[float]:
 
 
 def ensure_lineup_players_in_latest(
-    latest_players: pd.DataFrame, lineup_df: Optional[pd.DataFrame]
+    working: pd.DataFrame, lineup_df: Optional[pd.DataFrame]
 ) -> pd.DataFrame:
-    """Add synthetic placeholder rows for lineup players missing from feature data."""
-
-    if lineup_df is None or lineup_df.empty:
-        return latest_players
-
-    working = latest_players.copy()
-    if "team" not in working.columns:
-        working["team"] = np.nan
-    if "position" not in working.columns:
-        working["position"] = np.nan
-    if "player_name" not in working.columns:
-        working["player_name"] = ""
-    if "player_name_norm" not in working.columns:
-        working["player_name_norm"] = working["player_name"].map(normalize_player_name)
-
-    if "depth_rank" not in working.columns:
-        working["depth_rank"] = np.nan
-    if "status_bucket" not in working.columns:
-        working["status_bucket"] = np.nan
-    if "practice_status" not in working.columns:
-        working["practice_status"] = np.nan
-    if "injury_priority" not in working.columns:
-        working["injury_priority"] = np.nan
-    if "practice_priority" not in working.columns:
-        working["practice_priority"] = np.nan
-    if "_lineup_entry" not in working.columns:
-        working["_lineup_entry"] = False
-    if "is_projected_starter" not in working.columns:
-        working["is_projected_starter"] = False
-
-    if "__pname_key" not in working.columns:
-        working["__pname_key"] = working["player_name"].map(robust_player_name_key)
-    else:
-        working["__pname_key"] = working["__pname_key"].fillna("")
-        missing_key_mask = working["__pname_key"] == ""
-        if missing_key_mask.any():
-            working.loc[missing_key_mask, "__pname_key"] = working.loc[
-                missing_key_mask, "player_name"
-            ].map(robust_player_name_key)
-
-    template_columns = list(working.columns)
-
-    lineup = lineup_df.copy()
-    lineup["team"] = lineup["team"].apply(normalize_team_abbr)
-    lineup["position"] = lineup["position"].apply(normalize_position)
-    if "base_pos" in lineup.columns:
-        lineup["base_pos"] = lineup["base_pos"].apply(normalize_position)
-    else:
-        lineup["base_pos"] = lineup["position"]
-
-    if "__pname_key" not in lineup.columns:
-        lineup["__pname_key"] = ""
-    name_seed = (
-        lineup.get("first_name", "").fillna("") + " " + lineup.get("last_name", "").fillna("")
-    ).str.strip()
-    fallback_name = lineup.get("player_name", "").fillna("")
-    lineup["__pname_key"] = lineup["__pname_key"].fillna("")
-    needs_key = lineup["__pname_key"] == ""
-    lineup.loc[needs_key, "__pname_key"] = name_seed.where(name_seed != "", fallback_name)[
-        needs_key
-    ].map(robust_player_name_key)
-    lineup["__pname_key"] = lineup["__pname_key"].fillna("")
-    lineup = lineup[lineup["__pname_key"] != ""]
-
-    if "side" in lineup.columns:
-        lineup = lineup[
-            lineup["side"].fillna("").str.lower().isin({"offense", ""})
-        ]
-
-    lineup = lineup[lineup["base_pos"].isin({"QB", "RB", "WR", "TE"})]
-    if lineup.empty:
-        return working
-
-    existing_keys = set(
-        zip(
-            working["team"].fillna(""),
-            working["position"].fillna(""),
-            working["__pname_key"].fillna(""),
-        )
-    )
-
-    feature_defaults = {
-        "snap_share": 0.35,
-        "routes_run": 15.0,
-        "targets_per_g": 2.0,
-        "rush_att_per_g": 6.0,
-        "games_last3": 1.0,
-    }
-
-    additions: List[Dict[str, Any]] = []
-
-    for _, lineup_row in lineup.iterrows():
-        team = lineup_row.get("team")
-        base_pos = lineup_row.get("base_pos")
-        pname_key = lineup_row.get("__pname_key")
-        if not team or not base_pos or not pname_key:
-            continue
-        key = (team, base_pos, pname_key)
-        if key in existing_keys:
-            continue
-
-        player_name = lineup_row.get("player_name") or ""
-        if not player_name:
-            first = lineup_row.get("first_name", "")
-            last = lineup_row.get("last_name", "")
-            player_name = " ".join(part for part in [first, last] if part)
-
-        placeholder = {col: np.nan for col in template_columns}
-        placeholder["team"] = team
-        placeholder["position"] = base_pos
-        placeholder["player_name"] = player_name
-        placeholder["player_name_norm"] = normalize_player_name(player_name)
-        placeholder["__pname_key"] = pname_key
-
-        raw_player_id = lineup_row.get("player_id")
-        if isinstance(raw_player_id, str) and raw_player_id:
-            placeholder["player_id"] = raw_player_id
-        else:
-            placeholder["player_id"] = f"lineup_{team}_{pname_key}"
-
-        depth_rank = lineup_row.get("rank")
-        placeholder["depth_rank"] = depth_rank if depth_rank not in (None, "") else 1
-
-        lineup_status = lineup_row.get("status_bucket")
-        lineup_practice = lineup_row.get("practice_status")
-        if lineup_status:
-            status_bucket = normalize_injury_status(lineup_status)
-            practice_status = normalize_practice_status(lineup_practice)
-        else:
-            status_bucket, practice_status = interpret_playing_probability(
-                lineup_row.get("playing_probability")
-            )
-            status_bucket = normalize_injury_status(status_bucket)
-            practice_status = normalize_practice_status(practice_status)
-
-        placeholder["status_bucket"] = status_bucket
-        placeholder["practice_status"] = practice_status
-        if "injury_priority" in placeholder:
-            placeholder["injury_priority"] = INJURY_STATUS_PRIORITY.get(status_bucket, 1)
-        if "practice_priority" in placeholder:
-            placeholder["practice_priority"] = PRACTICE_STATUS_PRIORITY.get(
-                practice_status, PRACTICE_STATUS_PRIORITY.get("available", 1)
-            )
-
-        placeholder["_lineup_entry"] = True
-        if "source" in placeholder:
-            placeholder["source"] = "msf-lineup"
-
-        if "is_projected_starter" in placeholder:
-            placeholder["is_projected_starter"] = True
-
-        updated_at = lineup_row.get("updated_at")
-        game_start = lineup_row.get("game_start")
-        if "updated_at" in placeholder:
-            placeholder["updated_at"] = updated_at
-        if "game_start" in placeholder:
-            placeholder["game_start"] = game_start
-
-        if "first_name" in placeholder:
-            placeholder["first_name"] = lineup_row.get("first_name", "")
-        if "last_name" in placeholder:
-            placeholder["last_name"] = lineup_row.get("last_name", "")
-
-        for col, default_val in feature_defaults.items():
-            if col in placeholder:
-                placeholder[col] = default_val
-
-        for col in template_columns:
-            if col.startswith("season_"):
-                placeholder[col] = 0.0
-
-        additions.append(placeholder)
-        existing_keys.add(key)
-
-    if additions:
-        addition_df = pd.DataFrame(additions)
-        working = safe_concat([working, addition_df], ignore_index=True, sort=False)
+    """
+    No-op: we no longer synthesize placeholder rows from lineup entries.
+    We only keep players who already exist with real production rows.
+    """
 
     return working
+
 
 
 # ---------------------------------------------------------------------------
@@ -2546,16 +2374,40 @@ class NFLDatabase:
     ) -> None:
         if not metrics:
             return
-        rows = [
-            {
-                "run_id": run_id,
-                "model_name": model_name,
-                "metric_name": metric,
-                "metric_value": float(value),
-                "sample_size": sample_size,
-            }
-            for metric, value in metrics.items()
-        ]
+        rows: List[Dict[str, Any]] = []
+
+        def _append_metric(metric_name: str, metric_value: Any) -> None:
+            if metric_value is None:
+                return
+            try:
+                value_float = float(metric_value)
+            except (TypeError, ValueError):
+                return
+            if math.isnan(value_float):
+                return
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "model_name": model_name,
+                    "metric_name": metric_name,
+                    "metric_value": value_float,
+                    "sample_size": sample_size,
+                }
+            )
+
+        for metric, value in metrics.items():
+            if isinstance(value, (tuple, list)):
+                if len(value) == 2:
+                    _append_metric(f"{metric}_lower", value[0])
+                    _append_metric(f"{metric}_upper", value[1])
+                else:
+                    for idx, component in enumerate(value):
+                        _append_metric(f"{metric}_{idx}", component)
+            else:
+                _append_metric(metric, value)
+
+        if not rows:
+            return
         with self.engine.begin() as conn:
             conn.execute(self.model_backtests.insert(), rows)
 
@@ -5206,6 +5058,75 @@ class FeatureBuilder:
 
         latest_players = ensure_lineup_players_in_latest(latest_players, lineup_rows)
 
+        # --- Begin: require real production history (career/preseason/college allowed) ---
+        base_players = self.player_feature_frame  # includes historical per-game rows
+        if (
+            base_players is None
+            or "player_id" not in base_players.columns
+            or "game_id" not in base_players.columns
+        ):
+            hist_counts = pd.DataFrame({"player_id": [], "hist_game_count": []})
+        else:
+            hist_counts = (
+                base_players.groupby("player_id")["game_id"]
+                .nunique(dropna=True)
+                .rename("hist_game_count")
+                .reset_index()
+            )
+
+        latest_players = latest_players.merge(hist_counts, on="player_id", how="left")
+        latest_players["hist_game_count"] = latest_players["hist_game_count"].fillna(0).astype(int)
+
+        # Sum any season_* totals we just merged earlier; benign if absent
+        season_total_cols = [c for c in latest_players.columns if c.startswith("season_")]
+        if season_total_cols:
+            latest_players["_season_total_sum"] = latest_players[season_total_cols].sum(axis=1, numeric_only=True)
+        else:
+            latest_players["_season_total_sum"] = 0.0
+
+        # Optional: include preseason / college if you add those tables later
+        def _safe_read(name: str) -> pd.DataFrame:
+            try:
+                return pd.read_sql_table(name, self.engine).rename(columns=lambda c: str(c))
+            except Exception:
+                return pd.DataFrame()
+
+        pre_cols = _safe_read("nfl_preseason_stats")
+        col_cols = _safe_read("nfl_college_stats")
+
+        def _count_hist(df: pd.DataFrame) -> pd.DataFrame:
+            if df.empty or "player_id" not in df.columns:
+                return pd.DataFrame({"player_id": [], "extra_hist_game_count": []})
+            return (
+                df.groupby("player_id")["game_id"].nunique(dropna=True)
+                .rename("extra_hist_game_count")
+                .reset_index()
+            )
+
+        extra_hist = []
+        for df in (pre_cols, col_cols):
+            part = _count_hist(df)
+            if not part.empty:
+                extra_hist.append(part)
+        if extra_hist:
+            extra_hist = pd.concat(extra_hist, ignore_index=True)
+            extra_hist = extra_hist.groupby("player_id")["extra_hist_game_count"].sum().reset_index()
+            latest_players = latest_players.merge(extra_hist, on="player_id", how="left")
+            latest_players["extra_hist_game_count"] = latest_players["extra_hist_game_count"].fillna(0).astype(int)
+        else:
+            latest_players["extra_hist_game_count"] = 0
+
+        # Final production gate:
+        latest_players = latest_players[
+            (latest_players["hist_game_count"] > 0)
+            | (latest_players["extra_hist_game_count"] > 0)
+            | (latest_players["_season_total_sum"] > 0)
+        ].copy()
+
+        # Clean up helper columns
+        latest_players.drop(columns=["_season_total_sum"], inplace=True, errors="ignore")
+        # --- End: require real production history ---
+
         latest_players["status_bucket"] = (
             latest_players["status_bucket"].fillna("other").apply(normalize_injury_status)
         )
@@ -5991,6 +5912,7 @@ class ModelTrainer:
         self.target_priors: Dict[str, Dict[str, Any]] = {}
         self.prior_engines: Dict[str, Optional[Dict[str, Any]]] = {}
         self.special_models: Dict[str, Dict[str, Any]] = {}
+        self.feature_column_map: Dict[str, List[str]] = {}
 
     @staticmethod
     def _is_lineup_starter(position: str, rank: Optional[int]) -> bool:
@@ -6603,99 +6525,13 @@ class ModelTrainer:
             matched_count = int(merged_before_filter["_lineup_hit"].sum())
             logging.info(
                 "Roster gate respected lineups: kept %d of %d players (matched=%d)",
-                len(merged),
+                len(merged_before_filter[merged_before_filter["_lineup_hit"]]),
                 initial_candidate_count,
                 matched_count,
             )
-
-            required_counts: Dict[str, int] = {"QB": 1, "RB": 2, "WR": 3, "TE": 1}
-            additions: List[pd.DataFrame] = []
-
-            starter_mask = key_series.isin(starter_lineup_keys) if starter_lineup_keys else pd.Series(False, index=merged.index)
-            starter_groups = {
-                key: grp
-                for key, grp in merged.loc[starter_mask].groupby(["game_id", "team"], sort=False)
-            }
-
-            def _make_key(pid_value: Any, name_value: Any) -> Tuple[str, str]:
-                pid_text = str(pid_value)
-                if pid_text.lower() in {"", "nan", "none"}:
-                    pid_text = ""
-                name_text = name_value if isinstance(name_value, str) else ""
-                return pid_text, name_text
-
-            for key, full_group in candidate_pool.groupby(["game_id", "team"], sort=False):
-                starter_group = starter_groups.get(key)
-                if starter_group is not None:
-                    existing_keys: Set[Tuple[str, str]] = {
-                        _make_key(pid, name)
-                        for pid, name in zip(
-                            starter_group["player_id"],
-                            starter_group["__pname_key"],
-                        )
-                    }
-                    position_counts = starter_group["position"].value_counts().to_dict()
-                else:
-                    existing_keys = set()
-                    position_counts = {}
-
-                full_group = full_group.copy()
-                if "status_bucket" in full_group.columns:
-                    full_group = full_group[
-                        ~full_group["status_bucket"].isin(INACTIVE_INJURY_BUCKETS)
-                    ]
-                if full_group.empty:
-                    continue
-                full_group["__fallback_key"] = [
-                    _make_key(pid, name)
-                    for pid, name in zip(
-                        full_group["player_id"],
-                        full_group["__pname_key"],
-                    )
-                ]
-
-                for pos, needed in required_counts.items():
-                    have = position_counts.get(pos, 0)
-                    if have >= needed:
-                        continue
-
-                    candidates = full_group[full_group["position"] == pos]
-                    if candidates.empty:
-                        continue
-
-                    remaining = needed - have
-                    candidates = candidates[~candidates["__fallback_key"].isin(existing_keys)]
-                    if candidates.empty:
-                        continue
-
-                    candidates = candidates.sort_values(["depth_rank", "player_name"])
-                    selected = candidates.head(remaining)
-                    if selected.empty:
-                        continue
-
-                    selected_keys: List[Tuple[str, str]] = [
-                        _make_key(pid, name)
-                        for pid, name in zip(
-                            selected["player_id"],
-                            selected["__pname_key"],
-                        )
-                    ]
-
-                    additions.append(selected.drop(columns=["__fallback_key"], errors="ignore"))
-                    existing_keys.update(selected_keys)
-                    have += len(selected)
-                    position_counts[pos] = have
-
-                    logging.debug(
-                        "Roster fallback promoted %d %s player(s) for game %s team %s",
-                        len(selected_keys),
-                        pos,
-                        key[0],
-                        key[1],
-                    )
-
-            if additions:
-                merged = safe_concat([merged] + additions, ignore_index=True, sort=False)
+            merged = merged_before_filter[merged_before_filter["_lineup_hit"]].copy()
+        else:
+            merged = merged_before_filter
 
         merged["_usage_confidence"] = compute_recency_usage_weights(merged)
         merged = merged.drop(columns=["_placeholder_weight"], errors="ignore")
@@ -7175,18 +7011,34 @@ class ModelTrainer:
                 models.update(model)
                 continue
 
-            model = self._train_regression_model(df, target)
+            prepared = self._prepare_regression_training_data(df, target)
+            if prepared is None:
+                continue
+
+            sorted_df, feature_columns, weight_series = prepared
+            try:
+                model, _summary = self._train_regression_model(
+                    sorted_df,
+                    feature_columns,
+                    target,
+                    weight_series=weight_series,
+                )
+            except RuntimeError:
+                raise
+
             if model is not None:
                 models[target] = model
         return models
 
-    def _train_regression_model(self, df: pd.DataFrame, target: str) -> Optional[Pipeline]:
-        if len(df) < 20 or df[target].nunique() <= 1:
+    def _prepare_regression_training_data(
+        self, df: pd.DataFrame, target: str
+    ) -> Optional[Tuple[pd.DataFrame, List[str], Optional[pd.Series]]]:
+        if len(df) < 20 or target not in df.columns or df[target].nunique() <= 1:
             logging.warning(
                 "Not enough data to train %s model (rows=%d, unique targets=%d).",
                 target,
                 len(df),
-                df[target].nunique(),
+                df[target].nunique() if target in df.columns else 0,
             )
             return None
 
@@ -7207,449 +7059,369 @@ class ModelTrainer:
 
         self.target_priors[target] = self._compute_target_priors(df, target)
 
-        numeric_features = [
-            "week",
-            "temperature_f",
-            "wind_mph",
-            "humidity",
-            "offense_pass_rating",
-            "offense_rush_rating",
-            "defense_pass_rating",
-            "defense_rush_rating",
-            "pace_seconds_per_play",
-            "offense_epa",
-            "defense_epa",
-            "offense_success_rate",
-            "defense_success_rate",
-            "travel_penalty",
-            "rest_penalty",
-            "weather_adjustment",
-            "avg_timezone_diff_hours",
-            "opp_offense_pass_rating",
-            "opp_offense_rush_rating",
-            "opp_defense_pass_rating",
-            "opp_defense_rush_rating",
-            "opp_pace_seconds_per_play",
-            "opp_offense_epa",
-            "opp_defense_epa",
-            "opp_offense_success_rate",
-            "opp_defense_success_rate",
-            "opp_travel_penalty",
-            "opp_rest_penalty",
-            "opp_weather_adjustment",
-            "opp_timezone_diff_hours",
-            "avg_rush_yards",
-            "avg_rec_yards",
-            "avg_receptions",
-            "avg_rush_tds",
-            "avg_rec_tds",
-            "snap_count",
-            "receiving_targets",
-            "home_injury_total",
-            "away_injury_total",
-            "depth_rank",
-            "injury_priority",
-            "practice_priority",
-        ]
-        categorical_features = [
-            "team",
-            "opponent",
-            "venue",
-            "day_of_week",
-            "referee",
-            "position",
-            "status_bucket",
-            "practice_status",
-        ]
+        ignore_columns = {target, "sample_weight", "is_synthetic"}
+        feature_columns: List[str] = []
+        for col in df.columns:
+            if col in ignore_columns:
+                continue
+            series = df[col]
+            if not pd.api.types.is_numeric_dtype(series):
+                continue
+            if not series.notna().any():
+                continue
+            feature_columns.append(col)
 
-        available_numeric = [
-            col for col in numeric_features if col in df.columns and df[col].notna().any()
-        ]
-        dropped_numeric = sorted(set(numeric_features) - set(available_numeric))
-        if dropped_numeric:
-            logging.debug(
-                "Dropping numeric features with no observed values for %s model: %s",
-                target,
-                ", ".join(dropped_numeric),
-            )
-
-        available_categorical = [
-            col for col in categorical_features if col in df.columns and df[col].notna().any()
-        ]
-        dropped_categorical = sorted(set(categorical_features) - set(available_categorical))
-        if dropped_categorical:
-            logging.debug(
-                "Dropping categorical features with no observed values for %s model: %s",
-                target,
-                ", ".join(dropped_categorical),
-            )
-
-        if not available_numeric and not available_categorical:
-            logging.warning(
-                "No usable features with observed values available to train %s model; skipping.",
-                target,
-            )
+        if not feature_columns:
+            logging.warning("No usable numeric features available to train %s model; skipping.", target)
             return None
 
-        feature_columns = list(available_numeric + available_categorical)
+        sorted_df = self._sort_by_time(df).reset_index(drop=True)
+        weight_series = sorted_df.get("sample_weight")
+        self.prior_engines[target] = None
+        return sorted_df, feature_columns, weight_series
 
-        train_df, test_df, sorted_df = self._chronological_split(df)
-        X_train = train_df[feature_columns]
-        y_train = train_df[target]
-        X_test = test_df[feature_columns]
-        y_test = test_df[target]
 
-        def _weights_from(frame: pd.DataFrame) -> pd.Series:
-            series = frame.get("sample_weight")
-            if series is None:
-                return pd.Series(1.0, index=frame.index)
-            return (
-                pd.to_numeric(series, errors="coerce")
-                .replace([np.inf, -np.inf], np.nan)
-                .fillna(1.0)
-                .clip(lower=1e-4)
-            )
+    def _train_regression_model(
+        self,
+        sorted_df: pd.DataFrame,
+        feature_columns: List[str],
+        target: str,
+        weight_series: Optional[pd.Series] = None,
+        *,
+        vig_threshold: float = 0.02,
+        min_edge: float = 0.0,
+    ) -> Tuple[Pipeline, Dict[str, Any]]:
+        """
+        Walk-forward, season/week-ordered evaluation with betting diagnostics.
+        Aborts (raises RuntimeError) if ROI lower CI bound <= vig_threshold.
+        """
+        import math
+        from sklearn.base import clone
+        from sklearn.ensemble import GradientBoostingRegressor
+        from sklearn.pipeline import Pipeline
+        from sklearn.impute import SimpleImputer
+        from sklearn.preprocessing import StandardScaler
 
-        train_weights = _weights_from(train_df)
-        test_weights = _weights_from(test_df)
-        sorted_weights = _weights_from(sorted_df)
+        df = sorted_df.copy()
 
         def _as_weight_array(series: Optional[pd.Series]) -> Optional[np.ndarray]:
-            if series is None or series.empty:
+            if series is None:
                 return None
-            return series.astype(float).to_numpy()
-
-        train_weight_array = _as_weight_array(train_weights)
+            if isinstance(series, pd.Series):
+                arr = (
+                    pd.to_numeric(series, errors="coerce")
+                    .fillna(1.0)
+                    .clip(lower=1e-6)
+                    .astype(float)
+                    .to_numpy()
+                )
+            else:
+                arr = np.asarray(series, dtype=float)
+                arr = np.where(np.isfinite(arr), arr, 1.0)
+                arr = np.clip(arr, 1e-6, None)
+            return arr
 
         def _weighted_metrics(
-            y_true: pd.Series,
-            y_pred: np.ndarray,
-            weights: Optional[np.ndarray],
+            y_true: Union[pd.Series, np.ndarray],
+            y_pred: Union[pd.Series, np.ndarray],
+            weights: Optional[Union[pd.Series, np.ndarray]],
         ) -> Tuple[float, float, float]:
-            if len(y_true) == 0:
-                return (np.nan, np.nan, np.nan)
-            if weights is not None and len(weights) == len(y_true):
-                w = np.clip(weights.astype(float), 1e-6, None)
-                diff = y_pred - y_true.to_numpy(dtype=float)
-                mae = float(np.average(np.abs(diff), weights=w))
-                mse = float(np.average(diff ** 2, weights=w))
-                rmse = float(np.sqrt(mse))
-                if len(y_true) > 1:
-                    try:
-                        r2 = float(r2_score(y_true, y_pred, sample_weight=w))
-                    except ValueError:
-                        r2 = np.nan
-                else:
-                    r2 = np.nan
-                return (r2, mae, rmse)
-            diff = y_pred - y_true.to_numpy(dtype=float)
-            mae = float(mean_absolute_error(y_true, y_pred))
-            rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-            r2 = float(r2_score(y_true, y_pred)) if len(y_true) > 1 else np.nan
-            return (r2, mae, rmse)
+            from math import sqrt
+            from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-        actual_mask = (~test_df.get("is_synthetic", False).astype(bool)) & y_test.notna()
-        if not actual_mask.any():
+            y_t = np.asarray(y_true, dtype=float)
+            y_p = np.asarray(y_pred, dtype=float)
+            w = None if weights is None else np.asarray(weights, dtype=float)
+            if w is not None and w.shape != y_t.shape:
+                w = None
+            r2 = float(r2_score(y_t, y_p, sample_weight=w)) if y_t.size else float("nan")
+            mae = float(mean_absolute_error(y_t, y_p, sample_weight=w)) if y_t.size else float("nan")
+            if y_t.size:
+                mse = mean_squared_error(y_t, y_p, sample_weight=w)
+                rmse = float(sqrt(mse))
+            else:
+                rmse = float("nan")
+            return r2, mae, rmse
+
+        # Require time keys
+        if not {"season", "week"}.issubset(df.columns):
+            raise ValueError(f"{target}: requires 'season' and 'week' columns for walk-forward CV")
+
+        # Build a clean matrix
+        X_all = df[feature_columns]
+        y_all = df[target]
+        w_all = _as_weight_array(weight_series)  # existing helper
+
+        # Simple preprocessor; keep your original encoder if you had one upstream
+        preprocessor = Pipeline(
+            steps=[
+                ("impute", SimpleImputer(strategy="median")),
+                ("scale", StandardScaler(with_mean=False)),
+            ]
+        )
+
+        base_est = GradientBoostingRegressor(random_state=42)
+        model = Pipeline([("preprocessor", preprocessor), ("regressor", base_est)])
+
+        # ---- Walk-forward splits by unique (season, week) keys (expanding window) ----
+        df["_sw"] = list(zip(df["season"].astype(str), df["week"].astype(int, errors="ignore").fillna(0).astype(int)))
+        sw_keys = pd.Series(df["_sw"].unique().tolist())
+        # sort season/week by real world order: season asc, week asc
+        sw_keys = sw_keys.sort_values(key=lambda s: s.map(lambda x: (x[0], x[1]))).tolist()
+
+        # at least 3 folds: train on >=1, validate on the next, keep rolling
+        folds = []
+        for i in range(1, len(sw_keys) - 1):
+            train_keys = set(sw_keys[:i])        # everything strictly before validation
+            valid_key = sw_keys[i]               # one time-slice as validation
+            train_idx = df["_sw"].isin(train_keys).values
+            valid_idx = (df["_sw"] == valid_key).values
+            if train_idx.sum() >= 200 and valid_idx.sum() >= 50:  # reasonable sample minimums
+                folds.append((train_idx, valid_idx))
+
+        per_fold = []
+        preds_all = []
+        idx_all = []
+        used_walk_forward = True
+
+        if not folds:
+            # Fallback to a simple chronological holdout when there are not enough
+            # season/week buckets to run the expanding walk-forward evaluation.
             logging.warning(
-                "Holdout set for %s contains no non-synthetic observations; evaluating on available rows.",
+                "%s: insufficient time slices for walk-forward; fitting single model with holdout diagnostics.",
                 target,
             )
-            actual_mask = y_test.notna()
 
-        X_test_actual = X_test.loc[actual_mask]
-        y_test_actual = y_test.loc[actual_mask]
-        test_weight_array = _as_weight_array(test_weights.loc[actual_mask])
+            valid_size = max(1, min(max(len(df) // 5, 10), len(df) // 2))
+            train_size = len(df) - valid_size
+            if train_size <= 0:
+                train_size = max(len(df) - 1, 1)
+                valid_size = len(df) - train_size
 
-        transformers = []
-        if available_numeric:
-            transformers.append(
-                (
-                    "num",
-                    Pipeline([("imputer", SimpleImputer()), ("scaler", StandardScaler())]),
-                    available_numeric,
-                )
-            )
-        if available_categorical:
-            transformers.append(
-                (
-                    "cat",
-                    Pipeline([
-                        (
-                            "imputer",
-                            SimpleImputer(strategy="constant", fill_value="missing"),
-                        ),
-                        ("onehot", OneHotEncoder(handle_unknown="ignore")),
-                    ]),
-                    available_categorical,
-                )
-            )
+            train_idx = np.zeros(len(df), dtype=bool)
+            valid_idx = np.zeros(len(df), dtype=bool)
+            train_idx[:train_size] = True
+            valid_idx[train_size:train_size + valid_size] = True
 
-        preprocessor_template = ColumnTransformer(transformers=transformers)
+            folds = [(train_idx, valid_idx)]
+            used_walk_forward = False
 
-        self.prior_engines[target] = None
-        prior_transformer = None
-        try:
-            prior_transformer = clone(preprocessor_template)
-            prior_transformer.fit(X_train)
-        except Exception:
-            logging.debug("Unable to fit prior transformer for %s", target, exc_info=True)
-            prior_transformer = None
+        # ---- Run walk-forward (or fallback holdout) evaluation ----
+        for k, (tr_idx, va_idx) in enumerate(folds, 1):
+            X_tr, y_tr = X_all.iloc[tr_idx], y_all.iloc[tr_idx]
+            X_va, y_va = X_all.iloc[va_idx], y_all.iloc[va_idx]
+            w_tr = w_all[tr_idx] if w_all is not None else None
 
-        if prior_transformer is not None:
-            neighbor_engine = self._build_neighbor_engine(
-                prior_transformer,
-                X_train,
-                y_train,
-                train_df,
-                feature_columns,
-                train_weights,
-                target,
-            )
-            self.prior_engines[target] = neighbor_engine
+            est = clone(model)
+            fit_kwargs = {"regressor__sample_weight": w_tr} if w_tr is not None else {}
+            est.fit(X_tr, y_tr, **fit_kwargs)
 
-        preprocessor = preprocessor_template
+            y_hat = est.predict(X_va)
+            preds_all.append(y_hat)
+            idx_all.append(np.where(va_idx)[0])
 
-        baseline_model = Pipeline([
-            ("preprocessor", clone(preprocessor)),
-            ("regressor", GradientBoostingRegressor(random_state=42)),
-        ])
+            r2, mae, rmse = _weighted_metrics(y_va, y_hat, None)
+            per_fold.append({"fold": k, "n": int(len(y_va)), "r2": r2, "mae": float(mae), "rmse": float(rmse)})
 
-        baseline_fit_params: Dict[str, Any] = {}
-        if train_weight_array is not None:
-            baseline_fit_params["regressor__sample_weight"] = train_weight_array
+        preds_all = np.concatenate(preds_all)
+        idx_all = np.concatenate(idx_all)
+        out_df = df.iloc[idx_all].copy()
+        out_df["_y_pred"] = preds_all
+        out_df["_abs_err"] = (out_df[target] - out_df["_y_pred"]).abs()
 
-        baseline_model.fit(X_train, y_train, **baseline_fit_params)
+        # ---- Betting diagnostics ----
+        # 1) MAE vs "closing lines" (if present)
+        closing_cols = [c for c in out_df.columns if c.startswith("line_") or c.endswith("_implied_prob")]
+        mae_vs_closing = None
+        if target.endswith("_win_prob"):
+            # join to implied probs derived from moneylines already in games table
+            # Expect columns like 'home_implied_prob'/'away_implied_prob' from ingest (see _ingest_odds)
+            side = out_df.get("team_side")  # optional column you may carry ("home"/"away")
+            if side is not None and "home_implied_prob" in out_df and "away_implied_prob" in out_df:
+                cl = np.where(side == "home", out_df["home_implied_prob"], out_df["away_implied_prob"])
+                mae_vs_closing = float(np.nanmean(np.abs(out_df["_y_pred"] - cl)))
+        elif closing_cols:
+            # e.g., player props with 'line_receiving_yards', etc.
+            # Choose the first matching line as a reference
+            ref = out_df[closing_cols[0]].astype(float)
+            mae_vs_closing = float(np.nanmean(np.abs(out_df["_y_pred"] - ref)))
 
-        if len(X_test_actual) > 0:
-            baseline_pred_actual = baseline_model.predict(X_test_actual)
-        else:
-            baseline_pred_actual = np.array([], dtype=float)
+        # 2) EV rule → pick bets → compute hit rate & ROI (+ CI)
+        def _american_to_payout(odds: float) -> float:
+            # Net profit per unit staked if it wins
+            if odds >= 0:
+                return odds / 100.0
+            return 100.0 / (-odds)
 
-        baseline_r2, baseline_mae, baseline_rmse = _weighted_metrics(
-            y_test_actual, baseline_pred_actual, test_weight_array
-        )
+        # For game win-prob targets
+        roi, roi_lo, roi_hi, hit_rate, n_bets = None, None, None, None, 0
+        if target.endswith("_win_prob") and {"home_moneyline", "away_moneyline"}.issubset(out_df.columns):
+            # Choose side with positive edge > min_edge
+            choose_home = out_df["_y_pred"] - out_df.get("home_implied_prob", np.nan).values
+            choose_away = (1.0 - out_df["_y_pred"]) - out_df.get("away_implied_prob", np.nan).values
+
+            pick_home = (choose_home > min_edge) & out_df["home_moneyline"].notna()
+            pick_away = (choose_away > min_edge) & out_df["away_moneyline"].notna()
+
+            picks = []
+            # Home picks
+            if pick_home.any():
+                h = out_df.loc[pick_home, ["home_moneyline", "home_team", "away_team", "home_score", "away_score", "_y_pred"]].copy()
+                h["price"] = h["home_moneyline"].astype(float)
+                h["side_win"] = (h["home_score"] > h["away_score"]).astype(int)  # realized outcome
+                h["p_model"] = h["_y_pred"].clip(0.0, 1.0)
+                h["payout"] = h["price"].map(_american_to_payout)
+                picks.append(h[["p_model", "side_win", "payout"]])
+
+            # Away picks
+            if pick_away.any():
+                a = out_df.loc[pick_away, ["away_moneyline", "home_team", "away_team", "home_score", "away_score", "_y_pred"]].copy()
+                a["price"] = a["away_moneyline"].astype(float)
+                a["side_win"] = (a["away_score"] > a["home_score"]).astype(int)
+                a["p_model"] = (1.0 - a["_y_pred"]).clip(0.0, 1.0)
+                a["payout"] = a["price"].map(_american_to_payout)
+                picks.append(a[["p_model", "side_win", "payout"]])
+
+            if picks:
+                picks = pd.concat(picks, ignore_index=True)
+                n_bets = len(picks)
+
+                # 1u flat stake return per bet: +payout if win, -1 if loss
+                returns = np.where(picks["side_win"] == 1, picks["payout"].values, -1.0)
+                roi = float(np.mean(returns))  # average per-bet return (units per unit staked)
+
+                # Normal-approx CI for mean with finite-sample correction
+                m = returns.mean()
+                s = returns.std(ddof=1) if n_bets > 1 else 0.0
+                z = 1.96
+                se = s / math.sqrt(max(n_bets, 1))
+                roi_lo, roi_hi = float(m - z * se), float(m + z * se)
+
+                # Hit rate
+                hit_rate = float(np.mean(picks["side_win"]))
+
+        # Persist backtest metrics per fold + overall
+        for row in per_fold:
+            self.db.record_backtest_metrics(self.run_id, f"{target}_fold{row['fold']}", row, sample_size=row["n"])
+
+        evaluation_mode = "walk-forward" if used_walk_forward else "holdout"
+
+        summary = {
+            "folds": len(per_fold),
+            "r2_mean": float(np.mean([r["r2"] for r in per_fold])),
+            "mae_mean": float(np.mean([r["mae"] for r in per_fold])),
+            "rmse_mean": float(np.mean([r["rmse"] for r in per_fold])),
+            "mae_vs_closing": mae_vs_closing,
+            "roi": roi,
+            "roi_ci": (roi_lo, roi_hi) if roi_lo is not None else None,
+            "hit_rate": hit_rate,
+            "bets": n_bets,
+            "mode": evaluation_mode,
+        }
+        self.db.record_backtest_metrics(self.run_id, target, summary, sample_size=int(len(out_df)))
+
         logging.info(
-            "Trained %s model (baseline GBM), R^2=%.3f on holdout (MAE=%.3f, RMSE=%.3f, n=%d)",
+            "%s %s | folds=%d | MAE=%.3f | RMSE=%.3f | MAE_vs_close=%s | ROI=%s (CI=%s) | bets=%d",
             target,
-            baseline_r2,
-            baseline_mae,
-            baseline_rmse,
-            len(y_test_actual),
-        )
-        self.db.record_backtest_metrics(
-            self.run_id,
-            f"{target}_baseline",
-            {"r2": baseline_r2, "mae": baseline_mae, "rmse": baseline_rmse},
-            sample_size=len(y_test_actual),
+            evaluation_mode,
+            summary["folds"],
+            summary["mae_mean"],
+            summary["rmse_mean"],
+            f"{summary['mae_vs_closing']:.3f}" if summary["mae_vs_closing"] is not None else "n/a",
+            f"{summary['roi']:.3f}" if summary["roi"] is not None else "n/a",
+            f"({summary['roi_ci'][0]:.3f},{summary['roi_ci'][1]:.3f})" if summary["roi_ci"] else "n/a",
+            summary["bets"],
         )
 
-        tuned_model = Pipeline([
-            ("preprocessor", clone(preprocessor)),
-            ("regressor", GradientBoostingRegressor(random_state=42)),
-        ])
+        # ---- Deployment guard: beat the vig with lower CI bound ----
+        if summary["roi_ci"] is not None:
+            roi_lower = summary["roi_ci"][0]
+            if not (roi_lower > vig_threshold):
+                raise RuntimeError(
+                    f"{target}: ROI lower CI {roi_lower:.3f} does not beat vig threshold {vig_threshold:.3f}. Aborting deployment."
+                )
 
-        try:
-            cv = self._build_time_series_cv(len(X_train))
-        except ValueError as exc:
-            logging.warning(
-                "Skipping hyperparameter tuning for %s due to insufficient data: %s",
-                target,
-                exc,
-            )
-            best_model = tuned_model.fit(
-                X_train,
-                y_train,
-                **(
-                    {"regressor__sample_weight": train_weight_array}
-                    if train_weight_array is not None
-                    else {}
-                ),
-            )
-        else:
-            search_fit_params: Dict[str, Any] = {}
-            if train_weight_array is not None:
-                search_fit_params["regressor__sample_weight"] = train_weight_array
-            search = RandomizedSearchCV(
-                estimator=tuned_model,
-                param_distributions=self._gb_param_grid("regressor__"),
-                n_iter=10,
-                scoring="neg_mean_absolute_error",
-                cv=cv,
-                random_state=42,
-                n_jobs=-1,
-            )
-            search.fit(X_train, y_train, **search_fit_params)
-            best_model: Pipeline = search.best_estimator_
-            logging.info(
-                "Best parameters for %s model: %s (CV MAE=%.3f)",
-                target,
-                search.best_params_,
-                -search.best_score_,
-            )
+        # Finally fit on ALL data for live predictions
+        fit_kwargs = {"regressor__sample_weight": w_all} if w_all is not None else {}
+        model.fit(X_all, y_all, **fit_kwargs)
+        setattr(model, "feature_columns", list(feature_columns))
+        setattr(model, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target))
+        setattr(model, "target_name", target)
+        self.feature_column_map[target] = list(feature_columns)
+        self.model_uncertainty[target] = {"rmse": summary["rmse_mean"], "mae": summary["mae_mean"]}
 
-        ensemble = clone(best_model)
+        # Supplemental pricing models for prop markets
+        fitted_preprocessor = None
+        processed_cache: Optional[pd.DataFrame] = None
+        processed_feature_names: List[str] = []
 
-        ensemble_fit_params: Dict[str, Any] = {}
-        if train_weight_array is not None:
-            ensemble_fit_params = {
-                "regressor__sample_weight": train_weight_array,
-            }
-        ensemble.fit(X_train, y_train, **ensemble_fit_params)
+        if hasattr(model, "named_steps"):
+            fitted_preprocessor = model.named_steps.get("preprocessor")
 
-        if len(X_test_actual) > 0:
-            y_pred_actual = ensemble.predict(X_test_actual)
-        else:
-            y_pred_actual = np.array([], dtype=float)
-
-        r2, mae, rmse = _weighted_metrics(y_test_actual, y_pred_actual, test_weight_array)
-        logging.info(
-            "%s holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f | n=%d",
-            target,
-            r2,
-            mae,
-            rmse,
-            len(y_test_actual),
-        )
-
-        self.db.record_backtest_metrics(
-            self.run_id,
-            target,
-            {"r2": r2, "mae": mae, "rmse": rmse},
-            sample_size=len(y_test_actual),
-        )
-        self.model_uncertainty[target] = {"rmse": rmse, "mae": mae}
-
-        final_mask = sorted_df[target].notna()
-        final_features = sorted_df.loc[final_mask, feature_columns]
-        final_target = sorted_df.loc[final_mask, target]
-        final_weights_array = _as_weight_array(sorted_weights.loc[final_mask])
-        final_fit_params: Dict[str, Any] = {}
-        if final_weights_array is not None:
-            final_fit_params = {
-                "regressor__sample_weight": final_weights_array,
-            }
-
-        supplemental_model: Dict[str, Any] = {}
-        wants_quantile = target in {"passing_yards", "receiving_yards", "receptions"}
-        wants_hurdle = target in {"receiving_tds", "rushing_tds"}
-        if wants_quantile or wants_hurdle:
+        def _prepare_processed_frame() -> Optional[pd.DataFrame]:
+            nonlocal processed_cache, processed_feature_names
+            if processed_cache is not None:
+                return processed_cache
+            if fitted_preprocessor is None:
+                return None
             try:
-                supplemental_preprocessor = clone(preprocessor_template)
-                supplemental_preprocessor.fit(final_features)
-
-                transformed_final = supplemental_preprocessor.transform(final_features)
-                if hasattr(transformed_final, "toarray"):
-                    transformed_final = transformed_final.toarray()
-
-                try:
-                    feature_names_out = list(
-                        supplemental_preprocessor.get_feature_names_out()
-                    )
-                except Exception:
-                    feature_names_out = []
-
-                if not feature_names_out or len(feature_names_out) != transformed_final.shape[1]:
-                    logging.debug(
-                        "Supplemental preprocessor feature name mismatch for %s: "
-                        "expected %d, got %d; regenerating generic names.",
-                        target,
-                        transformed_final.shape[1],
-                        len(feature_names_out),
-                    )
-                    feature_names_out = [
-                        f"feature_{i}"
-                        for i in range(transformed_final.shape[1])
-                    ]
-
-                processed_final = pd.DataFrame(
-                    transformed_final,
-                    columns=feature_names_out,
-                    index=final_features.index,
-                )
-                processed_holdout: Optional[pd.DataFrame] = None
-                if not X_test_actual.empty:
-                    transformed_holdout = supplemental_preprocessor.transform(X_test_actual)
-                    if hasattr(transformed_holdout, "toarray"):
-                        transformed_holdout = transformed_holdout.toarray()
-                    processed_holdout = pd.DataFrame(
-                        transformed_holdout,
-                        columns=feature_names_out,
-                        index=X_test_actual.index,
-                    )
-
-                if wants_hurdle:
-                    hurdle = HurdleTDModel()
-                    splits = min(5, max(2, len(processed_final) // 20 or 2))
-                    hurdle.fit(processed_final, final_target, n_splits=splits)
-                    supplemental_model = {
-                        "type": "hurdle",
-                        "model": hurdle,
-                        "preprocessor": supplemental_preprocessor,
-                        "feature_columns": list(feature_columns),
-                        "feature_names": feature_names_out,
-                        "allowed_positions": pick_allowed_positions(target),
-                    }
-                    if processed_holdout is not None:
-                        try:
-                            y_bin = (y_test_actual > 0).astype(int)
-                            probs_any = hurdle.pr_anytime(processed_holdout)
-                            brier = brier_score_loss(y_bin, probs_any)
-                            ll = log_loss(y_bin, np.c_[1 - probs_any, probs_any], labels=[0, 1])
-                            logging.info(
-                                "%s hurdle eval | brier=%.3f logloss=%.3f",
-                                target,
-                                brier,
-                                ll,
-                            )
-                            supplemental_model["holdout"] = {"brier": brier, "log_loss": ll}
-                        except Exception as exc:
-                            logging.warning(
-                                "Calibration eval failed for %s hurdle model: %s",
-                                target,
-                                exc,
-                            )
-
-                if wants_quantile:
-                    quantile_model = QuantileYards(quantiles=(0.1, 0.5, 0.9))
-                    quantile_model.fit(processed_final, final_target)
-                    supplemental_model = {
-                        "type": "quantile",
-                        "model": quantile_model,
-                        "preprocessor": supplemental_preprocessor,
-                        "feature_columns": list(feature_columns),
-                        "feature_names": feature_names_out,
-                        "allowed_positions": pick_allowed_positions(target),
-                    }
-                    if processed_holdout is not None:
-                        try:
-                            qpreds = quantile_model.predict_quantiles(processed_holdout)
-                            mae_q = mean_absolute_error(y_test_actual, qpreds[0.5])
-                            rmse_q = compute_rmse(y_test_actual, qpreds[0.5])
-                            logging.info(
-                                "%s quantile holdout | MAE=%.3f RMSE=%.3f",
-                                target,
-                                mae_q,
-                                rmse_q,
-                            )
-                            supplemental_model["holdout"] = {"mae": mae_q, "rmse": rmse_q}
-                        except Exception as exc:
-                            logging.warning(
-                                "Quantile evaluation failed for %s: %s",
-                                target,
-                                exc,
-                            )
+                transformed = fitted_preprocessor.transform(X_all)
             except Exception:
-                logging.exception("Failed to build supplemental model for %s", target)
+                logging.debug("Unable to transform features for pricing models on %s", target, exc_info=True)
+                return None
+            if hasattr(transformed, "toarray"):
+                transformed = transformed.toarray()
+            processed_cache = pd.DataFrame(
+                transformed,
+                index=X_all.index,
+                columns=[f"feature_{i}" for i in range(transformed.shape[1])],
+            )
+            processed_feature_names = list(processed_cache.columns)
+            return processed_cache
 
-        if supplemental_model:
-            self.special_models[target] = supplemental_model
+        if target in {"receiving_yards", "receptions", "passing_yards"}:
+            processed = _prepare_processed_frame()
+            if processed is not None and len(processed) >= 100:
+                try:
+                    quant_model = QuantileYards()
+                    quant_model.fit(processed, y_all.astype(float))
+                    self.special_models[target] = {
+                        "type": "quantile",
+                        "model": quant_model,
+                        "preprocessor": fitted_preprocessor,
+                        "feature_columns": list(feature_columns),
+                        "feature_names": processed_feature_names,
+                        "allowed_positions": TARGET_ALLOWED_POSITIONS.get(target),
+                    }
+                except Exception:
+                    logging.exception("Failed to train quantile model for %s", target, exc_info=True)
 
-        ensemble.fit(final_features, final_target, **final_fit_params)
-        setattr(ensemble, "feature_columns", feature_columns)
-        setattr(ensemble, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target))
-        setattr(ensemble, "target_name", target)
-        return ensemble
+        if target in {"receiving_tds", "rushing_tds"}:
+            processed = _prepare_processed_frame()
+            positives = int((y_all > 0).sum())
+            negatives = int((y_all <= 0).sum())
+            if (
+                processed is not None
+                and len(processed) >= 150
+                and positives >= 5
+                and negatives >= 5
+            ):
+                try:
+                    n_splits = max(2, min(5, positives, negatives))
+                    hurdle_model = HurdleTDModel()
+                    hurdle_model.fit(processed, y_all.astype(float), n_splits=n_splits)
+                    self.special_models[target] = {
+                        "type": "hurdle",
+                        "model": hurdle_model,
+                        "preprocessor": fitted_preprocessor,
+                        "feature_columns": list(feature_columns),
+                        "feature_names": processed_feature_names,
+                        "allowed_positions": TARGET_ALLOWED_POSITIONS.get(target),
+                    }
+                except Exception:
+                    logging.exception("Failed to train hurdle TD model for %s", target, exc_info=True)
 
+        return model, summary
 
     def _train_game_models(self, df: pd.DataFrame) -> Dict[str, Pipeline]:
         if len(df) < 20 or df["game_result"].nunique() <= 1:
@@ -8291,15 +8063,33 @@ def predict_upcoming_games(
     upcoming = upcoming.sort_values("start_time").reset_index(drop=True)
 
     def _ensure_model_features(frame: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
-        columns = getattr(model, "feature_columns", None)
+        columns: Optional[Iterable[str]] = getattr(model, "feature_columns", None)
         if not columns:
-            return frame
-        missing = [col for col in columns if col not in frame.columns]
-        if missing:
-            frame = frame.copy()
-            for col in missing:
+            target_key = getattr(model, "target_name", None)
+            if trainer is not None and target_key:
+                columns = trainer.feature_column_map.get(target_key)
+        if not columns:
+            columns = getattr(model, "feature_names_in_", None)
+
+        if not columns:
+            numeric_cols = frame.select_dtypes(include=[np.number, bool]).columns.tolist()
+            if not numeric_cols:
+                return frame
+            return frame.loc[:, numeric_cols]
+
+        column_list = list(columns)
+        if not column_list:
+            numeric_cols = frame.select_dtypes(include=[np.number, bool]).columns.tolist()
+            if not numeric_cols:
+                return frame
+            return frame.loc[:, numeric_cols]
+
+        frame = frame.copy()
+        for col in column_list:
+            if col not in frame.columns:
                 frame[col] = np.nan
-        return frame[columns]
+
+        return frame.reindex(columns=column_list)
 
     # Game-level predictions
     game_models_present = all(key in models for key in ("game_winner", "home_points", "away_points"))
