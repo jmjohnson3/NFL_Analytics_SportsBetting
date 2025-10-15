@@ -7971,15 +7971,24 @@ def predict_upcoming_games(
     upcoming = upcoming.sort_values("start_time").reset_index(drop=True)
 
     def _ensure_model_features(frame: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
+        columns: Optional[Iterable[str]]
         columns = getattr(model, "feature_columns", None)
-        if not columns:
+        if columns is None or (hasattr(columns, "__len__") and len(columns) == 0):
+            columns = getattr(model, "feature_names_in_", None)
+        if columns is None:
             return frame
-        missing = [col for col in columns if col not in frame.columns]
-        if missing:
+
+        column_list = list(columns)
+        if not column_list:
+            return frame
+
+        if not set(column_list).issubset(frame.columns):
             frame = frame.copy()
-            for col in missing:
-                frame[col] = np.nan
-        return frame[columns]
+            for col in column_list:
+                if col not in frame.columns:
+                    frame[col] = np.nan
+
+        return frame.reindex(columns=column_list)
 
     # Game-level predictions
     game_models_present = all(key in models for key in ("game_winner", "home_points", "away_points"))
