@@ -7332,6 +7332,78 @@ class ModelTrainer:
         setattr(model, "target_name", target)
         self.feature_column_map[target] = list(feature_columns)
         self.model_uncertainty[target] = {"rmse": summary["rmse_mean"], "mae": summary["mae_mean"]}
+
+        # Supplemental pricing models for prop markets
+        fitted_preprocessor = None
+        processed_cache: Optional[pd.DataFrame] = None
+        processed_feature_names: List[str] = []
+
+        if hasattr(model, "named_steps"):
+            fitted_preprocessor = model.named_steps.get("preprocessor")
+
+        def _prepare_processed_frame() -> Optional[pd.DataFrame]:
+            nonlocal processed_cache, processed_feature_names
+            if processed_cache is not None:
+                return processed_cache
+            if fitted_preprocessor is None:
+                return None
+            try:
+                transformed = fitted_preprocessor.transform(X_all)
+            except Exception:
+                logging.debug("Unable to transform features for pricing models on %s", target, exc_info=True)
+                return None
+            if hasattr(transformed, "toarray"):
+                transformed = transformed.toarray()
+            processed_cache = pd.DataFrame(
+                transformed,
+                index=X_all.index,
+                columns=[f"feature_{i}" for i in range(transformed.shape[1])],
+            )
+            processed_feature_names = list(processed_cache.columns)
+            return processed_cache
+
+        if target in {"receiving_yards", "receptions", "passing_yards"}:
+            processed = _prepare_processed_frame()
+            if processed is not None and len(processed) >= 100:
+                try:
+                    quant_model = QuantileYards()
+                    quant_model.fit(processed, y_all.astype(float))
+                    self.special_models[target] = {
+                        "type": "quantile",
+                        "model": quant_model,
+                        "preprocessor": fitted_preprocessor,
+                        "feature_columns": list(feature_columns),
+                        "feature_names": processed_feature_names,
+                        "allowed_positions": TARGET_ALLOWED_POSITIONS.get(target),
+                    }
+                except Exception:
+                    logging.exception("Failed to train quantile model for %s", target, exc_info=True)
+
+        if target in {"receiving_tds", "rushing_tds"}:
+            processed = _prepare_processed_frame()
+            positives = int((y_all > 0).sum())
+            negatives = int((y_all <= 0).sum())
+            if (
+                processed is not None
+                and len(processed) >= 150
+                and positives >= 5
+                and negatives >= 5
+            ):
+                try:
+                    n_splits = max(2, min(5, positives, negatives))
+                    hurdle_model = HurdleTDModel()
+                    hurdle_model.fit(processed, y_all.astype(float), n_splits=n_splits)
+                    self.special_models[target] = {
+                        "type": "hurdle",
+                        "model": hurdle_model,
+                        "preprocessor": fitted_preprocessor,
+                        "feature_columns": list(feature_columns),
+                        "feature_names": processed_feature_names,
+                        "allowed_positions": TARGET_ALLOWED_POSITIONS.get(target),
+                    }
+                except Exception:
+                    logging.exception("Failed to train hurdle TD model for %s", target, exc_info=True)
+
         return model, summary
 
     def _train_game_models(self, df: pd.DataFrame) -> Dict[str, Pipeline]:
