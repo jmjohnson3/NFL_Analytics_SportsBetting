@@ -5912,6 +5912,7 @@ class ModelTrainer:
         self.target_priors: Dict[str, Dict[str, Any]] = {}
         self.prior_engines: Dict[str, Optional[Dict[str, Any]]] = {}
         self.special_models: Dict[str, Dict[str, Any]] = {}
+        self.feature_column_map: Dict[str, List[str]] = {}
 
     @staticmethod
     def _is_lineup_starter(position: str, rank: Optional[int]) -> bool:
@@ -7186,6 +7187,7 @@ class ModelTrainer:
             setattr(model, "feature_columns", list(feature_columns))
             setattr(model, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target))
             setattr(model, "target_name", target)
+            self.feature_column_map[target] = list(feature_columns)
             self.model_uncertainty[target] = {"rmse": float("nan"), "mae": float("nan")}
             return model, {"walk_forward": False, "folds": 0}
 
@@ -7328,6 +7330,7 @@ class ModelTrainer:
         setattr(model, "feature_columns", list(feature_columns))
         setattr(model, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target))
         setattr(model, "target_name", target)
+        self.feature_column_map[target] = list(feature_columns)
         self.model_uncertainty[target] = {"rmse": summary["rmse_mean"], "mae": summary["mae_mean"]}
         return model, summary
 
@@ -7971,22 +7974,31 @@ def predict_upcoming_games(
     upcoming = upcoming.sort_values("start_time").reset_index(drop=True)
 
     def _ensure_model_features(frame: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
-        columns: Optional[Iterable[str]]
-        columns = getattr(model, "feature_columns", None)
-        if columns is None or (hasattr(columns, "__len__") and len(columns) == 0):
+        columns: Optional[Iterable[str]] = getattr(model, "feature_columns", None)
+        if not columns:
+            target_key = getattr(model, "target_name", None)
+            if trainer is not None and target_key:
+                columns = trainer.feature_column_map.get(target_key)
+        if not columns:
             columns = getattr(model, "feature_names_in_", None)
-        if columns is None:
-            return frame
+
+        if not columns:
+            numeric_cols = frame.select_dtypes(include=[np.number, bool]).columns.tolist()
+            if not numeric_cols:
+                return frame
+            return frame.loc[:, numeric_cols]
 
         column_list = list(columns)
         if not column_list:
-            return frame
+            numeric_cols = frame.select_dtypes(include=[np.number, bool]).columns.tolist()
+            if not numeric_cols:
+                return frame
+            return frame.loc[:, numeric_cols]
 
-        if not set(column_list).issubset(frame.columns):
-            frame = frame.copy()
-            for col in column_list:
-                if col not in frame.columns:
-                    frame[col] = np.nan
+        frame = frame.copy()
+        for col in column_list:
+            if col not in frame.columns:
+                frame[col] = np.nan
 
         return frame.reindex(columns=column_list)
 
