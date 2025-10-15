@@ -2374,16 +2374,40 @@ class NFLDatabase:
     ) -> None:
         if not metrics:
             return
-        rows = [
-            {
-                "run_id": run_id,
-                "model_name": model_name,
-                "metric_name": metric,
-                "metric_value": float(value),
-                "sample_size": sample_size,
-            }
-            for metric, value in metrics.items()
-        ]
+        rows: List[Dict[str, Any]] = []
+
+        def _append_metric(metric_name: str, metric_value: Any) -> None:
+            if metric_value is None:
+                return
+            try:
+                value_float = float(metric_value)
+            except (TypeError, ValueError):
+                return
+            if math.isnan(value_float):
+                return
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "model_name": model_name,
+                    "metric_name": metric_name,
+                    "metric_value": value_float,
+                    "sample_size": sample_size,
+                }
+            )
+
+        for metric, value in metrics.items():
+            if isinstance(value, (tuple, list)):
+                if len(value) == 2:
+                    _append_metric(f"{metric}_lower", value[0])
+                    _append_metric(f"{metric}_upper", value[1])
+                else:
+                    for idx, component in enumerate(value):
+                        _append_metric(f"{metric}_{idx}", component)
+            else:
+                _append_metric(metric, value)
+
+        if not rows:
+            return
         with self.engine.begin() as conn:
             conn.execute(self.model_backtests.insert(), rows)
 
