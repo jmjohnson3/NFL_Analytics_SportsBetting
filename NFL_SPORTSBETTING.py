@@ -7183,6 +7183,10 @@ class ModelTrainer:
             logging.warning("%s: insufficient time slices for walk-forward; fitting single model.", target)
             fit_kwargs = {"regressor__sample_weight": w_all} if w_all is not None else {}
             model.fit(X_all, y_all, **fit_kwargs)
+            setattr(model, "feature_columns", list(feature_columns))
+            setattr(model, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target))
+            setattr(model, "target_name", target)
+            self.model_uncertainty[target] = {"rmse": float("nan"), "mae": float("nan")}
             return model, {"walk_forward": False, "folds": 0}
 
         # ---- Run walk-forward evaluation ----
