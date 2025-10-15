@@ -7101,6 +7101,7 @@ class ModelTrainer:
             y_pred: Union[pd.Series, np.ndarray],
             weights: Optional[Union[pd.Series, np.ndarray]],
         ) -> Tuple[float, float, float]:
+            from math import sqrt
             from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
             y_t = np.asarray(y_true, dtype=float)
@@ -7110,9 +7111,11 @@ class ModelTrainer:
                 w = None
             r2 = float(r2_score(y_t, y_p, sample_weight=w)) if y_t.size else float("nan")
             mae = float(mean_absolute_error(y_t, y_p, sample_weight=w)) if y_t.size else float("nan")
-            rmse = float(
-                mean_squared_error(y_t, y_p, sample_weight=w, squared=False)
-            ) if y_t.size else float("nan")
+            if y_t.size:
+                mse = mean_squared_error(y_t, y_p, sample_weight=w)
+                rmse = float(sqrt(mse))
+            else:
+                rmse = float("nan")
             return r2, mae, rmse
 
         # Require time keys
