@@ -400,6 +400,89 @@ def write_csv_safely(df: pd.DataFrame, path: str) -> None:
         logging.exception("Failed to write %s", path)
 
 
+def extract_pricing_odds(
+    odds_payload: Iterable[Dict[str, Any]],
+    valid_game_ids: Optional[Iterable[Any]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Convert bookmaker payload into flat tables for props and totals pricing."""
+
+    if valid_game_ids is None:
+        valid_ids: Optional[Set[str]] = None
+    else:
+        valid_ids = {str(gid) for gid in valid_game_ids if gid is not None}
+
+    player_rows: List[Dict[str, Any]] = []
+    total_rows: List[Dict[str, Any]] = []
+
+    for event in odds_payload or []:
+        game_id = str(event.get("id") or "")
+        if not game_id:
+            continue
+        if valid_ids is not None and game_id not in valid_ids:
+            continue
+
+        teams = [team for team in (event.get("teams") or []) if team]
+        home_raw = event.get("home_team") or (teams[0] if teams else None)
+        away_raw = event.get("away_team")
+        if not away_raw and teams:
+            away_raw = next((team for team in teams if team != home_raw), teams[0])
+
+        home_team = normalize_team_abbr(home_raw)
+        away_team = normalize_team_abbr(away_raw)
+
+        bookmakers = event.get("bookmakers", [])
+        for bookmaker in bookmakers:
+            sportsbook = bookmaker.get("key") or bookmaker.get("title") or "unknown"
+            last_update = parse_dt(bookmaker.get("last_update"))
+            for market in bookmaker.get("markets", []):
+                key = (market.get("key") or "").lower()
+                outcomes = market.get("outcomes", []) or []
+
+                if key == "totals":
+                    for outcome in outcomes:
+                        side = (outcome.get("name") or "").title()
+                        total_line = outcome.get("point")
+                        price = outcome.get("price")
+                        if side not in {"Over", "Under"}:
+                            continue
+                        if price is None or total_line is None:
+                            continue
+                        try:
+                            total_value = float(total_line)
+                        except (TypeError, ValueError):
+                            continue
+                        try:
+                            american_price = float(price)
+                        except (TypeError, ValueError):
+                            continue
+                        total_rows.append(
+                            {
+                                "market": "total",
+                                "game_id": game_id,
+                                "away_team": away_team,
+                                "home_team": home_team,
+                                "side": side,
+                                "total": total_value,
+                                "american_odds": american_price,
+                                "sportsbook": sportsbook,
+                                "event_id": game_id,
+                                "last_update": last_update,
+                            }
+                        )
+
+                # Placeholder for future prop extraction. Odds API plans often
+                # exclude player props on base subscriptions, so we skip other
+                # markets until we can map them reliably.
+
+    odds_players = pd.DataFrame(player_rows)
+    odds_totals = pd.DataFrame(total_rows)
+
+    if valid_ids is not None and not odds_totals.empty:
+        odds_totals = odds_totals[odds_totals["game_id"].astype(str).isin(valid_ids)]
+
+    return odds_players, odds_totals
+
+
 def pick_allowed_positions(target: str) -> Optional[Set[str]]:
     return TARGET_ALLOWED_POSITIONS.get(target)
 
@@ -493,12 +576,13 @@ def build_game_totals_candidates(
     offers = odds_df.query("market == 'total'").copy()
     if offers.empty:
         return pd.DataFrame()
+    offers["game_id"] = offers["game_id"].astype(str)
 
     lam_home, lam_away = tpois.predict_lambda(feats_home, feats_away)
     model_total = lam_home + lam_away
     rows: List[Dict[str, Any]] = []
     for idx, game in week_games_df.reset_index(drop=True).iterrows():
-        gid = game.get("game_id")
+        gid = str(game.get("game_id"))
         offers_game = offers[offers["game_id"] == gid]
         if offers_game.empty:
             continue
@@ -8649,8 +8733,24 @@ def predict_upcoming_games(
                     "american_odds",
                     "sportsbook",
                     "event_id",
+                    "last_update",
                 ]
             )
+
+            if ingestor is not None and getattr(ingestor, "odds_client", None) is not None:
+                try:
+                    odds_payload = ingestor.odds_client.fetch_odds()
+                    odds_players_df, odds_games_df = extract_pricing_odds(
+                        odds_payload,
+                        valid_game_ids=upcoming["game_id"].astype(str).unique(),
+                    )
+                    logging.info(
+                        "Collected %d totals rows and %d player prop rows for pricing",
+                        len(odds_games_df),
+                        len(odds_players_df),
+                    )
+                except Exception as exc:
+                    logging.warning("Failed to fetch odds for pricing: %s", exc)
 
             out_dir = Path("pricing_outputs")
             priced_results = emit_priced_picks(
