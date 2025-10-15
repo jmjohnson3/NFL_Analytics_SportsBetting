@@ -7179,22 +7179,34 @@ class ModelTrainer:
             if train_idx.sum() >= 200 and valid_idx.sum() >= 50:  # reasonable sample minimums
                 folds.append((train_idx, valid_idx))
 
-        if not folds:
-            # Fallback to fit once; no CV possible
-            logging.warning("%s: insufficient time slices for walk-forward; fitting single model.", target)
-            fit_kwargs = {"regressor__sample_weight": w_all} if w_all is not None else {}
-            model.fit(X_all, y_all, **fit_kwargs)
-            setattr(model, "feature_columns", list(feature_columns))
-            setattr(model, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target))
-            setattr(model, "target_name", target)
-            self.feature_column_map[target] = list(feature_columns)
-            self.model_uncertainty[target] = {"rmse": float("nan"), "mae": float("nan")}
-            return model, {"walk_forward": False, "folds": 0}
-
-        # ---- Run walk-forward evaluation ----
         per_fold = []
         preds_all = []
         idx_all = []
+        used_walk_forward = True
+
+        if not folds:
+            # Fallback to a simple chronological holdout when there are not enough
+            # season/week buckets to run the expanding walk-forward evaluation.
+            logging.warning(
+                "%s: insufficient time slices for walk-forward; fitting single model with holdout diagnostics.",
+                target,
+            )
+
+            valid_size = max(1, min(max(len(df) // 5, 10), len(df) // 2))
+            train_size = len(df) - valid_size
+            if train_size <= 0:
+                train_size = max(len(df) - 1, 1)
+                valid_size = len(df) - train_size
+
+            train_idx = np.zeros(len(df), dtype=bool)
+            valid_idx = np.zeros(len(df), dtype=bool)
+            train_idx[:train_size] = True
+            valid_idx[train_size:train_size + valid_size] = True
+
+            folds = [(train_idx, valid_idx)]
+            used_walk_forward = False
+
+        # ---- Run walk-forward (or fallback holdout) evaluation ----
         for k, (tr_idx, va_idx) in enumerate(folds, 1):
             X_tr, y_tr = X_all.iloc[tr_idx], y_all.iloc[tr_idx]
             X_va, y_va = X_all.iloc[va_idx], y_all.iloc[va_idx]
@@ -7291,6 +7303,9 @@ class ModelTrainer:
         # Persist backtest metrics per fold + overall
         for row in per_fold:
             self.db.record_backtest_metrics(self.run_id, f"{target}_fold{row['fold']}", row, sample_size=row["n"])
+
+        evaluation_mode = "walk-forward" if used_walk_forward else "holdout"
+
         summary = {
             "folds": len(per_fold),
             "r2_mean": float(np.mean([r["r2"] for r in per_fold])),
@@ -7301,12 +7316,14 @@ class ModelTrainer:
             "roi_ci": (roi_lo, roi_hi) if roi_lo is not None else None,
             "hit_rate": hit_rate,
             "bets": n_bets,
+            "mode": evaluation_mode,
         }
         self.db.record_backtest_metrics(self.run_id, target, summary, sample_size=int(len(out_df)))
 
         logging.info(
-            "%s walk-forward | folds=%d | MAE=%.3f | RMSE=%.3f | MAE_vs_close=%s | ROI=%s (CI=%s) | bets=%d",
+            "%s %s | folds=%d | MAE=%.3f | RMSE=%.3f | MAE_vs_close=%s | ROI=%s (CI=%s) | bets=%d",
             target,
+            evaluation_mode,
             summary["folds"],
             summary["mae_mean"],
             summary["rmse_mean"],
