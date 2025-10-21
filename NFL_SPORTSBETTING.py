@@ -435,25 +435,6 @@ class TeamPoissonTotals:
 
         return probs.reshape(lam_home.shape)
 
-    @staticmethod
-    def win_probability(
-        lambda_home: np.ndarray,
-        lambda_away: np.ndarray,
-        sims: int = 5000,
-        seed: Optional[int] = None,
-    ) -> np.ndarray:
-        """Monte Carlo estimate of home win probability from Poisson rates."""
-
-        rng = np.random.default_rng(seed)
-        probabilities: List[float] = []
-        for lam_h, lam_a in zip(lambda_home, lambda_away):
-            home_sims = rng.poisson(lam_h, sims)
-            away_sims = rng.poisson(lam_a, sims)
-            win_prob = np.mean(home_sims > away_sims)
-            tie_prob = np.mean(home_sims == away_sims)
-            probabilities.append(float(win_prob + 0.5 * tie_prob))
-        return np.asarray(probabilities, dtype=float)
-
 
 def pick_best_odds(odds_df: pd.DataFrame, by_cols: Iterable[str], price_col: str) -> pd.DataFrame:
     out = (
@@ -5556,6 +5537,15 @@ class FeatureBuilder:
                         row_copy["weather_adjustment"] = strength.get("weather_adjustment")
                         row_copy["avg_timezone_diff_hours"] = strength.get("avg_timezone_diff_hours")
 
+                    history = self._get_latest_team_history(team, season)
+                    if history is not None:
+                        if pd.isna(row_copy.get("rest_penalty")):
+                            row_copy["rest_penalty"] = history.get("rest_penalty")
+                        if pd.isna(row_copy.get("travel_penalty")):
+                            row_copy["travel_penalty"] = history.get("travel_penalty")
+                        if pd.isna(row_copy.get("avg_timezone_diff_hours")):
+                            row_copy["avg_timezone_diff_hours"] = history.get("timezone_diff_hours")
+
                     opp_strength = self._get_latest_team_strength(opponent, season)
                     if opp_strength is not None:
                         row_copy["opp_offense_pass_rating"] = opp_strength.get("offense_pass_rating")
@@ -5571,6 +5561,15 @@ class FeatureBuilder:
                         row_copy["opp_rest_penalty"] = opp_strength.get("rest_penalty")
                         row_copy["opp_weather_adjustment"] = opp_strength.get("weather_adjustment")
                         row_copy["opp_timezone_diff_hours"] = opp_strength.get("avg_timezone_diff_hours")
+
+                    opp_history = self._get_latest_team_history(opponent, season)
+                    if opp_history is not None:
+                        if pd.isna(row_copy.get("opp_rest_penalty")):
+                            row_copy["opp_rest_penalty"] = opp_history.get("rest_penalty")
+                        if pd.isna(row_copy.get("opp_travel_penalty")):
+                            row_copy["opp_travel_penalty"] = opp_history.get("travel_penalty")
+                        if pd.isna(row_copy.get("opp_timezone_diff_hours")):
+                            row_copy["opp_timezone_diff_hours"] = opp_history.get("timezone_diff_hours")
 
                     selected_rows.append(row_copy)
 
@@ -6990,6 +6989,16 @@ class ModelTrainer:
         if preds.size == 0:
             return preds
 
+        special_entry = self.special_models.get(target, {}) if hasattr(self, "special_models") else {}
+        calibration_info = special_entry.get("calibration") if isinstance(special_entry, dict) else None
+        if calibration_info and calibration_info.get("method") == "logistic":
+            try:
+                model = calibration_info.get("model")
+                if model is not None:
+                    preds = model.predict_proba(preds.reshape(-1, 1))[:, 1]
+            except Exception:
+                logging.debug("Unable to apply stored calibration for %s", target, exc_info=True)
+
         features = feature_slice.copy()
         if "team" in features.columns:
             features["team"] = features["team"].apply(normalize_team_abbr)
@@ -7267,6 +7276,26 @@ class ModelTrainer:
 
         df = sorted_df.copy()
 
+        def _american_to_prob(series: pd.Series) -> pd.Series:
+            odds = pd.to_numeric(series, errors="coerce")
+            prob = pd.Series(np.nan, index=odds.index, dtype=float)
+            if odds is None:
+                return prob
+            positive = odds >= 0
+            prob.loc[positive] = 100.0 / (odds.loc[positive] + 100.0)
+            prob.loc[~positive] = (-odds.loc[~positive]) / ((-odds.loc[~positive]) + 100.0)
+            return prob
+
+        if target.endswith("_win_prob"):
+            for side in ("home", "away"):
+                prob_col = f"{side}_implied_prob"
+                moneyline_col = f"{side}_moneyline"
+                if prob_col not in df.columns:
+                    df[prob_col] = np.nan
+                if moneyline_col in df.columns:
+                    derived = _american_to_prob(df[moneyline_col])
+                    df[prob_col] = df[prob_col].fillna(derived)
+
         def _as_weight_array(series: Optional[pd.Series]) -> Optional[np.ndarray]:
             if series is None:
                 return None
@@ -7339,12 +7368,12 @@ class ModelTrainer:
             valid_key = sw_keys[i]               # one time-slice as validation
             train_idx = df["_sw"].isin(train_keys).values
             valid_idx = (df["_sw"] == valid_key).values
-            if train_idx.sum() >= 200 and valid_idx.sum() >= 50:  # reasonable sample minimums
+            if train_idx.sum() >= 120 and valid_idx.sum() >= 30:  # reasonable sample minimums
                 folds.append((train_idx, valid_idx))
 
         per_fold = []
-        preds_all = []
-        idx_all = []
+        fold_details: List[Dict[str, Any]] = []
+        idx_all: List[np.ndarray] = []
         used_walk_forward = True
 
         if not folds:
@@ -7371,26 +7400,88 @@ class ModelTrainer:
 
         # ---- Run walk-forward (or fallback holdout) evaluation ----
         for k, (tr_idx, va_idx) in enumerate(folds, 1):
-            X_tr, y_tr = X_all.iloc[tr_idx], y_all.iloc[tr_idx]
-            X_va, y_va = X_all.iloc[va_idx], y_all.iloc[va_idx]
+            X_tr, y_tr = X_all.loc[tr_idx], y_all.loc[tr_idx]
+            X_va, y_va = X_all.loc[va_idx], y_all.loc[va_idx]
             w_tr = w_all[tr_idx] if w_all is not None else None
+            w_va = w_all[va_idx] if w_all is not None else None
 
             est = clone(model)
             fit_kwargs = {"regressor__sample_weight": w_tr} if w_tr is not None else {}
             est.fit(X_tr, y_tr, **fit_kwargs)
 
             y_hat = est.predict(X_va)
-            preds_all.append(y_hat)
-            idx_all.append(np.where(va_idx)[0])
+            idx = np.where(va_idx)[0]
+            idx_all.append(idx)
 
-            r2, mae, rmse = _weighted_metrics(y_va, y_hat, None)
-            per_fold.append({"fold": k, "n": int(len(y_va)), "r2": r2, "mae": float(mae), "rmse": float(rmse)})
+            fold_details.append(
+                {
+                    "fold": k,
+                    "indices": idx,
+                    "y_true": np.asarray(y_va, dtype=float),
+                    "y_pred": np.asarray(y_hat, dtype=float),
+                    "weights": np.asarray(w_va, dtype=float) if w_va is not None else None,
+                }
+            )
 
-        preds_all = np.concatenate(preds_all)
-        idx_all = np.concatenate(idx_all)
-        out_df = df.iloc[idx_all].copy()
+        if fold_details:
+            preds_all = np.concatenate([detail["y_pred"] for detail in fold_details])
+            idx_all = np.concatenate(idx_all)
+        else:
+            preds_all = np.array([])
+            idx_all = np.array([])
+
+        out_df = df.iloc[idx_all].copy() if idx_all.size else df.iloc[0:0].copy()
         out_df["_y_pred"] = preds_all
         out_df["_abs_err"] = (out_df[target] - out_df["_y_pred"]).abs()
+
+        calibration_record: Optional[Dict[str, Any]] = None
+        if fold_details and preds_all.size:
+            y_true_all = np.concatenate([detail["y_true"] for detail in fold_details])
+            weight_stacks = [
+                detail["weights"]
+                if detail["weights"] is not None
+                else np.ones_like(detail["y_true"], dtype=float)
+                for detail in fold_details
+            ]
+            weights_all = np.concatenate(weight_stacks) if weight_stacks else None
+
+            if target.endswith("_win_prob") and np.unique(y_true_all).size > 1:
+                try:
+                    from sklearn.linear_model import LogisticRegression
+
+                    lr = LogisticRegression(max_iter=1000)
+                    X_cal = preds_all.reshape(-1, 1)
+                    lr.fit(X_cal, y_true_all, sample_weight=weights_all)
+                    calibrated = lr.predict_proba(X_cal)[:, 1]
+
+                    start = 0
+                    for detail in fold_details:
+                        fold_len = len(detail["y_pred"])
+                        detail["final_pred"] = calibrated[start:start + fold_len]
+                        start += fold_len
+
+                    preds_all = calibrated
+                    out_df["_y_pred"] = calibrated
+                    out_df["_abs_err"] = (out_df[target] - out_df["_y_pred"]).abs()
+                    calibration_record = {"method": "logistic", "model": lr}
+                except Exception:
+                    logging.debug("Failed to fit logistic calibration for %s", target, exc_info=True)
+
+        if fold_details:
+            for detail in fold_details:
+                if "final_pred" not in detail:
+                    detail["final_pred"] = detail["y_pred"]
+                weights_fold = detail["weights"]
+                r2, mae, rmse = _weighted_metrics(detail["y_true"], detail["final_pred"], weights_fold)
+                per_fold.append(
+                    {
+                        "fold": detail["fold"],
+                        "n": int(len(detail["y_true"])),
+                        "r2": r2,
+                        "mae": float(mae),
+                        "rmse": float(rmse),
+                    }
+                )
 
         # ---- Betting diagnostics ----
         # 1) MAE vs "closing lines" (if present)
@@ -7469,18 +7560,32 @@ class ModelTrainer:
 
         evaluation_mode = "walk-forward" if used_walk_forward else "holdout"
 
-        summary = {
-            "folds": len(per_fold),
-            "r2_mean": float(np.mean([r["r2"] for r in per_fold])),
-            "mae_mean": float(np.mean([r["mae"] for r in per_fold])),
-            "rmse_mean": float(np.mean([r["rmse"] for r in per_fold])),
-            "mae_vs_closing": mae_vs_closing,
-            "roi": roi,
-            "roi_ci": (roi_lo, roi_hi) if roi_lo is not None else None,
-            "hit_rate": hit_rate,
-            "bets": n_bets,
-            "mode": evaluation_mode,
-        }
+        if per_fold:
+            summary = {
+                "folds": len(per_fold),
+                "r2_mean": float(np.mean([r["r2"] for r in per_fold])),
+                "mae_mean": float(np.mean([r["mae"] for r in per_fold])),
+                "rmse_mean": float(np.mean([r["rmse"] for r in per_fold])),
+                "mae_vs_closing": mae_vs_closing,
+                "roi": roi,
+                "roi_ci": (roi_lo, roi_hi) if roi_lo is not None else None,
+                "hit_rate": hit_rate,
+                "bets": n_bets,
+                "mode": evaluation_mode,
+            }
+        else:
+            summary = {
+                "folds": 0,
+                "r2_mean": float("nan"),
+                "mae_mean": float("nan"),
+                "rmse_mean": float("nan"),
+                "mae_vs_closing": mae_vs_closing,
+                "roi": roi,
+                "roi_ci": (roi_lo, roi_hi) if roi_lo is not None else None,
+                "hit_rate": hit_rate,
+                "bets": n_bets,
+                "mode": evaluation_mode,
+            }
         self.db.record_backtest_metrics(self.run_id, target, summary, sample_size=int(len(out_df)))
 
         logging.info(
@@ -7503,6 +7608,10 @@ class ModelTrainer:
                 raise RuntimeError(
                     f"{target}: ROI lower CI {roi_lower:.3f} does not beat vig threshold {vig_threshold:.3f}. Aborting deployment."
                 )
+
+        special_entry = self.special_models.get(target, {}).copy()
+        if calibration_record is not None:
+            special_entry["calibration"] = calibration_record
 
         # Finally fit on ALL data for live predictions
         fit_kwargs = {"regressor__sample_weight": w_all} if w_all is not None else {}
@@ -7548,14 +7657,16 @@ class ModelTrainer:
                 try:
                     quant_model = QuantileYards()
                     quant_model.fit(processed, y_all.astype(float))
-                    self.special_models[target] = {
-                        "type": "quantile",
-                        "model": quant_model,
-                        "preprocessor": fitted_preprocessor,
-                        "feature_columns": list(feature_columns),
-                        "feature_names": processed_feature_names,
-                        "allowed_positions": TARGET_ALLOWED_POSITIONS.get(target),
-                    }
+                    special_entry.update(
+                        {
+                            "type": "quantile",
+                            "model": quant_model,
+                            "preprocessor": fitted_preprocessor,
+                            "feature_columns": list(feature_columns),
+                            "feature_names": processed_feature_names,
+                            "allowed_positions": TARGET_ALLOWED_POSITIONS.get(target),
+                        }
+                    )
                 except Exception:
                     logging.exception("Failed to train quantile model for %s", target, exc_info=True)
 
@@ -7573,16 +7684,21 @@ class ModelTrainer:
                     n_splits = max(2, min(5, positives, negatives))
                     hurdle_model = HurdleTDModel()
                     hurdle_model.fit(processed, y_all.astype(float), n_splits=n_splits)
-                    self.special_models[target] = {
-                        "type": "hurdle",
-                        "model": hurdle_model,
-                        "preprocessor": fitted_preprocessor,
-                        "feature_columns": list(feature_columns),
-                        "feature_names": processed_feature_names,
-                        "allowed_positions": TARGET_ALLOWED_POSITIONS.get(target),
-                    }
+                    special_entry.update(
+                        {
+                            "type": "hurdle",
+                            "model": hurdle_model,
+                            "preprocessor": fitted_preprocessor,
+                            "feature_columns": list(feature_columns),
+                            "feature_names": processed_feature_names,
+                            "allowed_positions": TARGET_ALLOWED_POSITIONS.get(target),
+                        }
+                    )
                 except Exception:
                     logging.exception("Failed to train hurdle TD model for %s", target, exc_info=True)
+
+        if special_entry:
+            self.special_models[target] = special_entry
 
         return model, summary
 
