@@ -3949,6 +3949,110 @@ class FeatureBuilder:
         self.injury_frame: Optional[pd.DataFrame] = None
         self.depth_chart_frame: Optional[pd.DataFrame] = None
         self.advanced_metrics_frame: Optional[pd.DataFrame] = None
+        self.latest_odds_lookup: Optional[pd.DataFrame] = None
+
+    @staticmethod
+    def _american_to_prob_series(series: pd.Series) -> pd.Series:
+        odds = pd.to_numeric(series, errors="coerce")
+        prob = pd.Series(np.nan, index=odds.index, dtype=float)
+        if odds is None:
+            return prob
+        positive = odds >= 0
+        prob.loc[positive] = 100.0 / (odds.loc[positive] + 100.0)
+        prob.loc[~positive] = (-odds.loc[~positive]) / ((-odds.loc[~positive]) + 100.0)
+        return prob
+
+    @staticmethod
+    def _merge_odds_snapshot(
+        frame: pd.DataFrame,
+        lookup: pd.DataFrame,
+        key_cols: List[str],
+        value_cols: List[str],
+        sort_cols: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        if lookup is None or lookup.empty:
+            return frame
+
+        available_values = [col for col in value_cols if col in lookup.columns]
+        if not available_values:
+            return frame
+
+        for col in key_cols:
+            if col not in frame.columns or col not in lookup.columns:
+                return frame
+
+        subset = lookup.dropna(subset=[col for col in available_values if "moneyline" in col])
+        if subset.empty:
+            return frame
+
+        ordering = sort_cols or []
+        ordering = [col for col in ordering if col in subset.columns]
+        if ordering:
+            subset = subset.sort_values(ordering, ascending=[False] * len(ordering))
+        subset = subset.drop_duplicates(subset=key_cols, keep="first")
+
+        merge_cols = key_cols + available_values
+        snapshot = subset[merge_cols]
+
+        merged = frame.merge(snapshot, on=key_cols, how="left", suffixes=("", "_lookup"))
+        for col in available_values:
+            lookup_col = f"{col}_lookup"
+            if lookup_col in merged.columns:
+                merged[col] = merged[col].combine_first(merged[lookup_col])
+                merged.drop(columns=[lookup_col], inplace=True)
+        return merged
+
+    def _backfill_game_odds(self, games: pd.DataFrame) -> pd.DataFrame:
+        if games is None or games.empty:
+            return games
+
+        working = games.copy()
+        if "start_time" in working.columns:
+            working["start_time"] = pd.to_datetime(working["start_time"], errors="coerce")
+            working["_start_date"] = working["start_time"].dt.normalize()
+
+        odds_cols = [
+            "home_moneyline",
+            "away_moneyline",
+            "home_implied_prob",
+            "away_implied_prob",
+            "odds_updated",
+        ]
+
+        lookup_source = working.dropna(subset=["home_moneyline", "away_moneyline"], how="any")
+        if not lookup_source.empty:
+            if "odds_updated" in lookup_source.columns:
+                sort_columns = ["odds_updated", "start_time"]
+            else:
+                sort_columns = ["start_time"]
+
+            key_sets: List[List[str]] = []
+            if "game_id" in working.columns:
+                key_sets.append(["game_id"])
+            if {"season", "week", "home_team", "away_team"}.issubset(working.columns):
+                key_sets.append(["season", "week", "home_team", "away_team"])
+            if {"home_team", "away_team", "_start_date"}.issubset(working.columns):
+                key_sets.append(["home_team", "away_team", "_start_date"])
+            if {"season", "home_team", "away_team"}.issubset(working.columns):
+                key_sets.append(["season", "home_team", "away_team"])
+
+            for keys in key_sets:
+                working = self._merge_odds_snapshot(
+                    working, lookup_source, keys, odds_cols, sort_cols=sort_columns
+                )
+
+        for side in ("home", "away"):
+            money_col = f"{side}_moneyline"
+            prob_col = f"{side}_implied_prob"
+            if money_col in working.columns:
+                derived = self._american_to_prob_series(working[money_col])
+                if prob_col in working.columns:
+                    working[prob_col] = working[prob_col].combine_first(derived)
+                else:
+                    working[prob_col] = derived
+
+        working.drop(columns=["_start_date"], inplace=True, errors="ignore")
+        return working
 
     def load_dataframes(
         self,
@@ -4009,6 +4113,35 @@ class FeatureBuilder:
             return {}
 
         games = games.copy()
+        games = self._backfill_game_odds(games)
+        if "home_moneyline" in games.columns and "away_moneyline" in games.columns:
+            odds_lookup = games.dropna(subset=["home_moneyline", "away_moneyline"], how="any").copy()
+            if not odds_lookup.empty:
+                odds_lookup["start_time"] = pd.to_datetime(odds_lookup["start_time"], errors="coerce")
+                odds_lookup["_start_date"] = odds_lookup["start_time"].dt.normalize()
+                sort_cols = [col for col in ["odds_updated", "start_time"] if col in odds_lookup.columns]
+                if sort_cols:
+                    odds_lookup = odds_lookup.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+                odds_lookup = odds_lookup.drop_duplicates(
+                    subset=["home_team", "away_team", "_start_date"], keep="first"
+                )
+                self.latest_odds_lookup = odds_lookup[
+                    [
+                        "home_team",
+                        "away_team",
+                        "_start_date",
+                        "home_moneyline",
+                        "away_moneyline",
+                        "home_implied_prob",
+                        "away_implied_prob",
+                        "odds_updated",
+                    ]
+                ].rename(columns={"_start_date": "start_date"})
+            else:
+                self.latest_odds_lookup = pd.DataFrame()
+        else:
+            self.latest_odds_lookup = pd.DataFrame()
+
         player_stats = player_stats.copy()
         injuries = injuries.copy()
         depth_charts = depth_charts.copy()
@@ -4529,6 +4662,20 @@ class FeatureBuilder:
             )
             games_context.drop(columns=["away_travel_penalty_hist"], inplace=True)
 
+        penalty_fill_cols = [
+            "home_travel_penalty",
+            "home_rest_penalty",
+            "home_timezone_diff_hours",
+            "home_rest_days",
+            "away_travel_penalty",
+            "away_rest_penalty",
+            "away_timezone_diff_hours",
+            "away_rest_days",
+        ]
+        for col in penalty_fill_cols:
+            if col in games_context.columns:
+                games_context[col] = games_context[col].fillna(0.0)
+
         games_context["moneyline_diff"] = games_context["home_moneyline"] - games_context["away_moneyline"]
         games_context["implied_prob_diff"] = (
             games_context["home_implied_prob"] - games_context["away_implied_prob"]
@@ -4595,7 +4742,35 @@ class FeatureBuilder:
         if "day_of_week" not in features.columns or features["day_of_week"].isna().any():
             features["day_of_week"] = features["start_time"].dt.day_name()
 
+        # Reuse the latest odds snapshot harvested during feature assembly so upcoming
+        # games inherit backfilled closing numbers even when the source table is sparse.
+        lookup = self.latest_odds_lookup
+        if lookup is not None and not lookup.empty:
+            odds_lookup = lookup.copy()
+            odds_lookup["start_date"] = pd.to_datetime(
+                odds_lookup["start_date"], errors="coerce"
+            )
+            features["_start_date"] = features["start_time"].dt.normalize()
+            features = self._merge_odds_snapshot(
+                features,
+                odds_lookup,
+                ["home_team", "away_team", "_start_date"],
+                [
+                    "home_moneyline",
+                    "away_moneyline",
+                    "home_implied_prob",
+                    "away_implied_prob",
+                    "odds_updated",
+                ],
+                sort_cols=["odds_updated"],
+            )
+            features.drop(columns=["_start_date"], inplace=True, errors="ignore")
+
         numeric_placeholders = {
+            "home_moneyline": np.nan,
+            "away_moneyline": np.nan,
+            "home_implied_prob": np.nan,
+            "away_implied_prob": np.nan,
             "home_offense_pass_rating": np.nan,
             "home_offense_rush_rating": np.nan,
             "home_defense_pass_rating": np.nan,
@@ -5606,6 +5781,18 @@ class FeatureBuilder:
                         player_features[dest].notna(), player_features[src]
                     )
                     player_features = player_features.drop(columns=[src])
+
+        penalty_cols = [
+            "travel_penalty",
+            "rest_penalty",
+            "avg_timezone_diff_hours",
+            "opp_travel_penalty",
+            "opp_rest_penalty",
+            "opp_timezone_diff_hours",
+        ]
+        for col in penalty_cols:
+            if col in player_features.columns:
+                player_features[col] = player_features[col].fillna(0.0)
 
         player_features = player_features.drop(columns=["player_name_norm"], errors="ignore")
 
@@ -8385,6 +8572,23 @@ def predict_upcoming_games(
     home_predictions = models["home_points"].predict(home_features)
     winner_probs = models["game_winner"].predict_proba(winner_features)[:, 1]
 
+    if trainer is not None:
+        try:
+            specials = getattr(trainer, "special_models", {}) or {}
+        except Exception:
+            specials = {}
+        calibration_info = specials.get("game_winner", {}).get("calibration") if isinstance(specials, dict) else None
+        if calibration_info and calibration_info.get("method") == "logistic":
+            model = calibration_info.get("model")
+            if model is not None:
+                try:
+                    winner_probs = model.predict_proba(winner_probs.reshape(-1, 1))[:, 1]
+                except Exception:
+                    logging.debug(
+                        "Unable to apply stored calibration for game_winner during inference",
+                        exc_info=True,
+                    )
+
     scoreboard = upcoming[[
         "game_id",
         "start_time",
@@ -8446,6 +8650,19 @@ def predict_upcoming_games(
             "home_team": "home_team_abbr",
         }
     )
+
+    odds_columns = [
+        "home_moneyline",
+        "away_moneyline",
+        "home_implied_prob",
+        "away_implied_prob",
+        "odds_updated",
+    ]
+    available_odds = [col for col in odds_columns if col in game_features.columns]
+    if available_odds:
+        odds_frame = game_features[["game_id", *available_odds]].drop_duplicates("game_id")
+        scoreboard = scoreboard.merge(odds_frame, on="game_id", how="left")
+
     scoreboard = scoreboard.sort_values(["date", "start_time", "game_id"]).reset_index(drop=True)
 
     # Player-level predictions
