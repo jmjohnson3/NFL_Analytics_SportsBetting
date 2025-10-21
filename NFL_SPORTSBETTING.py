@@ -342,20 +342,98 @@ class TeamPoissonTotals:
         return lambda_home, lambda_away
 
     @staticmethod
+    def _poisson_cdf(rate: float, k: int) -> float:
+        """Compute cumulative probability P(X <= k) for X~Poisson(rate)."""
+
+        if k < 0:
+            return 0.0
+        if rate <= 0.0:
+            return 1.0
+
+        term = math.exp(-rate)
+        cumulative = term
+        for i in range(1, k + 1):
+            term *= rate / i
+            cumulative += term
+        return float(min(1.0, cumulative))
+
+    @staticmethod
     def prob_total_over(
         lambda_home: np.ndarray,
         lambda_away: np.ndarray,
         total: float,
-        sims: int = 5000,
-        seed: Optional[int] = None,
     ) -> np.ndarray:
-        rng = np.random.default_rng(seed)
-        probabilities: List[float] = []
-        for home_val, away_val in zip(lambda_home, lambda_away):
-            home_sims = rng.poisson(home_val, sims)
-            away_sims = rng.poisson(away_val, sims)
-            probabilities.append(float(np.mean((home_sims + away_sims) > total)))
-        return np.asarray(probabilities, dtype=float)
+        """Exact probability the combined score exceeds the listed total."""
+
+        lam_home = np.asarray(lambda_home, dtype=float)
+        lam_away = np.asarray(lambda_away, dtype=float)
+        combined = lam_home + lam_away
+
+        totals = np.broadcast_to(np.asarray(total, dtype=float), combined.shape).astype(float)
+        flat_combined = combined.reshape(-1)
+        flat_totals = totals.reshape(-1)
+
+        probs = np.empty_like(flat_combined)
+        for idx, (lam, line) in enumerate(zip(flat_combined, flat_totals)):
+            threshold = math.floor(line)
+            cdf_val = TeamPoissonTotals._poisson_cdf(lam, threshold)
+            probs[idx] = max(0.0, min(1.0, 1.0 - cdf_val))
+
+        return probs.reshape(combined.shape)
+
+    @staticmethod
+    def _home_win_probability_pair(lam_h: float, lam_a: float, tol: float = 1e-10) -> float:
+        if lam_h < 0 or lam_a < 0:
+            return 0.5
+
+        pmf_home = math.exp(-lam_h)
+        pmf_away = math.exp(-lam_a)
+        cdf_home = pmf_home
+
+        prob_home_win = 0.0
+        prob_tie = pmf_home * pmf_away
+        cdf_away_prev = pmf_away
+
+        max_rate = max(lam_h, lam_a)
+        max_iter = max(50, int(math.ceil(max_rate + 10.0 * math.sqrt(max_rate + 1.0))))
+
+        for k in range(1, max_iter + 1):
+            pmf_home *= lam_h / k if lam_h > 0 else 0.0
+            pmf_away *= lam_a / k if lam_a > 0 else 0.0
+
+            prob_home_win += pmf_home * cdf_away_prev
+            prob_tie += pmf_home * pmf_away
+
+            cdf_home = min(1.0, cdf_home + pmf_home)
+            cdf_away_prev = min(1.0, cdf_away_prev + pmf_away)
+
+            if (1.0 - cdf_home) < tol and (1.0 - cdf_away_prev) < tol:
+                break
+
+        if cdf_home < 1.0:
+            prob_home_win += (1.0 - cdf_home) * cdf_away_prev
+
+        probability = prob_home_win + 0.5 * prob_tie
+        return float(min(1.0, max(0.0, probability)))
+
+    @staticmethod
+    def win_probability(
+        lambda_home: np.ndarray,
+        lambda_away: np.ndarray,
+    ) -> np.ndarray:
+        """Deterministic estimate of home win probability from Poisson rates."""
+
+        lam_home = np.asarray(lambda_home, dtype=float)
+        lam_away = np.asarray(lambda_away, dtype=float)
+
+        flat_home = lam_home.reshape(-1)
+        flat_away = lam_away.reshape(-1)
+        probs = np.empty_like(flat_home)
+
+        for idx, (lh, la) in enumerate(zip(flat_home, flat_away)):
+            probs[idx] = TeamPoissonTotals._home_win_probability_pair(lh, la)
+
+        return probs.reshape(lam_home.shape)
 
     @staticmethod
     def win_probability(
