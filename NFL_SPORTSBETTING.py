@@ -357,6 +357,25 @@ class TeamPoissonTotals:
             probabilities.append(float(np.mean((home_sims + away_sims) > total)))
         return np.asarray(probabilities, dtype=float)
 
+    @staticmethod
+    def win_probability(
+        lambda_home: np.ndarray,
+        lambda_away: np.ndarray,
+        sims: int = 5000,
+        seed: Optional[int] = None,
+    ) -> np.ndarray:
+        """Monte Carlo estimate of home win probability from Poisson rates."""
+
+        rng = np.random.default_rng(seed)
+        probabilities: List[float] = []
+        for lam_h, lam_a in zip(lambda_home, lambda_away):
+            home_sims = rng.poisson(lam_h, sims)
+            away_sims = rng.poisson(lam_a, sims)
+            win_prob = np.mean(home_sims > away_sims)
+            tie_prob = np.mean(home_sims == away_sims)
+            probabilities.append(float(win_prob + 0.5 * tie_prob))
+        return np.asarray(probabilities, dtype=float)
+
 
 def pick_best_odds(odds_df: pd.DataFrame, by_cols: Iterable[str], price_col: str) -> pd.DataFrame:
     out = (
@@ -639,17 +658,60 @@ def emit_priced_picks(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     stacked = []
+    fallback_tables: List[pd.DataFrame] = []
     for market, table in player_pred_tables.items():
         if table is None or table.empty:
             continue
         table = table.copy()
         table["market"] = market
         stacked.append(table)
+
+        fallback = table.copy()
+        if market == "anytime_td":
+            fallback["model_probability"] = fallback.get("anytime_prob")
+            fallback["recommended_line"] = np.nan
+            fallback["range_low"] = np.nan
+            fallback["range_high"] = np.nan
+        else:
+            fallback["model_probability"] = np.nan
+            fallback["recommended_line"] = fallback.get("pred_median")
+            fallback["range_low"] = fallback.get("q10")
+            fallback["range_high"] = fallback.get("q90")
+        fallback_tables.append(fallback)
     preds_all = pd.concat(stacked, ignore_index=True) if stacked else pd.DataFrame()
 
     props_priced = build_player_prop_candidates(preds_all, odds_players) if not preds_all.empty else pd.DataFrame()
     props_filtered = filter_ev(props_priced, EV_MIN_PROPS)
     write_csv_safely(props_filtered, str(out_dir / f"player_props_priced_{week_key}.csv"))
+
+    model_props = pd.DataFrame()
+    if fallback_tables:
+        model_props = pd.concat(fallback_tables, ignore_index=True)
+        columns_order = [
+            col
+            for col in [
+                "market",
+                "player_id",
+                "player_name",
+                "team",
+                "opponent",
+                "position",
+                "recommended_line",
+                "range_low",
+                "range_high",
+                "model_probability",
+            ]
+            if col in model_props.columns
+        ]
+        model_props = model_props.loc[:, columns_order]
+        model_props_path = out_dir / f"player_props_model_{week_key}.csv"
+        write_csv_safely(model_props, str(model_props_path))
+        if not model_props.empty:
+            logging.info(
+                "Saved %d model-only prop forecasts to %s",
+                len(model_props),
+                model_props_path,
+            )
 
     totals_priced = pd.DataFrame()
     if tpois is not None and not feats_home.empty and not odds_games.empty:
@@ -664,6 +726,26 @@ def emit_priced_picks(
         write_csv_safely(totals_filtered, str(out_dir / f"game_totals_priced_{week_key}.csv"))
     else:
         totals_filtered = pd.DataFrame()
+
+    model_totals = pd.DataFrame()
+    if tpois is not None and not feats_home.empty:
+        lam_home, lam_away = tpois.predict_lambda(feats_home, feats_away)
+        model_totals = week_games_df.copy()
+        model_totals = model_totals.assign(
+            model_home_lambda=lam_home,
+            model_away_lambda=lam_away,
+            model_total=lam_home + lam_away,
+            model_spread=lam_home - lam_away,
+            model_home_win_prob=TeamPoissonTotals.win_probability(lam_home, lam_away),
+        )
+        model_totals_path = out_dir / f"game_totals_model_{week_key}.csv"
+        write_csv_safely(model_totals, str(model_totals_path))
+        if not model_totals.empty:
+            logging.info(
+                "Saved %d model-only game total forecasts to %s",
+                len(model_totals),
+                model_totals_path,
+            )
 
     try:
         if props_filtered is not None and not props_filtered.empty:
@@ -713,6 +795,8 @@ def emit_priced_picks(
     return {
         "props": props_filtered if props_filtered is not None else pd.DataFrame(),
         "totals": totals_filtered if totals_filtered is not None else pd.DataFrame(),
+        "model_props": model_props,
+        "model_totals": model_totals,
     }
 
 
