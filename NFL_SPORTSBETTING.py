@@ -18,6 +18,7 @@ can be used to identify profitable betting opportunities.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import dataclasses
 import datetime as dt
 import json
@@ -35,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import numpy as np
 import pandas as pd
 import requests
@@ -91,6 +93,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
+
+import odds_extract
 
 
 # ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
@@ -2873,234 +2877,242 @@ class MySportsFeedsClient:
             raise
 
 
+
 class OddsApiClient:
     def __init__(self, api_key: str, timeout: int = 30):
         self.api_key = api_key
         self.timeout = timeout
 
-    def _request(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        url = f"{ODDS_BASE}/{endpoint}"
-        params = params or {}
-        params.update({"apiKey": self.api_key})
-        logging.debug("Requesting Odds API endpoint %s", url)
-        resp = requests.get(url, params=params, timeout=self.timeout)
-        resp.raise_for_status()
-        remaining = resp.headers.get("x-requests-remaining")
-        if remaining is not None:
-            logging.debug("Odds API requests remaining: %s", remaining)
-        return resp.json()
+    @staticmethod
+    def _normalize_bound(value: Optional[dt.datetime]) -> Optional[dt.datetime]:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt.timezone.utc)
+        return value.astimezone(dt.timezone.utc)
 
-    def _format_commence_param(self, value: dt.datetime) -> str:
+    @staticmethod
+    def _to_iso(value: Optional[dt.datetime]) -> Optional[str]:
+        if value is None:
+            return None
         if value.tzinfo is None:
             value = value.replace(tzinfo=dt.timezone.utc)
-        else:
-            value = value.astimezone(dt.timezone.utc)
-        value = value.replace(microsecond=0)
-        return value.isoformat().replace("+00:00", "Z")
+        return value.astimezone(dt.timezone.utc).isoformat().replace('+00:00', 'Z')
 
-    def _fetch_events_window(
+    @staticmethod
+    def _reverse_market_map() -> Dict[str, str]:
+        reverse: Dict[str, str] = {}
+        for raw_key, canonical in odds_extract.NFL_MARKET_MAP.items():
+            preferred = raw_key
+            if preferred.endswith('_yds'):
+                preferred = preferred.replace('_yds', '_yards')
+            if preferred == 'player_reception_yds':
+                preferred = 'player_receiving_yards'
+            reverse[canonical.upper()] = preferred
+        return reverse
+
+    def _assemble_events(
         self,
-        *,
+        game_df: pd.DataFrame,
+        prop_df: pd.DataFrame,
         start: Optional[dt.datetime],
         end: Optional[dt.datetime],
     ) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"regions": ",".join(ODDS_REGIONS)}
-        if start is not None:
-            params["commenceTimeFrom"] = self._format_commence_param(start)
-        if end is not None:
-            params["commenceTimeTo"] = self._format_commence_param(end)
-        params["dateFormat"] = "iso"
-        payload = self._request(f"sports/{NFL_SPORT_KEY}/events", params=params)
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            return payload.get("events", [])  # type: ignore[return-value]
-        return []
+        reverse_map = self._reverse_market_map()
 
-    def fetch_events(
-        self,
-        *,
-        start: Optional[dt.datetime] = None,
-        end: Optional[dt.datetime] = None,
-    ) -> List[Dict[str, Any]]:
-        try:
-            return self._fetch_events_window(start=start, end=end)
-        except HTTPError as exc:
-            status = getattr(exc.response, "status_code", None)
-            if (
-                status == 422
-                and start is not None
-                and end is not None
-                and end > start
-            ):
-                midpoint = start + (end - start) / 2
-                if midpoint <= start or midpoint >= end:
-                    # Avoid infinite recursion if the interval cannot be split further
-                    raise
-                logging.debug(
-                    "Splitting Odds API event fetch window due to HTTP 422: %s -> %s", start, end
-                )
-                first_half = self.fetch_events(start=start, end=midpoint)
-                second_half = self.fetch_events(start=midpoint, end=end)
-                combined = first_half + second_half
-                # Deduplicate by event id while preserving order
-                seen: Set[str] = set()
-                unique_events: List[Dict[str, Any]] = []
-                for event in combined:
-                    event_id = str(event.get("id", "")) if isinstance(event, dict) else ""
-                    if event_id and event_id in seen:
-                        continue
-                    if event_id:
-                        seen.add(event_id)
-                    unique_events.append(event)
-                return unique_events
-            raise
+        def normalize_market(label: str) -> str:
+            key = reverse_map.get(label.upper(), label.lower())
+            if key.endswith('_yds'):
+                key = key.replace('_yds', '_yards')
+            if key == 'player_reception_yds':
+                key = 'player_receiving_yards'
+            return key
 
-    def _extract_bookmakers(self, payload: Any) -> List[Dict[str, Any]]:
-        if isinstance(payload, dict):
-            if "bookmakers" in payload:
-                return payload.get("bookmakers", [])  # type: ignore[return-value]
-            if "data" in payload and isinstance(payload["data"], dict):
-                return payload["data"].get("bookmakers", [])  # type: ignore[index]
-        if isinstance(payload, list) and payload:
-            if isinstance(payload[0], dict) and "bookmakers" in payload[0]:
-                return payload[0].get("bookmakers", [])  # type: ignore[return-value]
-        return []
+        event_meta: Dict[str, Dict[str, Any]] = {}
 
-    def _merge_bookmakers(self, bookmakers: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        merged: Dict[str, Dict[str, Any]] = {}
-        for bookmaker in bookmakers:
-            key = bookmaker.get("key") or bookmaker.get("title")
-            if not key:
-                continue
-            previous = merged.get(key)
-            last_update = parse_dt(bookmaker.get("last_update"))
-            prev_update = parse_dt(previous.get("last_update")) if previous else None
-            if previous is None or (
-                last_update is not None
-                and (prev_update is None or last_update >= prev_update)
-            ):
-                merged[key] = bookmaker
-        return list(merged.values())
-
-    def fetch_event_odds(
-        self,
-        event_id: str,
-        *,
-        markets: Sequence[str],
-    ) -> List[Dict[str, Any]]:
-        market_list = list(markets)
-        if not market_list:
-            return []
-
-        params = {
-            "regions": ",".join(ODDS_REGIONS),
-            "markets": ",".join(market_list),
-            "oddsFormat": ODDS_FORMAT,
-        }
-        try:
-            payload = self._request(
-                f"sports/{NFL_SPORT_KEY}/events/{event_id}/odds",
-                params=params,
-            )
-            return self._extract_bookmakers(payload)
-        except HTTPError as exc:
-            status = getattr(exc.response, "status_code", None)
-            if status == 422 and len(market_list) > 1:
-                mid = len(market_list) // 2
-                logging.debug(
-                    "Splitting Odds API event odds markets due to HTTP 422 for %s: %s",
-                    event_id,
-                    ",".join(market_list),
-                )
-                first_half = self.fetch_event_odds(event_id, markets=market_list[:mid])
-                second_half = self.fetch_event_odds(event_id, markets=market_list[mid:])
-                return self._merge_bookmakers(first_half + second_half)
-            if status == 422 and market_list:
-                logging.debug(
-                    "Odds API returned HTTP 422 for event %s market %s; skipping",
-                    event_id,
-                    market_list[0] if len(market_list) == 1 else ",".join(market_list),
-                )
-                return []
-            raise
-
-    def fetch_event_odds_history(
-        self,
-        event_id: str,
-        *,
-        markets: Sequence[str],
-        target_date: Optional[dt.datetime] = None,
-    ) -> List[Dict[str, Any]]:
-        market_list = list(markets)
-        if not market_list:
-            return []
-
-        params = {
-            "regions": ",".join(ODDS_REGIONS),
-            "markets": ",".join(market_list),
-            "oddsFormat": ODDS_FORMAT,
-        }
-        if target_date is not None:
-            params["date"] = target_date.date().isoformat()
-        try:
-            payload = self._request(
-                f"sports/{NFL_SPORT_KEY}/events/{event_id}/odds-history",
-                params=params,
-            )
-        except HTTPError as exc:
-            status = getattr(exc.response, "status_code", None)
-            if status == 422 and len(market_list) > 1:
-                mid = len(market_list) // 2
-                logging.debug(
-                    "Splitting Odds API odds-history markets due to HTTP 422 for %s: %s",
-                    event_id,
-                    ",".join(market_list),
-                )
-                first_half = self.fetch_event_odds_history(
-                    event_id,
-                    markets=market_list[:mid],
-                    target_date=target_date,
-                )
-                second_half = self.fetch_event_odds_history(
-                    event_id,
-                    markets=market_list[mid:],
-                    target_date=target_date,
-                )
-                return self._merge_bookmakers(first_half + second_half)
-            if status == 422 and market_list:
-                logging.debug(
-                    "Odds API returned HTTP 422 for event %s odds-history market %s; skipping",
-                    event_id,
-                    market_list[0] if len(market_list) == 1 else ",".join(market_list),
-                )
-                return []
-            raise
-        snapshots: List[Dict[str, Any]]
-        if isinstance(payload, list):
-            snapshots = payload
-        elif isinstance(payload, dict) and "data" in payload:
-            data = payload.get("data")
-            snapshots = data if isinstance(data, list) else [payload]
-        else:
-            snapshots = [payload] if payload else []
-
-        latest_by_bookmaker: Dict[str, Dict[str, Any]] = {}
-        for snapshot in snapshots:
-            bookmakers = self._extract_bookmakers(snapshot)
-            for bookmaker in bookmakers:
-                key = bookmaker.get("key") or bookmaker.get("title")
-                if not key:
+        def update_meta(frame: pd.DataFrame) -> None:
+            if frame is None or frame.empty:
+                return
+            for _, row in frame.iterrows():
+                eid = str(row.get('event_id') or '')
+                if not eid:
                     continue
-                previous = latest_by_bookmaker.get(key)
-                last_update = parse_dt(bookmaker.get("last_update"))
-                prev_update = parse_dt(previous.get("last_update")) if previous else None
-                if previous is None or (
-                    last_update is not None
-                    and (prev_update is None or last_update >= prev_update)
-                ):
-                    latest_by_bookmaker[key] = bookmaker
-        return list(latest_by_bookmaker.values())
+                meta = event_meta.setdefault(eid, {})
+                if not meta.get('home_team') and row.get('home_team'):
+                    meta['home_team'] = row.get('home_team')
+                if not meta.get('away_team') and row.get('away_team'):
+                    meta['away_team'] = row.get('away_team')
+                commence_dt = row.get('commence_dt')
+                if pd.notna(commence_dt) and meta.get('commence_dt') is None:
+                    if isinstance(commence_dt, pd.Timestamp):
+                        meta['commence_dt'] = commence_dt.to_pydatetime()
+                    elif isinstance(commence_dt, dt.datetime):
+                        meta['commence_dt'] = commence_dt
+                if not meta.get('commence_raw') and row.get('commence_time'):
+                    meta['commence_raw'] = row.get('commence_time')
+
+        update_meta(game_df)
+        update_meta(prop_df)
+
+        events: Dict[str, Dict[str, Any]] = {}
+        bookmaker_maps: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+        def get_event(event_id: str) -> Dict[str, Any]:
+            if event_id not in events:
+                meta = event_meta.get(event_id, {})
+                commence_dt = meta.get('commence_dt')
+                events[event_id] = {
+                    'id': event_id,
+                    'commence_time': self._to_iso(commence_dt) if commence_dt else meta.get('commence_raw'),
+                    'home_team': meta.get('home_team'),
+                    'away_team': meta.get('away_team'),
+                    'bookmakers': [],
+                }
+                bookmaker_maps[event_id] = {}
+            return events[event_id]
+
+        def get_bookmaker(event_id: str, book: str) -> Dict[str, Any]:
+            event = get_event(event_id)
+            book_map = bookmaker_maps[event_id]
+            if book not in book_map:
+                bookmaker = {
+                    'key': book,
+                    'title': book,
+                    'last_update': self._to_iso(default_now_utc()),
+                    'markets': [],
+                }
+                bookmaker['__markets'] = {}
+                book_map[book] = bookmaker
+                event['bookmakers'].append(bookmaker)
+            return book_map[book]
+
+        def add_outcome(book: Dict[str, Any], market_key: str, outcome: Dict[str, Any]) -> None:
+            markets_map = book.setdefault('__markets', {})
+            market_struct = markets_map.get(market_key)
+            if market_struct is None:
+                market_struct = {'key': market_key, 'outcomes': []}
+                markets_map[market_key] = market_struct
+                book['markets'].append(market_struct)
+            market_struct['outcomes'].append(outcome)
+
+        if game_df is not None and not game_df.empty:
+            for _, row in game_df.iterrows():
+                eid = str(row.get('event_id') or '')
+                book_name = str(row.get('book') or '')
+                if not eid or not book_name:
+                    continue
+                price = row.get('american_odds')
+                if pd.isna(price):
+                    continue
+                book = get_bookmaker(eid, book_name)
+                market_key = normalize_market(str(row.get('market') or ''))
+                outcome: Dict[str, Any] = {
+                    'name': row.get('side'),
+                    'price': float(price),
+                }
+                line_val = row.get('line')
+                if not pd.isna(line_val):
+                    outcome['point'] = float(line_val)
+                    if market_key == 'totals':
+                        outcome['total'] = float(line_val)
+                add_outcome(book, market_key, outcome)
+
+        if prop_df is not None and not prop_df.empty:
+            for _, row in prop_df.iterrows():
+                eid = str(row.get('event_id') or '')
+                book_name = str(row.get('book') or '')
+                if not eid or not book_name:
+                    continue
+                price = row.get('american_odds')
+                if pd.isna(price):
+                    continue
+                book = get_bookmaker(eid, book_name)
+                market_key = normalize_market(str(row.get('market') or ''))
+                outcome: Dict[str, Any] = {
+                    'name': row.get('side'),
+                    'price': float(price),
+                    'description': row.get('player'),
+                    'participant': row.get('player'),
+                }
+                line_val = row.get('line')
+                if not pd.isna(line_val):
+                    outcome['point'] = float(line_val)
+                add_outcome(book, market_key, outcome)
+
+        assembled = list(events.values())
+        for event in assembled:
+            for bookmaker in event.get('bookmakers', []):
+                bookmaker.pop('__markets', None)
+
+        if start or end:
+            filtered: List[Dict[str, Any]] = []
+            start_utc = self._normalize_bound(start)
+            end_utc = self._normalize_bound(end)
+            for event in assembled:
+                commence = parse_dt(event.get('commence_time'))
+                if start_utc and (commence is None or commence < start_utc):
+                    continue
+                if end_utc and (commence is None or commence > end_utc):
+                    continue
+                filtered.append(event)
+            assembled = filtered
+        return assembled
+
+    async def _fetch_async(
+        self,
+        start: Optional[dt.datetime],
+        end: Optional[dt.datetime],
+        include_player_props: bool,
+    ) -> List[Dict[str, Any]]:
+        odds_extract.ODDS_API_KEY = self.api_key or odds_extract.ODDS_API_KEY
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            game_df = await odds_extract.fetch_nfl_game_odds(
+                session,
+                regions=ODDS_REGIONS,
+                markets=ODDS_DEFAULT_MARKETS,
+                odds_format=ODDS_FORMAT,
+            )
+            if not game_df.empty:
+                game_df['commence_dt'] = pd.to_datetime(
+                    game_df['commence_time'], errors='coerce', utc=True
+                )
+                start_bound = self._normalize_bound(start)
+                end_bound = self._normalize_bound(end)
+                if start_bound is not None:
+                    game_df = game_df[game_df['commence_dt'] >= start_bound]
+                if end_bound is not None:
+                    game_df = game_df[game_df['commence_dt'] <= end_bound]
+            prop_df = pd.DataFrame()
+            if include_player_props:
+                if not game_df.empty and 'event_id' in game_df.columns:
+                    event_ids = (
+                        game_df['event_id']
+                        .dropna()
+                        .astype(str)
+                        .drop_duplicates()
+                        .tolist()
+                    )
+                else:
+                    event_ids = []
+                if event_ids:
+                    prop_df = await odds_extract.fetch_nfl_prop_odds(
+                        session,
+                        event_ids=event_ids,
+                        regions=ODDS_REGIONS,
+                        odds_format=ODDS_FORMAT,
+                    )
+                    if not prop_df.empty:
+                        prop_df['commence_dt'] = pd.to_datetime(
+                            prop_df['commence_time'], errors='coerce', utc=True
+                        )
+                        start_bound = self._normalize_bound(start)
+                        end_bound = self._normalize_bound(end)
+                        if start_bound is not None:
+                            prop_df = prop_df[prop_df['commence_dt'] >= start_bound]
+                        if end_bound is not None:
+                            prop_df = prop_df[prop_df['commence_dt'] <= end_bound]
+            return self._assemble_events(game_df, prop_df, start, end)
 
     def fetch_odds(
         self,
@@ -3110,50 +3122,19 @@ class OddsApiClient:
         include_player_props: bool = True,
         include_historical: bool = True,
     ) -> List[Dict[str, Any]]:
-        events = self.fetch_events(start=start, end=end)
-        if not events:
-            return []
-
-        markets: List[str] = list(ODDS_DEFAULT_MARKETS)
-        if include_player_props:
-            markets.extend(ODDS_PLAYER_PROP_MARKETS)
-        markets = sorted({m for m in markets if m})
-
-        now_utc = default_now_utc()
-        aggregated: List[Dict[str, Any]] = []
-        for event in events:
-            event_id = str(event.get("id") or "")
-            if not event_id:
-                continue
-            commence_time = parse_dt(event.get("commence_time"))
-            bookmakers: List[Dict[str, Any]] = []
-
-            if include_historical and commence_time and commence_time <= now_utc:
-                bookmakers = self.fetch_event_odds_history(
-                    event_id,
-                    markets=markets,
-                    target_date=commence_time,
+        try:
+            return asyncio.run(
+                self._fetch_async(start=start, end=end, include_player_props=include_player_props)
+            )
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                return loop.run_until_complete(
+                    self._fetch_async(start=start, end=end, include_player_props=include_player_props)
                 )
-            if not bookmakers:
-                bookmakers = self.fetch_event_odds(event_id, markets=markets)
-
-            if not bookmakers:
-                logging.debug("No bookmaker data returned for Odds API event %s", event_id)
-                continue
-
-            enriched = dict(event)
-            enriched["bookmakers"] = bookmakers
-            aggregated.append(enriched)
-
-        return aggregated
+            raise
 
 
-# ---------------------------------------------------------------------------
-# Ingestion pipeline
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass
 class MSFCreds:
     api_key: str
     password: str = "MYSPORTSFEEDS"
