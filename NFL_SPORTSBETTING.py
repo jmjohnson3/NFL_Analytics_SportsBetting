@@ -2967,22 +2967,63 @@ class OddsApiClient:
                 return payload[0].get("bookmakers", [])  # type: ignore[return-value]
         return []
 
+    def _merge_bookmakers(self, bookmakers: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        merged: Dict[str, Dict[str, Any]] = {}
+        for bookmaker in bookmakers:
+            key = bookmaker.get("key") or bookmaker.get("title")
+            if not key:
+                continue
+            previous = merged.get(key)
+            last_update = parse_dt(bookmaker.get("last_update"))
+            prev_update = parse_dt(previous.get("last_update")) if previous else None
+            if previous is None or (
+                last_update is not None
+                and (prev_update is None or last_update >= prev_update)
+            ):
+                merged[key] = bookmaker
+        return list(merged.values())
+
     def fetch_event_odds(
         self,
         event_id: str,
         *,
         markets: Sequence[str],
     ) -> List[Dict[str, Any]]:
+        market_list = list(markets)
+        if not market_list:
+            return []
+
         params = {
             "regions": ",".join(ODDS_REGIONS),
-            "markets": ",".join(markets),
+            "markets": ",".join(market_list),
             "oddsFormat": ODDS_FORMAT,
         }
-        payload = self._request(
-            f"sports/{NFL_SPORT_KEY}/events/{event_id}/odds",
-            params=params,
-        )
-        return self._extract_bookmakers(payload)
+        try:
+            payload = self._request(
+                f"sports/{NFL_SPORT_KEY}/events/{event_id}/odds",
+                params=params,
+            )
+            return self._extract_bookmakers(payload)
+        except HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 422 and len(market_list) > 1:
+                mid = len(market_list) // 2
+                logging.debug(
+                    "Splitting Odds API event odds markets due to HTTP 422 for %s: %s",
+                    event_id,
+                    ",".join(market_list),
+                )
+                first_half = self.fetch_event_odds(event_id, markets=market_list[:mid])
+                second_half = self.fetch_event_odds(event_id, markets=market_list[mid:])
+                return self._merge_bookmakers(first_half + second_half)
+            if status == 422 and market_list:
+                logging.debug(
+                    "Odds API returned HTTP 422 for event %s market %s; skipping",
+                    event_id,
+                    market_list[0] if len(market_list) == 1 else ",".join(market_list),
+                )
+                return []
+            raise
 
     def fetch_event_odds_history(
         self,
@@ -2991,17 +3032,50 @@ class OddsApiClient:
         markets: Sequence[str],
         target_date: Optional[dt.datetime] = None,
     ) -> List[Dict[str, Any]]:
+        market_list = list(markets)
+        if not market_list:
+            return []
+
         params = {
             "regions": ",".join(ODDS_REGIONS),
-            "markets": ",".join(markets),
+            "markets": ",".join(market_list),
             "oddsFormat": ODDS_FORMAT,
         }
         if target_date is not None:
             params["date"] = target_date.date().isoformat()
-        payload = self._request(
-            f"sports/{NFL_SPORT_KEY}/events/{event_id}/odds-history",
-            params=params,
-        )
+        try:
+            payload = self._request(
+                f"sports/{NFL_SPORT_KEY}/events/{event_id}/odds-history",
+                params=params,
+            )
+        except HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 422 and len(market_list) > 1:
+                mid = len(market_list) // 2
+                logging.debug(
+                    "Splitting Odds API odds-history markets due to HTTP 422 for %s: %s",
+                    event_id,
+                    ",".join(market_list),
+                )
+                first_half = self.fetch_event_odds_history(
+                    event_id,
+                    markets=market_list[:mid],
+                    target_date=target_date,
+                )
+                second_half = self.fetch_event_odds_history(
+                    event_id,
+                    markets=market_list[mid:],
+                    target_date=target_date,
+                )
+                return self._merge_bookmakers(first_half + second_half)
+            if status == 422 and market_list:
+                logging.debug(
+                    "Odds API returned HTTP 422 for event %s odds-history market %s; skipping",
+                    event_id,
+                    market_list[0] if len(market_list) == 1 else ",".join(market_list),
+                )
+                return []
+            raise
         snapshots: List[Dict[str, Any]]
         if isinstance(payload, list):
             snapshots = payload
