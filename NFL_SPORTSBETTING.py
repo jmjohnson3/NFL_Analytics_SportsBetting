@@ -95,6 +95,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from urllib.parse import urlencode
 
+import odds_extract
+
 
 # ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
 def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
