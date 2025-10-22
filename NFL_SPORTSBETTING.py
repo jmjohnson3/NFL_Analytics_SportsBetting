@@ -2890,17 +2890,25 @@ class OddsApiClient:
             logging.debug("Odds API requests remaining: %s", remaining)
         return resp.json()
 
-    def fetch_events(
+    def _format_commence_param(self, value: dt.datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt.timezone.utc)
+        else:
+            value = value.astimezone(dt.timezone.utc)
+        value = value.replace(microsecond=0)
+        return value.isoformat().replace("+00:00", "Z")
+
+    def _fetch_events_window(
         self,
         *,
-        start: Optional[dt.datetime] = None,
-        end: Optional[dt.datetime] = None,
+        start: Optional[dt.datetime],
+        end: Optional[dt.datetime],
     ) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {"regions": ",".join(ODDS_REGIONS)}
         if start is not None:
-            params["commenceTimeFrom"] = start.isoformat()
+            params["commenceTimeFrom"] = self._format_commence_param(start)
         if end is not None:
-            params["commenceTimeTo"] = end.isoformat()
+            params["commenceTimeTo"] = self._format_commence_param(end)
         params["dateFormat"] = "iso"
         payload = self._request(f"sports/{NFL_SPORT_KEY}/events", params=params)
         if isinstance(payload, list):
@@ -2908,6 +2916,45 @@ class OddsApiClient:
         if isinstance(payload, dict):
             return payload.get("events", [])  # type: ignore[return-value]
         return []
+
+    def fetch_events(
+        self,
+        *,
+        start: Optional[dt.datetime] = None,
+        end: Optional[dt.datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        try:
+            return self._fetch_events_window(start=start, end=end)
+        except HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if (
+                status == 422
+                and start is not None
+                and end is not None
+                and end > start
+            ):
+                midpoint = start + (end - start) / 2
+                if midpoint <= start or midpoint >= end:
+                    # Avoid infinite recursion if the interval cannot be split further
+                    raise
+                logging.debug(
+                    "Splitting Odds API event fetch window due to HTTP 422: %s -> %s", start, end
+                )
+                first_half = self.fetch_events(start=start, end=midpoint)
+                second_half = self.fetch_events(start=midpoint, end=end)
+                combined = first_half + second_half
+                # Deduplicate by event id while preserving order
+                seen: Set[str] = set()
+                unique_events: List[Dict[str, Any]] = []
+                for event in combined:
+                    event_id = str(event.get("id", "")) if isinstance(event, dict) else ""
+                    if event_id and event_id in seen:
+                        continue
+                    if event_id:
+                        seen.add(event_id)
+                    unique_events.append(event)
+                return unique_events
+            raise
 
     def _extract_bookmakers(self, payload: Any) -> List[Dict[str, Any]]:
         if isinstance(payload, dict):
