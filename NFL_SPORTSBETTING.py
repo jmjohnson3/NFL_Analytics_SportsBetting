@@ -1570,6 +1570,18 @@ async def odds_fetch_prop_odds(
         frame["line"] = pd.to_numeric(frame["line"], errors="coerce")
     return frame.reset_index(drop=True)
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip().lower()
+    if value in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
+
+
 DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 
@@ -2591,6 +2603,7 @@ class NFLConfig:
     advanced_metrics_path: Optional[str] = os.getenv("NFL_ADVANCED_PATH")
     weather_forecast_path: Optional[str] = os.getenv("NFL_FORECAST_PATH")
     respect_lineups: bool = True
+    odds_allow_insecure_ssl: bool = env_flag("ODDS_ALLOW_INSECURE_SSL", False)
 
     @property
     def pg_url(self) -> str:
@@ -3113,9 +3126,10 @@ class MySportsFeedsClient:
 
 
 class OddsApiClient:
-    def __init__(self, api_key: str, timeout: int = 30):
+    def __init__(self, api_key: str, timeout: int = 30, allow_insecure_ssl: bool = False):
         self.api_key = api_key
         self.timeout = timeout
+        self.allow_insecure_ssl = allow_insecure_ssl
 
     @staticmethod
     def _normalize_bound(value: Optional[dt.datetime]) -> Optional[dt.datetime]:
@@ -3300,7 +3314,10 @@ class OddsApiClient:
     ) -> List[Dict[str, Any]]:
         api_key = self.api_key or ODDS_API_KEY
         timeout = aiohttp.ClientTimeout(total=self.timeout)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        connector: Optional[aiohttp.TCPConnector] = None
+        if self.allow_insecure_ssl:
+            connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             game_df = await odds_fetch_game_odds(
                 session,
                 api_key=api_key,
@@ -10864,7 +10881,10 @@ def main() -> None:
     db = NFLDatabase(engine)
 
     msf_client = MySportsFeedsClient(NFL_API_USER, NFL_API_PASS)
-    odds_client = OddsApiClient(ODDS_API_KEY)
+    odds_client = OddsApiClient(
+        ODDS_API_KEY,
+        allow_insecure_ssl=config.odds_allow_insecure_ssl,
+    )
     supplemental_loader = SupplementalDataLoader(config)
 
     ingestor = NFLIngestor(db, msf_client, odds_client, supplemental_loader)
