@@ -7777,31 +7777,61 @@ class ModelTrainer:
             if preds_array.size != len(out_df) or not len(out_df):
                 return None
 
-            required_cols = {
-                "home_moneyline",
-                "away_moneyline",
-                "home_fair_prob",
-                "away_fair_prob",
-            }
-            if not required_cols.issubset(out_df.columns):
+            required_cols = {"home_moneyline", "away_moneyline", "home_score", "away_score"}
+            missing_required = required_cols - set(out_df.columns)
+            if missing_required:
                 logging.debug(
                     "%s: skipping edge evaluation (%s missing)",
                     target,
-                    ", ".join(sorted(required_cols - set(out_df.columns))),
+                    ", ".join(sorted(missing_required)),
                 )
                 return None
 
-            market_frame = out_df.loc[:, list(required_cols)].apply(pd.to_numeric, errors="coerce")
+            price_cols = ["home_moneyline", "away_moneyline"]
+            market_frame = out_df.loc[:, price_cols].apply(pd.to_numeric, errors="coerce")
             pred_series = pd.Series(preds_array, index=out_df.index, dtype=float)
 
-            home_probs = market_frame["home_fair_prob"].astype(float)
-            away_probs = market_frame["away_fair_prob"].astype(float)
             home_prices = market_frame["home_moneyline"].astype(float)
             away_prices = market_frame["away_moneyline"].astype(float)
 
-            home_valid = home_probs.notna() & home_prices.notna()
-            away_valid = away_probs.notna() & away_prices.notna()
-            valid_mask = home_valid | away_valid
+            home_probs = _american_to_prob(home_prices)
+            away_probs = _american_to_prob(away_prices)
+
+            # Fill missing implied probabilities with the complement if only one side is known
+            missing_home = home_probs.isna() & away_probs.notna()
+            if missing_home.any():
+                home_probs.loc[missing_home] = 1.0 - away_probs.loc[missing_home].clip(0.0, 1.0)
+
+            missing_away = away_probs.isna() & home_probs.notna()
+            if missing_away.any():
+                away_probs.loc[missing_away] = 1.0 - home_probs.loc[missing_away].clip(0.0, 1.0)
+
+            # Require completed games for ROI computation
+            results_mask = (
+                out_df["home_score"].notna() & out_df["away_score"].notna()
+            )
+
+            home_valid = home_prices.notna() & home_probs.notna()
+            away_valid = away_prices.notna() & away_probs.notna()
+            valid_mask = (home_valid | away_valid) & results_mask
+
+            synthetic_odds_used = False
+            if not valid_mask.any():
+                logging.debug(
+                    "%s: no rows with market odds; using synthetic -110 moneylines for diagnostics",
+                    target,
+                )
+                synthetic_odds_used = True
+                fallback_prices = pd.Series(-110.0, index=out_df.index, dtype=float)
+                implied = _american_to_prob(fallback_prices)
+                home_prices = fallback_prices.copy()
+                away_prices = fallback_prices.copy()
+                home_probs = implied.copy()
+                away_probs = implied.copy()
+                valid_mask = results_mask.copy()
+                home_valid = valid_mask.copy()
+                away_valid = valid_mask.copy()
+
             if not valid_mask.any():
                 logging.debug("%s: no rows with complete market data for edge check", target)
                 return None
@@ -7814,8 +7844,20 @@ class ModelTrainer:
             home_valid = home_valid.loc[valid_mask]
             away_valid = away_valid.loc[valid_mask]
 
-            choose_home = pred_series - home_probs
-            choose_away = (1.0 - pred_series) - away_probs
+            total_prob = home_probs + away_probs
+            fair_home = pd.Series(np.nan, index=home_probs.index, dtype=float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                fair_mask = total_prob > 0
+                fair_home.loc[fair_mask] = home_probs.loc[fair_mask] / total_prob.loc[fair_mask]
+            fair_home = fair_home.clip(0.0, 1.0)
+            fair_away = (1.0 - fair_home).clip(0.0, 1.0)
+
+            # Use fair probabilities when available, otherwise fall back to implied values
+            home_reference = fair_home.fillna(home_probs.clip(0.0, 1.0))
+            away_reference = fair_away.fillna(away_probs.clip(0.0, 1.0))
+
+            choose_home = pred_series - home_reference
+            choose_away = (1.0 - pred_series) - away_reference
 
             def _build_picks_for_threshold(threshold: float) -> Optional[pd.DataFrame]:
                 picks: List[pd.DataFrame] = []
@@ -7892,6 +7934,8 @@ class ModelTrainer:
                     label_suffix = f"{label}|forced_top_edges"
                 elif selected_threshold != min_edge:
                     label_suffix = f"{label}|thr={selected_threshold:+.3f}"
+            if synthetic_odds_used:
+                label_suffix = f"{label_suffix}|synthetic_odds"
 
             bet_count = len(picks_df)
             returns = np.where(picks_df["side_win"] == 1, picks_df["payout"].values, -1.0)
