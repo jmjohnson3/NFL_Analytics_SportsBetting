@@ -7749,6 +7749,27 @@ class ModelTrainer:
         # 1) MAE vs "closing lines" (if present)
         closing_cols = [c for c in out_df.columns if c.startswith("line_") or c.endswith("_implied_prob")]
         mae_vs_closing = None
+        baseline_reference: Optional[pd.Series] = None
+        if not target.endswith("_win_prob") and not out_df.empty:
+            try:
+                baseline_values: List[float] = []
+                for idx, row in out_df.iterrows():
+                    prior_mean, _ = self._resolve_prior(
+                        target,
+                        row.get("team"),
+                        row.get("position"),
+                    )
+                    if math.isnan(prior_mean):
+                        league_prior = self.target_priors.get(target, {}).get("league", {})
+                        prior_mean = float(league_prior.get("mean", np.nan))
+                    baseline_values.append(float(prior_mean))
+                baseline_reference = pd.Series(baseline_values, index=out_df.index, dtype=float)
+            except Exception:
+                logging.debug("%s: unable to resolve baseline priors for diagnostics", target, exc_info=True)
+                baseline_reference = None
+            else:
+                out_df["_baseline_reference"] = baseline_reference
+
         if target.endswith("_win_prob"):
             # join to implied probs derived from moneylines already in games table
             # Expect columns like 'home_implied_prob'/'away_implied_prob' from ingest (see _ingest_odds)
@@ -7761,6 +7782,12 @@ class ModelTrainer:
             # Choose the first matching line as a reference
             ref = out_df[closing_cols[0]].astype(float)
             mae_vs_closing = float(np.nanmean(np.abs(out_df["_y_pred"] - ref)))
+
+        if mae_vs_closing is None and baseline_reference is not None:
+            if baseline_reference.notna().any():
+                mae_vs_closing = float(
+                    np.nanmean(np.abs(out_df["_y_pred"] - baseline_reference.astype(float)))
+                )
 
         # 2) EV rule → pick bets → compute hit rate & ROI (+ CI)
         def _american_to_payout(odds: float) -> float:
@@ -7777,31 +7804,61 @@ class ModelTrainer:
             if preds_array.size != len(out_df) or not len(out_df):
                 return None
 
-            required_cols = {
-                "home_moneyline",
-                "away_moneyline",
-                "home_fair_prob",
-                "away_fair_prob",
-            }
-            if not required_cols.issubset(out_df.columns):
+            required_cols = {"home_moneyline", "away_moneyline", "home_score", "away_score"}
+            missing_required = required_cols - set(out_df.columns)
+            if missing_required:
                 logging.debug(
                     "%s: skipping edge evaluation (%s missing)",
                     target,
-                    ", ".join(sorted(required_cols - set(out_df.columns))),
+                    ", ".join(sorted(missing_required)),
                 )
                 return None
 
-            market_frame = out_df.loc[:, list(required_cols)].apply(pd.to_numeric, errors="coerce")
+            price_cols = ["home_moneyline", "away_moneyline"]
+            market_frame = out_df.loc[:, price_cols].apply(pd.to_numeric, errors="coerce")
             pred_series = pd.Series(preds_array, index=out_df.index, dtype=float)
 
-            home_probs = market_frame["home_fair_prob"].astype(float)
-            away_probs = market_frame["away_fair_prob"].astype(float)
             home_prices = market_frame["home_moneyline"].astype(float)
             away_prices = market_frame["away_moneyline"].astype(float)
 
-            home_valid = home_probs.notna() & home_prices.notna()
-            away_valid = away_probs.notna() & away_prices.notna()
-            valid_mask = home_valid | away_valid
+            home_probs = _american_to_prob(home_prices)
+            away_probs = _american_to_prob(away_prices)
+
+            # Fill missing implied probabilities with the complement if only one side is known
+            missing_home = home_probs.isna() & away_probs.notna()
+            if missing_home.any():
+                home_probs.loc[missing_home] = 1.0 - away_probs.loc[missing_home].clip(0.0, 1.0)
+
+            missing_away = away_probs.isna() & home_probs.notna()
+            if missing_away.any():
+                away_probs.loc[missing_away] = 1.0 - home_probs.loc[missing_away].clip(0.0, 1.0)
+
+            # Require completed games for ROI computation
+            results_mask = (
+                out_df["home_score"].notna() & out_df["away_score"].notna()
+            )
+
+            home_valid = home_prices.notna() & home_probs.notna()
+            away_valid = away_prices.notna() & away_probs.notna()
+            valid_mask = (home_valid | away_valid) & results_mask
+
+            synthetic_odds_used = False
+            if not valid_mask.any():
+                logging.debug(
+                    "%s: no rows with market odds; using synthetic -110 moneylines for diagnostics",
+                    target,
+                )
+                synthetic_odds_used = True
+                fallback_prices = pd.Series(-110.0, index=out_df.index, dtype=float)
+                implied = _american_to_prob(fallback_prices)
+                home_prices = fallback_prices.copy()
+                away_prices = fallback_prices.copy()
+                home_probs = implied.copy()
+                away_probs = implied.copy()
+                valid_mask = results_mask.copy()
+                home_valid = valid_mask.copy()
+                away_valid = valid_mask.copy()
+
             if not valid_mask.any():
                 logging.debug("%s: no rows with complete market data for edge check", target)
                 return None
@@ -7814,8 +7871,20 @@ class ModelTrainer:
             home_valid = home_valid.loc[valid_mask]
             away_valid = away_valid.loc[valid_mask]
 
-            choose_home = pred_series - home_probs
-            choose_away = (1.0 - pred_series) - away_probs
+            total_prob = home_probs + away_probs
+            fair_home = pd.Series(np.nan, index=home_probs.index, dtype=float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                fair_mask = total_prob > 0
+                fair_home.loc[fair_mask] = home_probs.loc[fair_mask] / total_prob.loc[fair_mask]
+            fair_home = fair_home.clip(0.0, 1.0)
+            fair_away = (1.0 - fair_home).clip(0.0, 1.0)
+
+            # Use fair probabilities when available, otherwise fall back to implied values
+            home_reference = fair_home.fillna(home_probs.clip(0.0, 1.0))
+            away_reference = fair_away.fillna(away_probs.clip(0.0, 1.0))
+
+            choose_home = pred_series - home_reference
+            choose_away = (1.0 - pred_series) - away_reference
 
             def _build_picks_for_threshold(threshold: float) -> Optional[pd.DataFrame]:
                 picks: List[pd.DataFrame] = []
@@ -7832,7 +7901,10 @@ class ModelTrainer:
                     home_df["_edge"] = choose_home.loc[pick_home].astype(float)
                     home_df["_threshold"] = threshold
                     home_df["_side"] = "home"
-                    picks.append(home_df[["p_model", "side_win", "payout", "_edge", "_threshold", "_side"]])
+                    home_df["_is_push"] = False
+                    picks.append(
+                        home_df[["p_model", "side_win", "payout", "_edge", "_threshold", "_side", "_is_push"]]
+                    )
 
                 pick_away = away_valid & (choose_away > threshold)
                 if pick_away.any():
@@ -7846,7 +7918,10 @@ class ModelTrainer:
                     away_df["_edge"] = choose_away.loc[pick_away].astype(float)
                     away_df["_threshold"] = threshold
                     away_df["_side"] = "away"
-                    picks.append(away_df[["p_model", "side_win", "payout", "_edge", "_threshold", "_side"]])
+                    away_df["_is_push"] = False
+                    picks.append(
+                        away_df[["p_model", "side_win", "payout", "_edge", "_threshold", "_side", "_is_push"]]
+                    )
 
                 if not picks:
                     return None
@@ -7892,16 +7967,26 @@ class ModelTrainer:
                     label_suffix = f"{label}|forced_top_edges"
                 elif selected_threshold != min_edge:
                     label_suffix = f"{label}|thr={selected_threshold:+.3f}"
+            if synthetic_odds_used:
+                label_suffix = f"{label_suffix}|synthetic_odds"
 
             bet_count = len(picks_df)
-            returns = np.where(picks_df["side_win"] == 1, picks_df["payout"].values, -1.0)
+            returns = np.where(
+                picks_df["_is_push"],
+                0.0,
+                np.where(picks_df["side_win"] == 1, picks_df["payout"].values, -1.0),
+            )
             roi_val = float(np.mean(returns))
             m = returns.mean()
             s = returns.std(ddof=1) if bet_count > 1 else 0.0
             se = s / math.sqrt(max(bet_count, 1))
             z = 1.96
             roi_lo_val, roi_hi_val = float(m - z * se), float(m + z * se)
-            hit_val = float(np.mean(picks_df["side_win"]))
+            non_push_mask = ~picks_df["_is_push"].astype(bool)
+            if non_push_mask.any():
+                hit_val = float(np.mean(picks_df.loc[non_push_mask, "side_win"]))
+            else:
+                hit_val = float("nan")
             return {
                 "roi": roi_val,
                 "roi_lo": roi_lo_val,
@@ -7926,6 +8011,211 @@ class ModelTrainer:
                     continue
                 seen_labels.add(label)
                 evaluation = _evaluate_edges(preds_array, label)
+                if evaluation is None:
+                    continue
+                if best_option is None or evaluation["roi"] > best_option["roi"]:
+                    best_option = evaluation
+
+            if best_option is not None:
+                roi = best_option["roi"]
+                roi_lo = best_option["roi_lo"]
+                roi_hi = best_option["roi_hi"]
+                hit_rate = best_option["hit_rate"]
+                n_bets = best_option["n_bets"]
+                edge_source = best_option["label"]
+        elif baseline_reference is not None and baseline_reference.notna().any():
+            def _evaluate_numeric_edges(
+                preds_array: np.ndarray, label: str
+            ) -> Optional[Dict[str, Any]]:
+                if preds_array.size != len(out_df) or not len(out_df):
+                    return None
+
+                pred_series = pd.Series(preds_array, index=out_df.index, dtype=float)
+                baseline_series = baseline_reference.astype(float)
+                actual_series = pd.to_numeric(out_df.get(target), errors="coerce")
+
+                mask = actual_series.notna() & baseline_series.notna()
+                if "is_synthetic" in out_df.columns:
+                    mask &= ~out_df["is_synthetic"].astype(bool)
+
+                if not mask.any():
+                    return None
+
+                pred_series = pred_series.loc[mask]
+                baseline_series = baseline_series.loc[mask]
+                actual_series = actual_series.loc[mask]
+
+                residuals = (actual_series - pred_series).to_numpy(dtype=float)
+                residuals = residuals[np.isfinite(residuals)]
+                if residuals.size >= 2:
+                    sigma = float(np.std(residuals, ddof=1))
+                elif residuals.size == 1:
+                    sigma = float(abs(residuals[0]))
+                else:
+                    sigma = float("nan")
+
+                if not math.isfinite(sigma) or sigma < 1e-6:
+                    fallback_vals = actual_series.to_numpy(dtype=float)
+                    fallback_vals = fallback_vals[np.isfinite(fallback_vals)]
+                    if fallback_vals.size >= 2:
+                        sigma = float(np.std(fallback_vals, ddof=1))
+                    elif fallback_vals.size:
+                        sigma = float(max(abs(fallback_vals[0]), 1.0))
+                    else:
+                        sigma = 1.0
+
+                sigma = max(sigma, 1.0)
+
+                def _normal_cdf(z: float) -> float:
+                    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+                payout = _american_to_payout(-110.0)
+
+                def _build_numeric(threshold: float) -> Optional[pd.DataFrame]:
+                    rows: List[pd.Series] = []
+                    for idx in pred_series.index:
+                        mu = pred_series.at[idx]
+                        line_val = baseline_series.at[idx]
+                        actual_val = actual_series.at[idx]
+                        if not (math.isfinite(mu) and math.isfinite(line_val) and math.isfinite(actual_val)):
+                            continue
+
+                        z = (line_val - mu) / sigma
+                        prob_over = 1.0 - _normal_cdf(z)
+                        prob_over = float(np.clip(prob_over, 1e-6, 1 - 1e-6))
+                        prob_under = float(np.clip(1.0 - prob_over, 1e-6, 1 - 1e-6))
+
+                        ev_over = ev_of_bet(prob_over, -110.0)
+                        ev_under = ev_of_bet(prob_under, -110.0)
+
+                        if ev_over > threshold:
+                            series = pd.Series(
+                                {
+                                    "p_model": prob_over,
+                                    "side_win": 1 if actual_val > line_val else 0,
+                                    "payout": payout,
+                                    "_edge": ev_over,
+                                    "_threshold": threshold,
+                                    "_side": "over",
+                                    "_line": line_val,
+                                    "_actual": actual_val,
+                                    "_is_push": bool(np.isclose(actual_val, line_val)),
+                                }
+                            )
+                            if np.isclose(actual_val, line_val):
+                                series["side_win"] = 0
+                            rows.append(series)
+
+                        if ev_under > threshold:
+                            series = pd.Series(
+                                {
+                                    "p_model": prob_under,
+                                    "side_win": 1 if actual_val < line_val else 0,
+                                    "payout": payout,
+                                    "_edge": ev_under,
+                                    "_threshold": threshold,
+                                    "_side": "under",
+                                    "_line": line_val,
+                                    "_actual": actual_val,
+                                    "_is_push": bool(np.isclose(actual_val, line_val)),
+                                }
+                            )
+                            if np.isclose(actual_val, line_val):
+                                series["side_win"] = 0
+                            rows.append(series)
+
+                    if not rows:
+                        return None
+                    return pd.DataFrame(rows)
+
+                candidate_thresholds: List[float] = []
+                seen_thresholds: Set[float] = set()
+                for candidate in [min_edge, (min_edge * 0.5 if min_edge > 0 else None), 0.0, -0.005]:
+                    if candidate is None:
+                        continue
+                    candidate = float(candidate)
+                    if math.isnan(candidate):
+                        continue
+                    if candidate not in seen_thresholds:
+                        candidate_thresholds.append(candidate)
+                        seen_thresholds.add(candidate)
+
+                selected_threshold: Optional[float] = None
+                picks_df: Optional[pd.DataFrame] = None
+                for threshold in candidate_thresholds:
+                    candidate_df = _build_numeric(threshold)
+                    if candidate_df is not None and not candidate_df.empty:
+                        picks_df = candidate_df
+                        selected_threshold = threshold
+                        break
+
+                if picks_df is None:
+                    fallback_df = _build_numeric(float("-inf"))
+                    if fallback_df is not None and not fallback_df.empty:
+                        fallback_df = fallback_df.sort_values("_edge", ascending=False)
+                        top_n = max(1, min(5, len(fallback_df)))
+                        picks_df = fallback_df.head(top_n).reset_index(drop=True)
+                        selected_threshold = float("-inf")
+                        logging.debug("%s: forcing %d numeric bets via fallback selection", target, len(picks_df))
+
+                if picks_df is None:
+                    return None
+
+                picks_df["_is_push"] = picks_df["_is_push"].astype(bool)
+
+                label_suffix = label
+                if selected_threshold is not None:
+                    if selected_threshold == float("-inf"):
+                        label_suffix = f"{label_suffix}|forced_top_edges"
+                    elif selected_threshold != min_edge:
+                        label_suffix = f"{label_suffix}|thr={selected_threshold:+.3f}"
+                label_suffix = f"{label_suffix}|priors_baseline|synthetic_odds"
+
+                bet_count = len(picks_df)
+                returns = []
+                for _, row in picks_df.iterrows():
+                    if row["_is_push"]:
+                        returns.append(0.0)
+                    elif row["side_win"] == 1:
+                        returns.append(row["payout"])
+                    else:
+                        returns.append(-1.0)
+                returns_arr = np.asarray(returns, dtype=float)
+                roi_val = float(np.mean(returns_arr))
+                m = returns_arr.mean()
+                s = returns_arr.std(ddof=1) if bet_count > 1 else 0.0
+                se = s / math.sqrt(max(bet_count, 1))
+                z = 1.96
+                roi_lo_val, roi_hi_val = float(m - z * se), float(m + z * se)
+                non_push_mask = ~picks_df["_is_push"].astype(bool)
+                if non_push_mask.any():
+                    hit_val = float(np.mean(picks_df.loc[non_push_mask, "side_win"]))
+                else:
+                    hit_val = float("nan")
+
+                return {
+                    "roi": roi_val,
+                    "roi_lo": roi_lo_val,
+                    "roi_hi": roi_hi_val,
+                    "hit_rate": hit_val,
+                    "n_bets": bet_count,
+                    "label": label_suffix,
+                }
+
+            prediction_candidates: List[Tuple[str, np.ndarray]] = []
+            if len(out_df):
+                base_label = "calibrated" if calibration_record is not None else "model"
+                prediction_candidates.append((base_label, out_df["_y_pred"].to_numpy(dtype=float)))
+                if "_y_pred_raw" in out_df.columns:
+                    prediction_candidates.append(("raw", out_df["_y_pred_raw"].to_numpy(dtype=float)))
+
+            best_option: Optional[Dict[str, Any]] = None
+            seen_labels: Set[str] = set()
+            for label, preds_array in prediction_candidates:
+                if label in seen_labels:
+                    continue
+                seen_labels.add(label)
+                evaluation = _evaluate_numeric_edges(preds_array, label)
                 if evaluation is None:
                     continue
                 if best_option is None or evaluation["roi"] > best_option["roi"]:
