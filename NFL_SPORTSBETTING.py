@@ -93,6 +93,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
+from urllib.parse import urlencode
 
 import odds_extract
 
@@ -1325,6 +1326,7 @@ ODDS_PLAYER_PROP_MARKETS = [
     "player_receptions",
     "player_receiving_yards",
     "player_receiving_tds",
+    "player_anytime_td",
 ]
 PLAYER_PROP_MARKET_COLUMN_MAP = {
     "player_pass_yards": "line_passing_yards",
@@ -1334,7 +1336,241 @@ PLAYER_PROP_MARKET_COLUMN_MAP = {
     "player_receptions": "line_receptions",
     "player_receiving_yards": "line_receiving_yards",
     "player_receiving_tds": "line_receiving_tds",
+    "player_anytime_td": "line_anytime_td",
 }
+
+ODDS_MARKET_CANONICAL_MAP = {
+    "h2h": "MONEYLINE",
+    "spreads": "SPREAD",
+    "totals": "TOTAL",
+    "player_pass_yards": "PASS_YDS",
+    "player_pass_tds": "PASS_TD",
+    "player_rush_yards": "RUSH_YDS",
+    "player_rush_tds": "RUSH_TD",
+    "player_receptions": "RECEPTIONS",
+    "player_receiving_yards": "REC_YDS",
+    "player_receiving_tds": "REC_TD",
+    "player_anytime_td": "ANY_TD",
+    # Alternate keys occasionally returned by the API
+    "player_pass_yds": "PASS_YDS",
+    "player_rush_yds": "RUSH_YDS",
+    "player_reception_yds": "REC_YDS",
+}
+
+odds_logger = logging.getLogger(__name__)
+
+
+def odds_american_to_decimal(american: float) -> float:
+    american = float(american)
+    if american > 0:
+        return 1.0 + american / 100.0
+    return 1.0 + 100.0 / abs(american)
+
+
+def odds_american_to_prob(american: float) -> float:
+    return 1.0 / odds_american_to_decimal(american)
+
+
+def _odds_build_url(path: str, params: Dict[str, Any]) -> str:
+    base = ODDS_BASE.rstrip("/")
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{base}{path}?{urlencode(params, doseq=True)}"
+
+
+async def _odds_get_json(
+    session: aiohttp.ClientSession,
+    path: str,
+    api_key: Optional[str],
+    **params: Any,
+) -> Optional[Any]:
+    params = {"apiKey": api_key or ODDS_API_KEY, **params}
+    url = _odds_build_url(path, params)
+    try:
+        async with session.get(url, timeout=30) as response:
+            if response.status != 200:
+                text = await response.text()
+                odds_logger.warning("Odds GET %s -> %s\n%s", response.status, url, text[:600])
+                return None
+            return await response.json()
+    except Exception:
+        odds_logger.exception("GET failed: %s", url)
+        return None
+
+
+async def odds_fetch_game_odds(
+    session: aiohttp.ClientSession,
+    *,
+    api_key: Optional[str],
+    regions: Sequence[str] | str = ("us", "us2"),
+    markets: Sequence[str] | str = ("h2h", "spreads", "totals"),
+    odds_format: str = ODDS_FORMAT,
+    date_format: str = "iso",
+) -> pd.DataFrame:
+    regions_param = ",".join(regions) if isinstance(regions, (list, tuple)) else regions
+    markets_param = ",".join(markets) if isinstance(markets, (list, tuple)) else markets
+
+    data = await _odds_get_json(
+        session,
+        f"/sports/{NFL_SPORT_KEY}/odds",
+        api_key,
+        regions=regions_param,
+        markets=markets_param,
+        oddsFormat=odds_format,
+        dateFormat=date_format,
+    )
+    if not data:
+        return pd.DataFrame(
+            columns=[
+                "event_id",
+                "commence_time",
+                "home_team",
+                "away_team",
+                "book",
+                "market",
+                "side",
+                "line",
+                "american_odds",
+                "decimal_odds",
+                "imp_prob",
+            ]
+        )
+
+    rows: List[Dict[str, Any]] = []
+    for event in data:
+        event_id = str(event.get("id", ""))
+        home_team = event.get("home_team") or event.get("homeTeam") or ""
+        away_team = event.get("away_team") or event.get("awayTeam") or ""
+        commence_time = event.get("commence_time") or event.get("commenceTime") or ""
+
+        for bookmaker in event.get("bookmakers", []) or []:
+            book_key = bookmaker.get("key") or bookmaker.get("title")
+            for market in bookmaker.get("markets", []) or []:
+                market_key = str(market.get("key", "")).lower()
+                market_label = ODDS_MARKET_CANONICAL_MAP.get(market_key, market_key.upper())
+                for outcome in market.get("outcomes", []) or []:
+                    outcome_name = outcome.get("name")
+                    price = outcome.get("price")
+                    line = outcome.get("point") or outcome.get("total") or outcome.get("handicap")
+
+                    rows.append(
+                        {
+                            "event_id": event_id,
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "commence_time": commence_time,
+                            "book": book_key,
+                            "market": market_label,
+                            "side": outcome_name,
+                            "line": float(line) if line is not None else np.nan,
+                            "american_odds": float(price) if price is not None else np.nan,
+                        }
+                    )
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+
+    frame["decimal_odds"] = frame["american_odds"].apply(odds_american_to_decimal)
+    frame["imp_prob"] = frame["american_odds"].apply(odds_american_to_prob)
+    if "line" in frame.columns:
+        frame["line"] = pd.to_numeric(frame["line"], errors="coerce")
+    return frame.reset_index(drop=True)
+
+
+async def odds_fetch_prop_odds(
+    session: aiohttp.ClientSession,
+    event_ids: Sequence[str] | str,
+    *,
+    api_key: Optional[str],
+    regions: Sequence[str] | str = ("us", "us2"),
+    odds_format: str = ODDS_FORMAT,
+    date_format: str = "iso",
+) -> pd.DataFrame:
+    if isinstance(event_ids, str):
+        event_ids = [event_ids]
+    event_ids = [event_id for event_id in (event_ids or []) if event_id]
+    if not event_ids:
+        return pd.DataFrame(
+            columns=[
+                "event_id",
+                "commence_time",
+                "home_team",
+                "away_team",
+                "book",
+                "market",
+                "player",
+                "side",
+                "line",
+                "american_odds",
+                "decimal_odds",
+                "imp_prob",
+            ]
+        )
+
+    regions_param = ",".join(regions) if isinstance(regions, (list, tuple)) else regions
+    prop_markets = ",".join(ODDS_PLAYER_PROP_MARKETS)
+
+    tasks = [
+        _odds_get_json(
+            session,
+            f"/sports/{NFL_SPORT_KEY}/events/{event_id}/odds",
+            api_key,
+            regions=regions_param,
+            markets=prop_markets,
+            oddsFormat=odds_format,
+            dateFormat=date_format,
+        )
+        for event_id in event_ids
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+
+    rows: List[Dict[str, Any]] = []
+    for event_id, payload in zip(event_ids, results):
+        if not payload:
+            continue
+        home_team = payload.get("home_team") or payload.get("homeTeam")
+        away_team = payload.get("away_team") or payload.get("awayTeam")
+        commence_time = payload.get("commence_time") or payload.get("commenceTime")
+
+        for bookmaker in payload.get("bookmakers", []) or []:
+            book_key = bookmaker.get("key") or bookmaker.get("title")
+            for market in bookmaker.get("markets", []) or []:
+                market_key = str(market.get("key", "")).lower()
+                market_label = ODDS_MARKET_CANONICAL_MAP.get(market_key, market_key.upper())
+                for outcome in market.get("outcomes", []) or []:
+                    player = outcome.get("description") or outcome.get("participant") or ""
+                    side = (outcome.get("name") or "").title()
+                    if market_key == "player_anytime_td":
+                        side = {"Yes": "Over", "No": "Under"}.get(side, side)
+                    price = outcome.get("price")
+                    line = outcome.get("point")
+                    if not player or price is None:
+                        continue
+                    rows.append(
+                        {
+                            "event_id": event_id,
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "commence_time": commence_time,
+                            "book": book_key,
+                            "market": market_label,
+                            "player": str(player),
+                            "side": side,
+                            "line": float(line) if line is not None else np.nan,
+                            "american_odds": float(price),
+                        }
+                    )
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+
+    frame["decimal_odds"] = frame["american_odds"].apply(odds_american_to_decimal)
+    frame["imp_prob"] = frame["american_odds"].apply(odds_american_to_prob)
+    if "line" in frame.columns:
+        frame["line"] = pd.to_numeric(frame["line"], errors="coerce")
+    return frame.reset_index(drop=True)
 
 DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
@@ -2902,7 +3138,7 @@ class OddsApiClient:
     @staticmethod
     def _reverse_market_map() -> Dict[str, str]:
         reverse: Dict[str, str] = {}
-        for raw_key, canonical in odds_extract.NFL_MARKET_MAP.items():
+        for raw_key, canonical in ODDS_MARKET_CANONICAL_MAP.items():
             preferred = raw_key
             if preferred.endswith('_yds'):
                 preferred = preferred.replace('_yds', '_yards')
@@ -3064,11 +3300,12 @@ class OddsApiClient:
         end: Optional[dt.datetime],
         include_player_props: bool,
     ) -> List[Dict[str, Any]]:
-        odds_extract.ODDS_API_KEY = self.api_key or odds_extract.ODDS_API_KEY
+        api_key = self.api_key or ODDS_API_KEY
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            game_df = await odds_extract.fetch_nfl_game_odds(
+            game_df = await odds_fetch_game_odds(
                 session,
+                api_key=api_key,
                 regions=ODDS_REGIONS,
                 markets=ODDS_DEFAULT_MARKETS,
                 odds_format=ODDS_FORMAT,
@@ -3096,8 +3333,9 @@ class OddsApiClient:
                 else:
                     event_ids = []
                 if event_ids:
-                    prop_df = await odds_extract.fetch_nfl_prop_odds(
+                    prop_df = await odds_fetch_prop_odds(
                         session,
+                        api_key=api_key,
                         event_ids=event_ids,
                         regions=ODDS_REGIONS,
                         odds_format=ODDS_FORMAT,
