@@ -18,6 +18,7 @@ can be used to identify profitable betting opportunities.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import dataclasses
 import datetime as dt
 import json
@@ -35,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import numpy as np
 import pandas as pd
 import requests
@@ -91,6 +93,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
+from urllib.parse import urlencode
 
 
 # ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
@@ -550,9 +553,120 @@ def extract_pricing_odds(
                             }
                         )
 
-                # Placeholder for future prop extraction. Odds API plans often
-                # exclude player props on base subscriptions, so we skip other
-                # markets until we can map them reliably.
+                if key in PLAYER_PROP_MARKET_COLUMN_MAP:
+                    stat_key = PLAYER_PROP_MARKET_COLUMN_MAP[key].replace("line_", "")
+                    player_buckets: Dict[str, Dict[str, Any]] = {}
+                    for outcome in outcomes:
+                        name_raw = str(outcome.get("name") or "").strip()
+                        desc_raw = str(outcome.get("description") or "").strip()
+                        participant = str(
+                            outcome.get("participant")
+                            or outcome.get("player")
+                            or outcome.get("player_name")
+                            or ""
+                        ).strip()
+                        side = None
+                        player_name = None
+
+                        name_lower = name_raw.lower()
+                        desc_lower = desc_raw.lower()
+                        if name_lower in {"over", "under"}:
+                            side = name_raw.title()
+                            player_name = desc_raw or participant
+                        elif desc_lower in {"over", "under"}:
+                            side = desc_raw.title()
+                            player_name = name_raw or participant
+                        elif name_lower.endswith(" over") or name_lower.endswith(" under"):
+                            tokens = name_lower.rsplit(" ", 1)
+                            side = tokens[1].title()
+                            player_name = name_raw[: -len(tokens[1])].strip()
+                        elif participant:
+                            player_name = participant
+
+                        if not player_name or side is None:
+                            continue
+
+                        player_line = outcome.get("line") or outcome.get("point")
+                        try:
+                            line_value = float(player_line) if player_line is not None else None
+                        except (TypeError, ValueError):
+                            line_value = None
+                        try:
+                            price_value = float(outcome.get("price")) if outcome.get("price") is not None else None
+                        except (TypeError, ValueError):
+                            price_value = None
+
+                        if line_value is None or price_value is None:
+                            continue
+
+                        team_abbr = normalize_team_abbr(outcome.get("team"))
+                        player_key = robust_player_name_key(player_name)
+                        bucket = player_buckets.setdefault(
+                            player_key,
+                            {
+                                "player_name": player_name,
+                                "player_id": outcome.get("player_id")
+                                or outcome.get("participant_id")
+                                or outcome.get("id"),
+                                "team": team_abbr,
+                                "line": line_value,
+                                "over": None,
+                                "under": None,
+                            },
+                        )
+                        bucket["line"] = line_value
+                        if side == "Over":
+                            bucket["over"] = price_value
+                        elif side == "Under":
+                            bucket["under"] = price_value
+
+                    for player_key, info in player_buckets.items():
+                        if info.get("line") is None:
+                            continue
+                        player_identifier = info.get("player_id")
+                        if player_identifier is None:
+                            player_identifier = player_key
+                        team_abbr = info.get("team")
+                        opponent_abbr = None
+                        if team_abbr:
+                            if team_abbr == home_team:
+                                opponent_abbr = away_team
+                            elif team_abbr == away_team:
+                                opponent_abbr = home_team
+                        if info.get("over") is not None:
+                            player_rows.append(
+                                {
+                                    "market": stat_key,
+                                    "player_id": player_identifier,
+                                    "player_name": info.get("player_name"),
+                                    "team": team_abbr,
+                                    "opponent": opponent_abbr,
+                                    "line": info.get("line"),
+                                    "american_odds": info.get("over"),
+                                    "side": "Over",
+                                    "sportsbook": sportsbook,
+                                    "event_id": game_id,
+                                    "game_id": game_id,
+                                    "last_update": last_update,
+                                }
+                            )
+                        if info.get("under") is not None:
+                            player_rows.append(
+                                {
+                                    "market": stat_key,
+                                    "player_id": player_identifier,
+                                    "player_name": info.get("player_name"),
+                                    "team": team_abbr,
+                                    "opponent": opponent_abbr,
+                                    "line": info.get("line"),
+                                    "american_odds": info.get("under"),
+                                    "side": "Under",
+                                    "sportsbook": sportsbook,
+                                    "event_id": game_id,
+                                    "game_id": game_id,
+                                    "last_update": last_update,
+                                }
+                            )
 
     odds_players = pd.DataFrame(player_rows)
     odds_totals = pd.DataFrame(total_rows)
@@ -1198,6 +1312,263 @@ ODDS_BASE = "https://api.the-odds-api.com/v4"
 NFL_SPORT_KEY = "americanfootball_nfl"
 ODDS_REGIONS = ["us"]
 ODDS_FORMAT = "american"
+ODDS_DEFAULT_MARKETS = [
+    "h2h",
+    "totals",
+]
+ODDS_PLAYER_PROP_MARKETS = [
+    "player_pass_yards",
+    "player_pass_tds",
+    "player_rush_yards",
+    "player_rush_tds",
+    "player_receptions",
+    "player_receiving_yards",
+    "player_receiving_tds",
+    "player_anytime_td",
+]
+PLAYER_PROP_MARKET_COLUMN_MAP = {
+    "player_pass_yards": "line_passing_yards",
+    "player_pass_tds": "line_passing_tds",
+    "player_rush_yards": "line_rushing_yards",
+    "player_rush_tds": "line_rushing_tds",
+    "player_receptions": "line_receptions",
+    "player_receiving_yards": "line_receiving_yards",
+    "player_receiving_tds": "line_receiving_tds",
+    "player_anytime_td": "line_anytime_td",
+}
+
+ODDS_MARKET_CANONICAL_MAP = {
+    "h2h": "MONEYLINE",
+    "spreads": "SPREAD",
+    "totals": "TOTAL",
+    "player_pass_yards": "PASS_YDS",
+    "player_pass_tds": "PASS_TD",
+    "player_rush_yards": "RUSH_YDS",
+    "player_rush_tds": "RUSH_TD",
+    "player_receptions": "RECEPTIONS",
+    "player_receiving_yards": "REC_YDS",
+    "player_receiving_tds": "REC_TD",
+    "player_anytime_td": "ANY_TD",
+    # Alternate keys occasionally returned by the API
+    "player_pass_yds": "PASS_YDS",
+    "player_rush_yds": "RUSH_YDS",
+    "player_reception_yds": "REC_YDS",
+}
+
+odds_logger = logging.getLogger(__name__)
+
+
+def odds_american_to_decimal(american: float) -> float:
+    american = float(american)
+    if american > 0:
+        return 1.0 + american / 100.0
+    return 1.0 + 100.0 / abs(american)
+
+
+def odds_american_to_prob(american: float) -> float:
+    return 1.0 / odds_american_to_decimal(american)
+
+
+def _odds_build_url(path: str, params: Dict[str, Any]) -> str:
+    base = ODDS_BASE.rstrip("/")
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{base}{path}?{urlencode(params, doseq=True)}"
+
+
+async def _odds_get_json(
+    session: aiohttp.ClientSession,
+    path: str,
+    api_key: Optional[str],
+    **params: Any,
+) -> Optional[Any]:
+    params = {"apiKey": api_key or ODDS_API_KEY, **params}
+    url = _odds_build_url(path, params)
+    try:
+        async with session.get(url, timeout=30) as response:
+            if response.status != 200:
+                text = await response.text()
+                odds_logger.warning("Odds GET %s -> %s\n%s", response.status, url, text[:600])
+                return None
+            return await response.json()
+    except Exception:
+        odds_logger.exception("GET failed: %s", url)
+        return None
+
+
+async def odds_fetch_game_odds(
+    session: aiohttp.ClientSession,
+    *,
+    api_key: Optional[str],
+    regions: Sequence[str] | str = ("us", "us2"),
+    markets: Sequence[str] | str = ("h2h", "spreads", "totals"),
+    odds_format: str = ODDS_FORMAT,
+    date_format: str = "iso",
+) -> pd.DataFrame:
+    regions_param = ",".join(regions) if isinstance(regions, (list, tuple)) else regions
+    markets_param = ",".join(markets) if isinstance(markets, (list, tuple)) else markets
+
+    data = await _odds_get_json(
+        session,
+        f"/sports/{NFL_SPORT_KEY}/odds",
+        api_key,
+        regions=regions_param,
+        markets=markets_param,
+        oddsFormat=odds_format,
+        dateFormat=date_format,
+    )
+    if not data:
+        return pd.DataFrame(
+            columns=[
+                "event_id",
+                "commence_time",
+                "home_team",
+                "away_team",
+                "book",
+                "market",
+                "side",
+                "line",
+                "american_odds",
+                "decimal_odds",
+                "imp_prob",
+            ]
+        )
+
+    rows: List[Dict[str, Any]] = []
+    for event in data:
+        event_id = str(event.get("id", ""))
+        home_team = event.get("home_team") or event.get("homeTeam") or ""
+        away_team = event.get("away_team") or event.get("awayTeam") or ""
+        commence_time = event.get("commence_time") or event.get("commenceTime") or ""
+
+        for bookmaker in event.get("bookmakers", []) or []:
+            book_key = bookmaker.get("key") or bookmaker.get("title")
+            for market in bookmaker.get("markets", []) or []:
+                market_key = str(market.get("key", "")).lower()
+                market_label = ODDS_MARKET_CANONICAL_MAP.get(market_key, market_key.upper())
+                for outcome in market.get("outcomes", []) or []:
+                    outcome_name = outcome.get("name")
+                    price = outcome.get("price")
+                    line = outcome.get("point") or outcome.get("total") or outcome.get("handicap")
+
+                    rows.append(
+                        {
+                            "event_id": event_id,
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "commence_time": commence_time,
+                            "book": book_key,
+                            "market": market_label,
+                            "side": outcome_name,
+                            "line": float(line) if line is not None else np.nan,
+                            "american_odds": float(price) if price is not None else np.nan,
+                        }
+                    )
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+
+    frame["decimal_odds"] = frame["american_odds"].apply(odds_american_to_decimal)
+    frame["imp_prob"] = frame["american_odds"].apply(odds_american_to_prob)
+    if "line" in frame.columns:
+        frame["line"] = pd.to_numeric(frame["line"], errors="coerce")
+    return frame.reset_index(drop=True)
+
+
+async def odds_fetch_prop_odds(
+    session: aiohttp.ClientSession,
+    event_ids: Sequence[str] | str,
+    *,
+    api_key: Optional[str],
+    regions: Sequence[str] | str = ("us", "us2"),
+    odds_format: str = ODDS_FORMAT,
+    date_format: str = "iso",
+) -> pd.DataFrame:
+    if isinstance(event_ids, str):
+        event_ids = [event_ids]
+    event_ids = [event_id for event_id in (event_ids or []) if event_id]
+    if not event_ids:
+        return pd.DataFrame(
+            columns=[
+                "event_id",
+                "commence_time",
+                "home_team",
+                "away_team",
+                "book",
+                "market",
+                "player",
+                "side",
+                "line",
+                "american_odds",
+                "decimal_odds",
+                "imp_prob",
+            ]
+        )
+
+    regions_param = ",".join(regions) if isinstance(regions, (list, tuple)) else regions
+    prop_markets = ",".join(ODDS_PLAYER_PROP_MARKETS)
+
+    tasks = [
+        _odds_get_json(
+            session,
+            f"/sports/{NFL_SPORT_KEY}/events/{event_id}/odds",
+            api_key,
+            regions=regions_param,
+            markets=prop_markets,
+            oddsFormat=odds_format,
+            dateFormat=date_format,
+        )
+        for event_id in event_ids
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+
+    rows: List[Dict[str, Any]] = []
+    for event_id, payload in zip(event_ids, results):
+        if not payload:
+            continue
+        home_team = payload.get("home_team") or payload.get("homeTeam")
+        away_team = payload.get("away_team") or payload.get("awayTeam")
+        commence_time = payload.get("commence_time") or payload.get("commenceTime")
+
+        for bookmaker in payload.get("bookmakers", []) or []:
+            book_key = bookmaker.get("key") or bookmaker.get("title")
+            for market in bookmaker.get("markets", []) or []:
+                market_key = str(market.get("key", "")).lower()
+                market_label = ODDS_MARKET_CANONICAL_MAP.get(market_key, market_key.upper())
+                for outcome in market.get("outcomes", []) or []:
+                    player = outcome.get("description") or outcome.get("participant") or ""
+                    side = (outcome.get("name") or "").title()
+                    if market_key == "player_anytime_td":
+                        side = {"Yes": "Over", "No": "Under"}.get(side, side)
+                    price = outcome.get("price")
+                    line = outcome.get("point")
+                    if not player or price is None:
+                        continue
+                    rows.append(
+                        {
+                            "event_id": event_id,
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "commence_time": commence_time,
+                            "book": book_key,
+                            "market": market_label,
+                            "player": str(player),
+                            "side": side,
+                            "line": float(line) if line is not None else np.nan,
+                            "american_odds": float(price),
+                        }
+                    )
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+
+    frame["decimal_odds"] = frame["american_odds"].apply(odds_american_to_decimal)
+    frame["imp_prob"] = frame["american_odds"].apply(odds_american_to_prob)
+    if "line" in frame.columns:
+        frame["line"] = pd.to_numeric(frame["line"], errors="coerce")
+    return frame.reset_index(drop=True)
 
 DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
@@ -2265,6 +2636,8 @@ class NFLDatabase:
             statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS humidity DOUBLE PRECISION")
         if "injury_summary" not in game_columns:
             statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS injury_summary TEXT")
+        if "odds_event_id" not in game_columns:
+            statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS odds_event_id TEXT")
 
         if "nfl_depth_charts" in table_names:
             try:
@@ -2317,6 +2690,7 @@ class NFLDatabase:
             Column("home_score", Integer),
             Column("away_score", Integer),
             Column("status", String),
+            Column("odds_event_id", String),
             Column("home_moneyline", Float),
             Column("away_moneyline", Float),
             Column("home_implied_prob", Float),
@@ -2437,6 +2811,43 @@ class NFLDatabase:
             Column("created_at", DateTime(timezone=True), default=default_now_utc),
         )
 
+        self.game_totals = Table(
+            "nfl_game_totals",
+            self.meta,
+            Column("market_id", String, primary_key=True),
+            Column("game_id", String, nullable=False),
+            Column("event_id", String),
+            Column("season", String),
+            Column("week", Integer),
+            Column("start_time", DateTime(timezone=True)),
+            Column("bookmaker", String),
+            Column("total_line", Float),
+            Column("over_odds", Float),
+            Column("under_odds", Float),
+            Column("last_update", DateTime(timezone=True)),
+            Column("ingested_at", DateTime(timezone=True), default=default_now_utc),
+        )
+
+        self.player_prop_lines = Table(
+            "nfl_player_prop_lines",
+            self.meta,
+            Column("prop_id", String, primary_key=True),
+            Column("game_id", String, nullable=False),
+            Column("event_id", String),
+            Column("player_id", String),
+            Column("player_name", String),
+            Column("player_name_norm", String),
+            Column("team", String),
+            Column("opponent", String),
+            Column("market", String, nullable=False),
+            Column("line", Float),
+            Column("over_odds", Float),
+            Column("under_odds", Float),
+            Column("bookmaker", String),
+            Column("last_update", DateTime(timezone=True)),
+            Column("ingested_at", DateTime(timezone=True), default=default_now_utc),
+        )
+
     # ------------------------------------------------------------------
     # Write helpers
     # ------------------------------------------------------------------
@@ -2494,6 +2905,33 @@ class NFLDatabase:
         with self.engine.begin() as conn:
             rows = conn.execute(select(self.games.c.game_id)).fetchall()
         return {row[0] for row in rows}
+
+    def fetch_game_lookup(self) -> List[Dict[str, Any]]:
+        columns = [
+            self.games.c.game_id,
+            self.games.c.season,
+            self.games.c.week,
+            self.games.c.start_time,
+            self.games.c.home_team,
+            self.games.c.away_team,
+            self.games.c.odds_event_id,
+        ]
+        with self.engine.begin() as conn:
+            rows = conn.execute(select(*columns)).fetchall()
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            results.append(
+                {
+                    "game_id": row[0],
+                    "season": row[1],
+                    "week": row[2],
+                    "start_time": row[3],
+                    "home_team": row[4],
+                    "away_team": row[5],
+                    "odds_event_id": row[6],
+                }
+            )
+        return results
 
     def fetch_games_with_player_stats(self) -> set[str]:
         """Return the set of game IDs that already have player statistics stored."""
@@ -2673,38 +3111,267 @@ class MySportsFeedsClient:
             raise
 
 
+
 class OddsApiClient:
     def __init__(self, api_key: str, timeout: int = 30):
         self.api_key = api_key
         self.timeout = timeout
 
-    def _request(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        url = f"{ODDS_BASE}/{endpoint}"
-        params = params or {}
-        params.update({"apiKey": self.api_key})
-        logging.debug("Requesting Odds API endpoint %s", url)
-        resp = requests.get(url, params=params, timeout=self.timeout)
-        resp.raise_for_status()
-        remaining = resp.headers.get("x-requests-remaining")
-        if remaining is not None:
-            logging.debug("Odds API requests remaining: %s", remaining)
-        return resp.json()
+    @staticmethod
+    def _normalize_bound(value: Optional[dt.datetime]) -> Optional[dt.datetime]:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt.timezone.utc)
+        return value.astimezone(dt.timezone.utc)
 
-    def fetch_odds(self) -> List[Dict[str, Any]]:
-        params = {
-            "regions": ",".join(ODDS_REGIONS),
-            "oddsFormat": ODDS_FORMAT,
-            "markets": "h2h",
-        }
-        return self._request(f"sports/{NFL_SPORT_KEY}/odds", params=params)
+    @staticmethod
+    def _to_iso(value: Optional[dt.datetime]) -> Optional[str]:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt.timezone.utc)
+        return value.astimezone(dt.timezone.utc).isoformat().replace('+00:00', 'Z')
+
+    @staticmethod
+    def _reverse_market_map() -> Dict[str, str]:
+        reverse: Dict[str, str] = {}
+        for raw_key, canonical in ODDS_MARKET_CANONICAL_MAP.items():
+            preferred = raw_key
+            if preferred.endswith('_yds'):
+                preferred = preferred.replace('_yds', '_yards')
+            if preferred == 'player_reception_yds':
+                preferred = 'player_receiving_yards'
+            reverse[canonical.upper()] = preferred
+        return reverse
+
+    def _assemble_events(
+        self,
+        game_df: pd.DataFrame,
+        prop_df: pd.DataFrame,
+        start: Optional[dt.datetime],
+        end: Optional[dt.datetime],
+    ) -> List[Dict[str, Any]]:
+        reverse_map = self._reverse_market_map()
+
+        def normalize_market(label: str) -> str:
+            key = reverse_map.get(label.upper(), label.lower())
+            if key.endswith('_yds'):
+                key = key.replace('_yds', '_yards')
+            if key == 'player_reception_yds':
+                key = 'player_receiving_yards'
+            return key
+
+        event_meta: Dict[str, Dict[str, Any]] = {}
+
+        def update_meta(frame: pd.DataFrame) -> None:
+            if frame is None or frame.empty:
+                return
+            for _, row in frame.iterrows():
+                eid = str(row.get('event_id') or '')
+                if not eid:
+                    continue
+                meta = event_meta.setdefault(eid, {})
+                if not meta.get('home_team') and row.get('home_team'):
+                    meta['home_team'] = row.get('home_team')
+                if not meta.get('away_team') and row.get('away_team'):
+                    meta['away_team'] = row.get('away_team')
+                commence_dt = row.get('commence_dt')
+                if pd.notna(commence_dt) and meta.get('commence_dt') is None:
+                    if isinstance(commence_dt, pd.Timestamp):
+                        meta['commence_dt'] = commence_dt.to_pydatetime()
+                    elif isinstance(commence_dt, dt.datetime):
+                        meta['commence_dt'] = commence_dt
+                if not meta.get('commence_raw') and row.get('commence_time'):
+                    meta['commence_raw'] = row.get('commence_time')
+
+        update_meta(game_df)
+        update_meta(prop_df)
+
+        events: Dict[str, Dict[str, Any]] = {}
+        bookmaker_maps: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+        def get_event(event_id: str) -> Dict[str, Any]:
+            if event_id not in events:
+                meta = event_meta.get(event_id, {})
+                commence_dt = meta.get('commence_dt')
+                events[event_id] = {
+                    'id': event_id,
+                    'commence_time': self._to_iso(commence_dt) if commence_dt else meta.get('commence_raw'),
+                    'home_team': meta.get('home_team'),
+                    'away_team': meta.get('away_team'),
+                    'bookmakers': [],
+                }
+                bookmaker_maps[event_id] = {}
+            return events[event_id]
+
+        def get_bookmaker(event_id: str, book: str) -> Dict[str, Any]:
+            event = get_event(event_id)
+            book_map = bookmaker_maps[event_id]
+            if book not in book_map:
+                bookmaker = {
+                    'key': book,
+                    'title': book,
+                    'last_update': self._to_iso(default_now_utc()),
+                    'markets': [],
+                }
+                bookmaker['__markets'] = {}
+                book_map[book] = bookmaker
+                event['bookmakers'].append(bookmaker)
+            return book_map[book]
+
+        def add_outcome(book: Dict[str, Any], market_key: str, outcome: Dict[str, Any]) -> None:
+            markets_map = book.setdefault('__markets', {})
+            market_struct = markets_map.get(market_key)
+            if market_struct is None:
+                market_struct = {'key': market_key, 'outcomes': []}
+                markets_map[market_key] = market_struct
+                book['markets'].append(market_struct)
+            market_struct['outcomes'].append(outcome)
+
+        if game_df is not None and not game_df.empty:
+            for _, row in game_df.iterrows():
+                eid = str(row.get('event_id') or '')
+                book_name = str(row.get('book') or '')
+                if not eid or not book_name:
+                    continue
+                price = row.get('american_odds')
+                if pd.isna(price):
+                    continue
+                book = get_bookmaker(eid, book_name)
+                market_key = normalize_market(str(row.get('market') or ''))
+                outcome: Dict[str, Any] = {
+                    'name': row.get('side'),
+                    'price': float(price),
+                }
+                line_val = row.get('line')
+                if not pd.isna(line_val):
+                    outcome['point'] = float(line_val)
+                    if market_key == 'totals':
+                        outcome['total'] = float(line_val)
+                add_outcome(book, market_key, outcome)
+
+        if prop_df is not None and not prop_df.empty:
+            for _, row in prop_df.iterrows():
+                eid = str(row.get('event_id') or '')
+                book_name = str(row.get('book') or '')
+                if not eid or not book_name:
+                    continue
+                price = row.get('american_odds')
+                if pd.isna(price):
+                    continue
+                book = get_bookmaker(eid, book_name)
+                market_key = normalize_market(str(row.get('market') or ''))
+                outcome: Dict[str, Any] = {
+                    'name': row.get('side'),
+                    'price': float(price),
+                    'description': row.get('player'),
+                    'participant': row.get('player'),
+                }
+                line_val = row.get('line')
+                if not pd.isna(line_val):
+                    outcome['point'] = float(line_val)
+                add_outcome(book, market_key, outcome)
+
+        assembled = list(events.values())
+        for event in assembled:
+            for bookmaker in event.get('bookmakers', []):
+                bookmaker.pop('__markets', None)
+
+        if start or end:
+            filtered: List[Dict[str, Any]] = []
+            start_utc = self._normalize_bound(start)
+            end_utc = self._normalize_bound(end)
+            for event in assembled:
+                commence = parse_dt(event.get('commence_time'))
+                if start_utc and (commence is None or commence < start_utc):
+                    continue
+                if end_utc and (commence is None or commence > end_utc):
+                    continue
+                filtered.append(event)
+            assembled = filtered
+        return assembled
+
+    async def _fetch_async(
+        self,
+        start: Optional[dt.datetime],
+        end: Optional[dt.datetime],
+        include_player_props: bool,
+    ) -> List[Dict[str, Any]]:
+        api_key = self.api_key or ODDS_API_KEY
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            game_df = await odds_fetch_game_odds(
+                session,
+                api_key=api_key,
+                regions=ODDS_REGIONS,
+                markets=ODDS_DEFAULT_MARKETS,
+                odds_format=ODDS_FORMAT,
+            )
+            if not game_df.empty:
+                game_df['commence_dt'] = pd.to_datetime(
+                    game_df['commence_time'], errors='coerce', utc=True
+                )
+                start_bound = self._normalize_bound(start)
+                end_bound = self._normalize_bound(end)
+                if start_bound is not None:
+                    game_df = game_df[game_df['commence_dt'] >= start_bound]
+                if end_bound is not None:
+                    game_df = game_df[game_df['commence_dt'] <= end_bound]
+            prop_df = pd.DataFrame()
+            if include_player_props:
+                if not game_df.empty and 'event_id' in game_df.columns:
+                    event_ids = (
+                        game_df['event_id']
+                        .dropna()
+                        .astype(str)
+                        .drop_duplicates()
+                        .tolist()
+                    )
+                else:
+                    event_ids = []
+                if event_ids:
+                    prop_df = await odds_fetch_prop_odds(
+                        session,
+                        api_key=api_key,
+                        event_ids=event_ids,
+                        regions=ODDS_REGIONS,
+                        odds_format=ODDS_FORMAT,
+                    )
+                    if not prop_df.empty:
+                        prop_df['commence_dt'] = pd.to_datetime(
+                            prop_df['commence_time'], errors='coerce', utc=True
+                        )
+                        start_bound = self._normalize_bound(start)
+                        end_bound = self._normalize_bound(end)
+                        if start_bound is not None:
+                            prop_df = prop_df[prop_df['commence_dt'] >= start_bound]
+                        if end_bound is not None:
+                            prop_df = prop_df[prop_df['commence_dt'] <= end_bound]
+            return self._assemble_events(game_df, prop_df, start, end)
+
+    def fetch_odds(
+        self,
+        *,
+        start: Optional[dt.datetime] = None,
+        end: Optional[dt.datetime] = None,
+        include_player_props: bool = True,
+        include_historical: bool = True,
+    ) -> List[Dict[str, Any]]:
+        try:
+            return asyncio.run(
+                self._fetch_async(start=start, end=end, include_player_props=include_player_props)
+            )
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                return loop.run_until_complete(
+                    self._fetch_async(start=start, end=end, include_player_props=include_player_props)
+                )
+            raise
 
 
-# ---------------------------------------------------------------------------
-# Ingestion pipeline
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass
+@dataclass
 class MSFCreds:
     api_key: str
     password: str = "MYSPORTSFEEDS"
@@ -3008,15 +3675,127 @@ class NFLIngestor:
         self._ingest_odds()
 
     def _ingest_odds(self) -> None:
-        odds_data = self.odds_client.fetch_odds()
+        game_lookup_rows = self.db.fetch_game_lookup()
+        if not game_lookup_rows:
+            logging.warning("No scheduled games available when attempting to ingest odds.")
+            return
+
+        def _ensure_datetime(value: Any) -> Optional[dt.datetime]:
+            if value is None or value == "":
+                return None
+            if isinstance(value, dt.datetime):
+                return value
+            return parse_dt(value)
+
+        games_by_event: Dict[str, Dict[str, Any]] = {}
+        games_by_key: Dict[Tuple[str, str, Optional[dt.date]], List[Dict[str, Any]]] = defaultdict(list)
+        min_start: Optional[dt.datetime] = None
+        max_start: Optional[dt.datetime] = None
+
+        for row in game_lookup_rows:
+            start_time = _ensure_datetime(row.get("start_time"))
+            if start_time is not None:
+                if min_start is None or start_time < min_start:
+                    min_start = start_time
+                if max_start is None or start_time > max_start:
+                    max_start = start_time
+            home = normalize_team_abbr(row.get("home_team"))
+            away = normalize_team_abbr(row.get("away_team"))
+            if home and away:
+                key = (home, away, start_time.date() if start_time else None)
+                games_by_key[key].append(row)
+            event_id = row.get("odds_event_id")
+            if event_id:
+                games_by_event[str(event_id)] = row
+
+        if min_start is None:
+            min_start = default_now_utc() - dt.timedelta(days=7)
+        if max_start is None:
+            max_start = default_now_utc() + dt.timedelta(days=7)
+
+        buffer = dt.timedelta(days=2)
+        odds_data = self.odds_client.fetch_odds(
+            start=min_start - buffer,
+            end=max_start + buffer,
+            include_player_props=True,
+            include_historical=True,
+        )
         logging.info("Fetched %d odds entries", len(odds_data))
 
+        def _match_game(
+            event_id: str,
+            home_team: str,
+            away_team: str,
+            commence: Optional[dt.datetime],
+        ) -> Optional[Dict[str, Any]]:
+            if event_id in games_by_event:
+                return games_by_event[event_id]
+
+            date_candidates: Set[Optional[dt.date]] = {None}
+            if commence is not None:
+                base_date = commence.date()
+                date_candidates = {
+                    base_date,
+                    (commence - dt.timedelta(days=1)).date(),
+                    (commence + dt.timedelta(days=1)).date(),
+                }
+
+            candidates: List[Tuple[Dict[str, Any], float]] = []
+            for date_value in date_candidates:
+                key = (home_team, away_team, date_value)
+                for record in games_by_key.get(key, []):
+                    start_time = _ensure_datetime(record.get("start_time"))
+                    if commence is not None and start_time is not None:
+                        diff = abs((start_time - commence).total_seconds())
+                    else:
+                        diff = float("inf")
+                    candidates.append((record, diff))
+
+            if not candidates and commence is not None:
+                # Try swapped home/away assignment if the API differs from MSF
+                swapped_key_candidates: List[Tuple[Dict[str, Any], float]] = []
+                for date_value in date_candidates:
+                    key = (away_team, home_team, date_value)
+                    for record in games_by_key.get(key, []):
+                        start_time = _ensure_datetime(record.get("start_time"))
+                        diff = (
+                            abs((start_time - commence).total_seconds())
+                            if start_time is not None
+                            else float("inf")
+                        )
+                        swapped_key_candidates.append((record, diff))
+                candidates.extend(swapped_key_candidates)
+
+            if not candidates:
+                return None
+
+            candidates.sort(key=lambda item: item[1])
+            matched_record = candidates[0][0]
+            games_by_event[event_id] = matched_record
+            return matched_record
+
+        def _american_to_prob(odds: Optional[float]) -> Optional[float]:
+            if odds is None:
+                return None
+            try:
+                odds_val = float(odds)
+            except (TypeError, ValueError):
+                return None
+            if odds_val > 0:
+                return 100.0 / (odds_val + 100.0)
+            return -odds_val / (-odds_val + 100.0)
+
         odds_rows: List[Dict[str, Any]] = []
+        totals_rows: List[Dict[str, Any]] = []
+        prop_rows: List[Dict[str, Any]] = []
+
         for event in odds_data:
+            event_id = str(event.get("id") or "")
+            if not event_id:
+                continue
+
             commence_time = parse_dt(event.get("commence_time"))
-
             teams_list = [team for team in (event.get("teams") or []) if team]
-
             home_team_raw = event.get("home_team") or (teams_list[0] if teams_list else None)
             away_team_raw = event.get("away_team")
             if not away_team_raw and teams_list:
@@ -3027,81 +3806,289 @@ class NFLIngestor:
 
             home_team = normalize_team_abbr(home_team_raw)
             away_team = normalize_team_abbr(away_team_raw)
-
             if not home_team or not away_team:
                 logging.debug(
                     "Skipping odds event %s due to unmapped team names (home=%s, away=%s)",
-                    event.get("id"),
+                    event_id,
                     home_team_raw,
                     away_team_raw,
                 )
                 continue
 
-            markets = event.get("bookmakers", [])
+            matched_game = _match_game(event_id, home_team, away_team, commence_time)
+            if not matched_game:
+                logging.debug(
+                    "Unable to match odds event %s (%s at %s) to an existing MSF game", 
+                    event_id,
+                    away_team,
+                    home_team,
+                )
+                continue
+
+            game_id = matched_game.get("game_id")
+            if not game_id:
+                continue
+
+            season = matched_game.get("season") or self._infer_season(commence_time)
+            week = matched_game.get("week")
+            markets = event.get("bookmakers", []) or []
             if not markets:
                 continue
-            # Use the freshest bookmaker odds
-            market = sorted(markets, key=lambda b: parse_dt(b.get("last_update")) or default_now_utc(), reverse=True)[0]
-            last_update = parse_dt(market.get("last_update"))
-            h2h = next((m for m in market.get("markets", []) if m.get("key") == "h2h"), None)
-            if not h2h:
-                continue
 
-            prices = {outcome.get("name"): outcome.get("price") for outcome in h2h.get("outcomes", [])}
-            home_price = prices.get(home_team)
-            away_price = prices.get(away_team)
+            # Choose bookmaker with the most recent update for moneylines
+            sorted_books = sorted(
+                markets,
+                key=lambda b: parse_dt(b.get("last_update")) or default_now_utc(),
+                reverse=True,
+            )
 
-            def american_to_prob(odds: Optional[float]) -> Optional[float]:
-                if odds is None:
-                    return None
-                odds = float(odds)
-                if odds > 0:
-                    return 100.0 / (odds + 100.0)
-                return -odds / (-odds + 100.0)
+            primary_book = sorted_books[0]
+            last_update = parse_dt(primary_book.get("last_update"))
+            moneyline_market = None
+            for market in primary_book.get("markets", []) or []:
+                if (market.get("key") or "").lower() == "h2h":
+                    moneyline_market = market
+                    break
+
+            def _extract_team_price(outcomes: Iterable[Dict[str, Any]], team_abbr: str) -> Optional[float]:
+                for outcome in outcomes:
+                    name_norm = normalize_team_abbr(outcome.get("name"))
+                    desc_norm = normalize_team_abbr(outcome.get("description"))
+                    if team_abbr in {name_norm, desc_norm}:
+                        price = outcome.get("price")
+                        try:
+                            return float(price)
+                        except (TypeError, ValueError):
+                            return None
+                return None
+
+            home_price = None
+            away_price = None
+            if moneyline_market:
+                outcomes = moneyline_market.get("outcomes", []) or []
+                home_price = _extract_team_price(outcomes, home_team)
+                away_price = _extract_team_price(outcomes, away_team)
 
             odds_rows.append(
                 {
-                    "game_id": event.get("id"),
-                    "season": self._infer_season(commence_time),
-                    "week": None,
-                    "start_time": commence_time,
-                    "venue": None,
-                    "city": None,
-                    "state": None,
-                    "country": None,
-                    "surface": None,
-                    "day_of_week": commence_time.strftime("%A") if commence_time else None,
-                    "referee": None,
-                    "temperature_f": None,
-                    "weather_conditions": None,
+                    "game_id": game_id,
+                    "season": season,
+                    "week": week,
+                    "start_time": commence_time or _ensure_datetime(matched_game.get("start_time")),
                     "home_team": home_team,
                     "away_team": away_team,
-                    "home_score": None,
-                    "away_score": None,
-                    "status": "upcoming",
+                    "status": matched_game.get("status") or "scheduled",
                     "home_moneyline": home_price,
                     "away_moneyline": away_price,
-                    "home_implied_prob": american_to_prob(home_price),
-                    "away_implied_prob": american_to_prob(away_price),
+                    "home_implied_prob": _american_to_prob(home_price),
+                    "away_implied_prob": _american_to_prob(away_price),
                     "odds_updated": last_update,
+                    "odds_event_id": event_id,
                 }
             )
 
-        self.db.upsert_rows(
-            self.db.games,
-            odds_rows,
-            ["game_id"],
-            update_columns=[
-                "start_time",
-                "home_moneyline",
-                "away_moneyline",
-                "home_implied_prob",
-                "away_implied_prob",
-                "odds_updated",
-                "home_team",
-                "away_team",
-            ],
-        )
+            for bookmaker in sorted_books:
+                sportsbook = bookmaker.get("key") or bookmaker.get("title") or "unknown"
+                book_update = parse_dt(bookmaker.get("last_update")) or last_update
+                for market in bookmaker.get("markets", []) or []:
+                    market_key = (market.get("key") or "").lower()
+                    outcomes = market.get("outcomes", []) or []
+
+                    if market_key == "totals":
+                        over_outcome = next(
+                            (o for o in outcomes if str(o.get("name", "")).lower() == "over"),
+                            None,
+                        )
+                        under_outcome = next(
+                            (o for o in outcomes if str(o.get("name", "")).lower() == "under"),
+                            None,
+                        )
+                        try:
+                            total_line = float(
+                                (over_outcome or under_outcome or {}).get("point")
+                                or (over_outcome or under_outcome or {}).get("line")
+                            )
+                        except (TypeError, ValueError):
+                            total_line = None
+                        if total_line is not None:
+                            try:
+                                over_price_val = float(over_outcome.get("price")) if over_outcome else None
+                            except (TypeError, ValueError):
+                                over_price_val = None
+                            try:
+                                under_price_val = float(under_outcome.get("price")) if under_outcome else None
+                            except (TypeError, ValueError):
+                                under_price_val = None
+                            totals_rows.append(
+                                {
+                                    "market_id": f"{game_id}:{sportsbook}:total",
+                                    "game_id": game_id,
+                                    "event_id": event_id,
+                                    "season": season,
+                                    "week": week,
+                                    "start_time": commence_time,
+                                    "bookmaker": sportsbook,
+                                    "total_line": total_line,
+                                    "over_odds": over_price_val,
+                                    "under_odds": under_price_val,
+                                    "last_update": book_update,
+                                }
+                            )
+
+                    elif market_key in ODDS_PLAYER_PROP_MARKETS:
+                        player_buckets: Dict[str, Dict[str, Any]] = {}
+
+                        for outcome in outcomes:
+                            name_raw = str(outcome.get("name") or "").strip()
+                            desc_raw = str(outcome.get("description") or "").strip()
+                            participant = str(
+                                outcome.get("participant")
+                                or outcome.get("player")
+                                or outcome.get("player_name")
+                                or ""
+                            ).strip()
+                            side: Optional[str] = None
+                            player_name: Optional[str] = None
+
+                            lower_name = name_raw.lower()
+                            lower_desc = desc_raw.lower()
+                            if lower_name in {"over", "under"}:
+                                side = name_raw.title()
+                                player_name = desc_raw or participant
+                            elif lower_desc in {"over", "under"}:
+                                side = desc_raw.title()
+                                player_name = name_raw or participant
+                            elif lower_name.endswith(" over") or lower_name.endswith(" under"):
+                                tokens = lower_name.rsplit(" ", 1)
+                                side = tokens[1].title()
+                                player_name = name_raw[: -len(tokens[1])].strip()
+                            elif participant:
+                                player_name = participant
+
+                            if not player_name or not side:
+                                continue
+
+                            player_line = outcome.get("line") or outcome.get("point")
+                            try:
+                                player_line_val = float(player_line) if player_line is not None else None
+                            except (TypeError, ValueError):
+                                player_line_val = None
+
+                            price_val = outcome.get("price")
+                            try:
+                                price_float = float(price_val) if price_val is not None else None
+                            except (TypeError, ValueError):
+                                price_float = None
+
+                            player_key = robust_player_name_key(player_name)
+                            bucket = player_buckets.setdefault(
+                                player_key,
+                                {
+                                    "player_name": player_name,
+                                    "player_id": outcome.get("player_id")
+                                    or outcome.get("participant_id")
+                                    or outcome.get("id"),
+                                    "line": player_line_val,
+                                    "over_odds": None,
+                                    "under_odds": None,
+                                    "team": normalize_team_abbr(outcome.get("team")),
+                                },
+                            )
+
+                            if player_line_val is not None:
+                                bucket["line"] = player_line_val
+                            if side == "Over":
+                                bucket["over_odds"] = price_float
+                            elif side == "Under":
+                                bucket["under_odds"] = price_float
+
+                        for player_key, info in player_buckets.items():
+                            if info.get("line") is None:
+                                continue
+                            if info.get("over_odds") is None and info.get("under_odds") is None:
+                                continue
+                            player_name_norm = normalize_player_name(info.get("player_name"))
+                            team_abbr = info.get("team")
+                            opponent = None
+                            if team_abbr:
+                                if team_abbr == home_team:
+                                    opponent = away_team
+                                elif team_abbr == away_team:
+                                    opponent = home_team
+                            prop_rows.append(
+                                {
+                                    "prop_id": f"{game_id}:{sportsbook}:{market_key}:{player_key}",
+                                    "game_id": game_id,
+                                    "event_id": event_id,
+                                    "player_id": str(info.get("player_id")) if info.get("player_id") else None,
+                                    "player_name": info.get("player_name"),
+                                    "player_name_norm": player_name_norm,
+                                    "team": team_abbr,
+                                    "opponent": opponent,
+                                    "market": market_key,
+                                    "line": info.get("line"),
+                                    "over_odds": info.get("over_odds"),
+                                    "under_odds": info.get("under_odds"),
+                                    "bookmaker": sportsbook,
+                                    "last_update": book_update,
+                                }
+                            )
+
+        if odds_rows:
+            self.db.upsert_rows(
+                self.db.games,
+                odds_rows,
+                ["game_id"],
+                update_columns=[
+                    "start_time",
+                    "home_moneyline",
+                    "away_moneyline",
+                    "home_implied_prob",
+                    "away_implied_prob",
+                    "odds_updated",
+                    "home_team",
+                    "away_team",
+                    "odds_event_id",
+                    "season",
+                    "week",
+                ],
+            )
+
+        if totals_rows:
+            self.db.upsert_rows(
+                self.db.game_totals,
+                totals_rows,
+                ["market_id"],
+                update_columns=[
+                    "total_line",
+                    "over_odds",
+                    "under_odds",
+                    "last_update",
+                    "start_time",
+                    "season",
+                    "week",
+                    "bookmaker",
+                    "event_id",
+                ],
+            )
+
+        if prop_rows:
+            self.db.upsert_rows(
+                self.db.player_prop_lines,
+                prop_rows,
+                ["prop_id"],
+                update_columns=[
+                    "line",
+                    "over_odds",
+                    "under_odds",
+                    "last_update",
+                    "team",
+                    "opponent",
+                    "bookmaker",
+                    "event_id",
+                    "player_id",
+                ],
+            )
 
     def _group_msf_injuries(
         self,
@@ -3950,6 +4937,8 @@ class FeatureBuilder:
         self.depth_chart_frame: Optional[pd.DataFrame] = None
         self.advanced_metrics_frame: Optional[pd.DataFrame] = None
         self.latest_odds_lookup: Optional[pd.DataFrame] = None
+        self.game_totals_frame: Optional[pd.DataFrame] = None
+        self.player_prop_lines_frame: Optional[pd.DataFrame] = None
 
     @staticmethod
     def _american_to_prob_series(series: pd.Series) -> pd.Series:
@@ -4063,6 +5052,8 @@ class FeatureBuilder:
         pd.DataFrame,
         pd.DataFrame,
         pd.DataFrame,
+        pd.DataFrame,
+        pd.DataFrame,
     ]:
         games = pd.read_sql_table("nfl_games", self.engine)
         player_stats = pd.read_sql_table("nfl_player_stats", self.engine)
@@ -4070,6 +5061,14 @@ class FeatureBuilder:
         injuries = pd.read_sql_table("nfl_injury_reports", self.engine)
         depth_charts = pd.DataFrame()
         advanced_metrics = pd.read_sql_table("nfl_team_advanced_metrics", self.engine)
+        try:
+            game_totals = pd.read_sql_table("nfl_game_totals", self.engine)
+        except Exception:
+            game_totals = pd.DataFrame()
+        try:
+            player_prop_lines = pd.read_sql_table("nfl_player_prop_lines", self.engine)
+        except Exception:
+            player_prop_lines = pd.DataFrame()
 
         # Normalize column names to plain strings so downstream pipelines see
         # consistent labels regardless of database dialect.
@@ -4079,6 +5078,8 @@ class FeatureBuilder:
         injuries = injuries.rename(columns=lambda col: str(col))
         depth_charts = depth_charts.rename(columns=lambda col: str(col))
         advanced_metrics = advanced_metrics.rename(columns=lambda col: str(col))
+        game_totals = game_totals.rename(columns=lambda col: str(col))
+        player_prop_lines = player_prop_lines.rename(columns=lambda col: str(col))
         if "position" in player_stats.columns:
             player_stats["position"] = player_stats["position"].apply(normalize_position)
         if "practice_status" in player_stats.columns:
@@ -4096,7 +5097,21 @@ class FeatureBuilder:
             injuries["status_original"] = injuries["status"]
             injuries["status"] = injuries["status"].apply(normalize_injury_status)
 
-        return games, player_stats, team_ratings, injuries, depth_charts, advanced_metrics
+        if "team" in player_prop_lines.columns:
+            player_prop_lines["team"] = player_prop_lines["team"].apply(normalize_team_abbr)
+        if "opponent" in player_prop_lines.columns:
+            player_prop_lines["opponent"] = player_prop_lines["opponent"].apply(normalize_team_abbr)
+
+        return (
+            games,
+            player_stats,
+            team_ratings,
+            injuries,
+            depth_charts,
+            advanced_metrics,
+            game_totals,
+            player_prop_lines,
+        )
 
     def build_features(self) -> Dict[str, pd.DataFrame]:
         (
@@ -4106,6 +5121,8 @@ class FeatureBuilder:
             injuries,
             depth_charts,
             advanced_metrics,
+            game_totals,
+            player_prop_lines,
         ) = self.load_dataframes()
 
         if games.empty:
@@ -4142,10 +5159,31 @@ class FeatureBuilder:
         else:
             self.latest_odds_lookup = pd.DataFrame()
 
+        if not game_totals.empty and "game_id" in game_totals.columns:
+            for col in ["last_update", "start_time"]:
+                if col in game_totals.columns:
+                    game_totals[col] = pd.to_datetime(game_totals[col], errors="coerce")
+            sort_cols = [col for col in ["last_update", "start_time"] if col in game_totals.columns]
+            if sort_cols:
+                totals_sorted = game_totals.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+            else:
+                totals_sorted = game_totals
+            totals_latest = totals_sorted.drop_duplicates(subset=["game_id"], keep="first")
+            rename_map = {
+                "total_line": "game_total_line",
+                "over_odds": "game_total_over_odds",
+                "under_odds": "game_total_under_odds",
+            }
+            totals_latest = totals_latest[[col for col in rename_map if col in totals_latest.columns] + ["game_id"]]
+            totals_latest = totals_latest.rename(columns=rename_map)
+            games = games.merge(totals_latest, on="game_id", how="left")
+
         player_stats = player_stats.copy()
         injuries = injuries.copy()
         depth_charts = depth_charts.copy()
         advanced_metrics = advanced_metrics.copy()
+        game_totals = game_totals.copy()
+        player_prop_lines = player_prop_lines.copy()
 
         if "position" in player_stats.columns:
             player_stats["position"] = player_stats["position"].apply(normalize_position)
@@ -4153,6 +5191,8 @@ class FeatureBuilder:
         self.injury_frame = injuries
         self.depth_chart_frame = depth_charts
         self.advanced_metrics_frame = advanced_metrics
+        self.game_totals_frame = game_totals
+        self.player_prop_lines_frame = player_prop_lines
 
         # Basic cleanup
         games["start_time"] = pd.to_datetime(games["start_time"])
@@ -4334,6 +5374,48 @@ class FeatureBuilder:
             player_stats["player_name_norm"] = player_stats["player_name"].apply(
                 normalize_player_name
             )
+
+            if not player_prop_lines.empty:
+                props = player_prop_lines.copy()
+                props["game_id"] = props["game_id"].astype(str)
+                if "player_name_norm" in props.columns:
+                    props["player_name_norm"] = props["player_name_norm"].fillna("").astype(str)
+                else:
+                    props["player_name_norm"] = ""
+                empty_norm = props["player_name_norm"].str.strip() == ""
+                if empty_norm.any():
+                    props.loc[empty_norm, "player_name_norm"] = props.loc[empty_norm, "player_name"].fillna("").map(
+                        normalize_player_name
+                    )
+                props["player_name_norm"] = props["player_name_norm"].fillna("").map(normalize_player_name)
+                props = props[props["player_name_norm"] != ""].copy()
+                if "last_update" in props.columns:
+                    props["last_update"] = pd.to_datetime(props["last_update"], errors="coerce")
+                    props = props.sort_values("last_update", ascending=False)
+                props = props.drop_duplicates(
+                    subset=["game_id", "player_name_norm", "market"], keep="first"
+                )
+                for market_key, column_name in PLAYER_PROP_MARKET_COLUMN_MAP.items():
+                    subset = props[props["market"] == market_key]
+                    if subset.empty:
+                        continue
+                    stat_name = column_name.replace("line_", "")
+                    over_col = f"over_odds_{stat_name}"
+                    under_col = f"under_odds_{stat_name}"
+                    subset_merge = subset[
+                        ["game_id", "player_name_norm", "line", "over_odds", "under_odds"]
+                    ].rename(
+                        columns={
+                            "line": column_name,
+                            "over_odds": over_col,
+                            "under_odds": under_col,
+                        }
+                    )
+                    player_stats = player_stats.merge(
+                        subset_merge,
+                        on=["game_id", "player_name_norm"],
+                        how="left",
+                    )
 
             if not injuries.empty:
                 injuries_latest = injuries.copy()
@@ -7749,6 +8831,27 @@ class ModelTrainer:
         # 1) MAE vs "closing lines" (if present)
         closing_cols = [c for c in out_df.columns if c.startswith("line_") or c.endswith("_implied_prob")]
         mae_vs_closing = None
+        baseline_reference: Optional[pd.Series] = None
+        if not target.endswith("_win_prob") and not out_df.empty:
+            try:
+                baseline_values: List[float] = []
+                for idx, row in out_df.iterrows():
+                    prior_mean, _ = self._resolve_prior(
+                        target,
+                        row.get("team"),
+                        row.get("position"),
+                    )
+                    if math.isnan(prior_mean):
+                        league_prior = self.target_priors.get(target, {}).get("league", {})
+                        prior_mean = float(league_prior.get("mean", np.nan))
+                    baseline_values.append(float(prior_mean))
+                baseline_reference = pd.Series(baseline_values, index=out_df.index, dtype=float)
+            except Exception:
+                logging.debug("%s: unable to resolve baseline priors for diagnostics", target, exc_info=True)
+                baseline_reference = None
+            else:
+                out_df["_baseline_reference"] = baseline_reference
+
         if target.endswith("_win_prob"):
             # join to implied probs derived from moneylines already in games table
             # Expect columns like 'home_implied_prob'/'away_implied_prob' from ingest (see _ingest_odds)
@@ -7761,6 +8864,12 @@ class ModelTrainer:
             # Choose the first matching line as a reference
             ref = out_df[closing_cols[0]].astype(float)
             mae_vs_closing = float(np.nanmean(np.abs(out_df["_y_pred"] - ref)))
+
+        if mae_vs_closing is None and baseline_reference is not None:
+            if baseline_reference.notna().any():
+                mae_vs_closing = float(
+                    np.nanmean(np.abs(out_df["_y_pred"] - baseline_reference.astype(float)))
+                )
 
         # 2) EV rule → pick bets → compute hit rate & ROI (+ CI)
         def _american_to_payout(odds: float) -> float:
@@ -7777,31 +8886,61 @@ class ModelTrainer:
             if preds_array.size != len(out_df) or not len(out_df):
                 return None
 
-            required_cols = {
-                "home_moneyline",
-                "away_moneyline",
-                "home_fair_prob",
-                "away_fair_prob",
-            }
-            if not required_cols.issubset(out_df.columns):
+            required_cols = {"home_moneyline", "away_moneyline", "home_score", "away_score"}
+            missing_required = required_cols - set(out_df.columns)
+            if missing_required:
                 logging.debug(
                     "%s: skipping edge evaluation (%s missing)",
                     target,
-                    ", ".join(sorted(required_cols - set(out_df.columns))),
+                    ", ".join(sorted(missing_required)),
                 )
                 return None
 
-            market_frame = out_df.loc[:, list(required_cols)].apply(pd.to_numeric, errors="coerce")
+            price_cols = ["home_moneyline", "away_moneyline"]
+            market_frame = out_df.loc[:, price_cols].apply(pd.to_numeric, errors="coerce")
             pred_series = pd.Series(preds_array, index=out_df.index, dtype=float)
 
-            home_probs = market_frame["home_fair_prob"].astype(float)
-            away_probs = market_frame["away_fair_prob"].astype(float)
             home_prices = market_frame["home_moneyline"].astype(float)
             away_prices = market_frame["away_moneyline"].astype(float)
 
-            home_valid = home_probs.notna() & home_prices.notna()
-            away_valid = away_probs.notna() & away_prices.notna()
-            valid_mask = home_valid | away_valid
+            home_probs = _american_to_prob(home_prices)
+            away_probs = _american_to_prob(away_prices)
+
+            # Fill missing implied probabilities with the complement if only one side is known
+            missing_home = home_probs.isna() & away_probs.notna()
+            if missing_home.any():
+                home_probs.loc[missing_home] = 1.0 - away_probs.loc[missing_home].clip(0.0, 1.0)
+
+            missing_away = away_probs.isna() & home_probs.notna()
+            if missing_away.any():
+                away_probs.loc[missing_away] = 1.0 - home_probs.loc[missing_away].clip(0.0, 1.0)
+
+            # Require completed games for ROI computation
+            results_mask = (
+                out_df["home_score"].notna() & out_df["away_score"].notna()
+            )
+
+            home_valid = home_prices.notna() & home_probs.notna()
+            away_valid = away_prices.notna() & away_probs.notna()
+            valid_mask = (home_valid | away_valid) & results_mask
+
+            synthetic_odds_used = False
+            if not valid_mask.any():
+                logging.debug(
+                    "%s: no rows with market odds; using synthetic -110 moneylines for diagnostics",
+                    target,
+                )
+                synthetic_odds_used = True
+                fallback_prices = pd.Series(-110.0, index=out_df.index, dtype=float)
+                implied = _american_to_prob(fallback_prices)
+                home_prices = fallback_prices.copy()
+                away_prices = fallback_prices.copy()
+                home_probs = implied.copy()
+                away_probs = implied.copy()
+                valid_mask = results_mask.copy()
+                home_valid = valid_mask.copy()
+                away_valid = valid_mask.copy()
+
             if not valid_mask.any():
                 logging.debug("%s: no rows with complete market data for edge check", target)
                 return None
@@ -7814,8 +8953,20 @@ class ModelTrainer:
             home_valid = home_valid.loc[valid_mask]
             away_valid = away_valid.loc[valid_mask]
 
-            choose_home = pred_series - home_probs
-            choose_away = (1.0 - pred_series) - away_probs
+            total_prob = home_probs + away_probs
+            fair_home = pd.Series(np.nan, index=home_probs.index, dtype=float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                fair_mask = total_prob > 0
+                fair_home.loc[fair_mask] = home_probs.loc[fair_mask] / total_prob.loc[fair_mask]
+            fair_home = fair_home.clip(0.0, 1.0)
+            fair_away = (1.0 - fair_home).clip(0.0, 1.0)
+
+            # Use fair probabilities when available, otherwise fall back to implied values
+            home_reference = fair_home.fillna(home_probs.clip(0.0, 1.0))
+            away_reference = fair_away.fillna(away_probs.clip(0.0, 1.0))
+
+            choose_home = pred_series - home_reference
+            choose_away = (1.0 - pred_series) - away_reference
 
             def _build_picks_for_threshold(threshold: float) -> Optional[pd.DataFrame]:
                 picks: List[pd.DataFrame] = []
@@ -7832,7 +8983,10 @@ class ModelTrainer:
                     home_df["_edge"] = choose_home.loc[pick_home].astype(float)
                     home_df["_threshold"] = threshold
                     home_df["_side"] = "home"
-                    picks.append(home_df[["p_model", "side_win", "payout", "_edge", "_threshold", "_side"]])
+                    home_df["_is_push"] = False
+                    picks.append(
+                        home_df[["p_model", "side_win", "payout", "_edge", "_threshold", "_side", "_is_push"]]
+                    )
 
                 pick_away = away_valid & (choose_away > threshold)
                 if pick_away.any():
@@ -7846,7 +9000,10 @@ class ModelTrainer:
                     away_df["_edge"] = choose_away.loc[pick_away].astype(float)
                     away_df["_threshold"] = threshold
                     away_df["_side"] = "away"
-                    picks.append(away_df[["p_model", "side_win", "payout", "_edge", "_threshold", "_side"]])
+                    away_df["_is_push"] = False
+                    picks.append(
+                        away_df[["p_model", "side_win", "payout", "_edge", "_threshold", "_side", "_is_push"]]
+                    )
 
                 if not picks:
                     return None
@@ -7892,16 +9049,26 @@ class ModelTrainer:
                     label_suffix = f"{label}|forced_top_edges"
                 elif selected_threshold != min_edge:
                     label_suffix = f"{label}|thr={selected_threshold:+.3f}"
+            if synthetic_odds_used:
+                label_suffix = f"{label_suffix}|synthetic_odds"
 
             bet_count = len(picks_df)
-            returns = np.where(picks_df["side_win"] == 1, picks_df["payout"].values, -1.0)
+            returns = np.where(
+                picks_df["_is_push"],
+                0.0,
+                np.where(picks_df["side_win"] == 1, picks_df["payout"].values, -1.0),
+            )
             roi_val = float(np.mean(returns))
             m = returns.mean()
             s = returns.std(ddof=1) if bet_count > 1 else 0.0
             se = s / math.sqrt(max(bet_count, 1))
             z = 1.96
             roi_lo_val, roi_hi_val = float(m - z * se), float(m + z * se)
-            hit_val = float(np.mean(picks_df["side_win"]))
+            non_push_mask = ~picks_df["_is_push"].astype(bool)
+            if non_push_mask.any():
+                hit_val = float(np.mean(picks_df.loc[non_push_mask, "side_win"]))
+            else:
+                hit_val = float("nan")
             return {
                 "roi": roi_val,
                 "roi_lo": roi_lo_val,
@@ -7926,6 +9093,211 @@ class ModelTrainer:
                     continue
                 seen_labels.add(label)
                 evaluation = _evaluate_edges(preds_array, label)
+                if evaluation is None:
+                    continue
+                if best_option is None or evaluation["roi"] > best_option["roi"]:
+                    best_option = evaluation
+
+            if best_option is not None:
+                roi = best_option["roi"]
+                roi_lo = best_option["roi_lo"]
+                roi_hi = best_option["roi_hi"]
+                hit_rate = best_option["hit_rate"]
+                n_bets = best_option["n_bets"]
+                edge_source = best_option["label"]
+        elif baseline_reference is not None and baseline_reference.notna().any():
+            def _evaluate_numeric_edges(
+                preds_array: np.ndarray, label: str
+            ) -> Optional[Dict[str, Any]]:
+                if preds_array.size != len(out_df) or not len(out_df):
+                    return None
+
+                pred_series = pd.Series(preds_array, index=out_df.index, dtype=float)
+                baseline_series = baseline_reference.astype(float)
+                actual_series = pd.to_numeric(out_df.get(target), errors="coerce")
+
+                mask = actual_series.notna() & baseline_series.notna()
+                if "is_synthetic" in out_df.columns:
+                    mask &= ~out_df["is_synthetic"].astype(bool)
+
+                if not mask.any():
+                    return None
+
+                pred_series = pred_series.loc[mask]
+                baseline_series = baseline_series.loc[mask]
+                actual_series = actual_series.loc[mask]
+
+                residuals = (actual_series - pred_series).to_numpy(dtype=float)
+                residuals = residuals[np.isfinite(residuals)]
+                if residuals.size >= 2:
+                    sigma = float(np.std(residuals, ddof=1))
+                elif residuals.size == 1:
+                    sigma = float(abs(residuals[0]))
+                else:
+                    sigma = float("nan")
+
+                if not math.isfinite(sigma) or sigma < 1e-6:
+                    fallback_vals = actual_series.to_numpy(dtype=float)
+                    fallback_vals = fallback_vals[np.isfinite(fallback_vals)]
+                    if fallback_vals.size >= 2:
+                        sigma = float(np.std(fallback_vals, ddof=1))
+                    elif fallback_vals.size:
+                        sigma = float(max(abs(fallback_vals[0]), 1.0))
+                    else:
+                        sigma = 1.0
+
+                sigma = max(sigma, 1.0)
+
+                def _normal_cdf(z: float) -> float:
+                    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+                payout = _american_to_payout(-110.0)
+
+                def _build_numeric(threshold: float) -> Optional[pd.DataFrame]:
+                    rows: List[pd.Series] = []
+                    for idx in pred_series.index:
+                        mu = pred_series.at[idx]
+                        line_val = baseline_series.at[idx]
+                        actual_val = actual_series.at[idx]
+                        if not (math.isfinite(mu) and math.isfinite(line_val) and math.isfinite(actual_val)):
+                            continue
+
+                        z = (line_val - mu) / sigma
+                        prob_over = 1.0 - _normal_cdf(z)
+                        prob_over = float(np.clip(prob_over, 1e-6, 1 - 1e-6))
+                        prob_under = float(np.clip(1.0 - prob_over, 1e-6, 1 - 1e-6))
+
+                        ev_over = ev_of_bet(prob_over, -110.0)
+                        ev_under = ev_of_bet(prob_under, -110.0)
+
+                        if ev_over > threshold:
+                            series = pd.Series(
+                                {
+                                    "p_model": prob_over,
+                                    "side_win": 1 if actual_val > line_val else 0,
+                                    "payout": payout,
+                                    "_edge": ev_over,
+                                    "_threshold": threshold,
+                                    "_side": "over",
+                                    "_line": line_val,
+                                    "_actual": actual_val,
+                                    "_is_push": bool(np.isclose(actual_val, line_val)),
+                                }
+                            )
+                            if np.isclose(actual_val, line_val):
+                                series["side_win"] = 0
+                            rows.append(series)
+
+                        if ev_under > threshold:
+                            series = pd.Series(
+                                {
+                                    "p_model": prob_under,
+                                    "side_win": 1 if actual_val < line_val else 0,
+                                    "payout": payout,
+                                    "_edge": ev_under,
+                                    "_threshold": threshold,
+                                    "_side": "under",
+                                    "_line": line_val,
+                                    "_actual": actual_val,
+                                    "_is_push": bool(np.isclose(actual_val, line_val)),
+                                }
+                            )
+                            if np.isclose(actual_val, line_val):
+                                series["side_win"] = 0
+                            rows.append(series)
+
+                    if not rows:
+                        return None
+                    return pd.DataFrame(rows)
+
+                candidate_thresholds: List[float] = []
+                seen_thresholds: Set[float] = set()
+                for candidate in [min_edge, (min_edge * 0.5 if min_edge > 0 else None), 0.0, -0.005]:
+                    if candidate is None:
+                        continue
+                    candidate = float(candidate)
+                    if math.isnan(candidate):
+                        continue
+                    if candidate not in seen_thresholds:
+                        candidate_thresholds.append(candidate)
+                        seen_thresholds.add(candidate)
+
+                selected_threshold: Optional[float] = None
+                picks_df: Optional[pd.DataFrame] = None
+                for threshold in candidate_thresholds:
+                    candidate_df = _build_numeric(threshold)
+                    if candidate_df is not None and not candidate_df.empty:
+                        picks_df = candidate_df
+                        selected_threshold = threshold
+                        break
+
+                if picks_df is None:
+                    fallback_df = _build_numeric(float("-inf"))
+                    if fallback_df is not None and not fallback_df.empty:
+                        fallback_df = fallback_df.sort_values("_edge", ascending=False)
+                        top_n = max(1, min(5, len(fallback_df)))
+                        picks_df = fallback_df.head(top_n).reset_index(drop=True)
+                        selected_threshold = float("-inf")
+                        logging.debug("%s: forcing %d numeric bets via fallback selection", target, len(picks_df))
+
+                if picks_df is None:
+                    return None
+
+                picks_df["_is_push"] = picks_df["_is_push"].astype(bool)
+
+                label_suffix = label
+                if selected_threshold is not None:
+                    if selected_threshold == float("-inf"):
+                        label_suffix = f"{label_suffix}|forced_top_edges"
+                    elif selected_threshold != min_edge:
+                        label_suffix = f"{label_suffix}|thr={selected_threshold:+.3f}"
+                label_suffix = f"{label_suffix}|priors_baseline|synthetic_odds"
+
+                bet_count = len(picks_df)
+                returns = []
+                for _, row in picks_df.iterrows():
+                    if row["_is_push"]:
+                        returns.append(0.0)
+                    elif row["side_win"] == 1:
+                        returns.append(row["payout"])
+                    else:
+                        returns.append(-1.0)
+                returns_arr = np.asarray(returns, dtype=float)
+                roi_val = float(np.mean(returns_arr))
+                m = returns_arr.mean()
+                s = returns_arr.std(ddof=1) if bet_count > 1 else 0.0
+                se = s / math.sqrt(max(bet_count, 1))
+                z = 1.96
+                roi_lo_val, roi_hi_val = float(m - z * se), float(m + z * se)
+                non_push_mask = ~picks_df["_is_push"].astype(bool)
+                if non_push_mask.any():
+                    hit_val = float(np.mean(picks_df.loc[non_push_mask, "side_win"]))
+                else:
+                    hit_val = float("nan")
+
+                return {
+                    "roi": roi_val,
+                    "roi_lo": roi_lo_val,
+                    "roi_hi": roi_hi_val,
+                    "hit_rate": hit_val,
+                    "n_bets": bet_count,
+                    "label": label_suffix,
+                }
+
+            prediction_candidates: List[Tuple[str, np.ndarray]] = []
+            if len(out_df):
+                base_label = "calibrated" if calibration_record is not None else "model"
+                prediction_candidates.append((base_label, out_df["_y_pred"].to_numpy(dtype=float)))
+                if "_y_pred_raw" in out_df.columns:
+                    prediction_candidates.append(("raw", out_df["_y_pred_raw"].to_numpy(dtype=float)))
+
+            best_option: Optional[Dict[str, Any]] = None
+            seen_labels: Set[str] = set()
+            for label, preds_array in prediction_candidates:
+                if label in seen_labels:
+                    continue
+                seen_labels.add(label)
+                evaluation = _evaluate_numeric_edges(preds_array, label)
                 if evaluation is None:
                     continue
                 if best_option is None or evaluation["roi"] > best_option["roi"]:
