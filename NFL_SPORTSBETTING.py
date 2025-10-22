@@ -7430,6 +7430,17 @@ class ModelTrainer:
                 continue
             feature_columns.append(col)
 
+        if target.endswith("_win_prob"):
+            filtered_features: List[str] = []
+            removal_tokens = ("moneyline", "implied_prob", "line_", "spread")
+            for col in feature_columns:
+                lower = col.lower()
+                if any(token in lower for token in removal_tokens):
+                    continue
+                filtered_features.append(col)
+            if filtered_features:
+                feature_columns = filtered_features
+
         if not feature_columns:
             logging.warning("No usable numeric features available to train %s model; skipping.", target)
             return None
@@ -7619,6 +7630,7 @@ class ModelTrainer:
 
         out_df = df.iloc[idx_all].copy() if idx_all.size else df.iloc[0:0].copy()
         out_df["_y_pred"] = preds_all
+        out_df["_y_pred_raw"] = preds_all
         out_df["_abs_err"] = (out_df[target] - out_df["_y_pred"]).abs()
 
         calibration_record: Optional[Dict[str, Any]] = None
@@ -7696,50 +7708,96 @@ class ModelTrainer:
 
         # For game win-prob targets
         roi, roi_lo, roi_hi, hit_rate, n_bets = None, None, None, None, 0
-        if target.endswith("_win_prob") and {"home_moneyline", "away_moneyline"}.issubset(out_df.columns):
-            # Choose side with positive edge > min_edge
-            choose_home = out_df["_y_pred"] - out_df.get("home_implied_prob", np.nan).values
-            choose_away = (1.0 - out_df["_y_pred"]) - out_df.get("away_implied_prob", np.nan).values
+        edge_source = None
 
-            pick_home = (choose_home > min_edge) & out_df["home_moneyline"].notna()
-            pick_away = (choose_away > min_edge) & out_df["away_moneyline"].notna()
+        def _evaluate_edges(preds_array: np.ndarray, label: str) -> Optional[Dict[str, Any]]:
+            if preds_array.size != len(out_df) or not len(out_df):
+                return None
 
-            picks = []
-            # Home picks
+            pred_series = pd.Series(preds_array, index=out_df.index, dtype=float)
+            home_probs = pd.to_numeric(out_df.get("home_implied_prob"), errors="coerce")
+            away_probs = pd.to_numeric(out_df.get("away_implied_prob"), errors="coerce")
+            home_prices = pd.to_numeric(out_df.get("home_moneyline"), errors="coerce")
+            away_prices = pd.to_numeric(out_df.get("away_moneyline"), errors="coerce")
+
+            if home_probs is None or away_probs is None:
+                return None
+
+            choose_home = pred_series - home_probs
+            choose_away = (1.0 - pred_series) - away_probs
+
+            pick_home = (choose_home > min_edge) & home_prices.notna()
+            pick_away = (choose_away > min_edge) & away_prices.notna()
+
+            picks: List[pd.DataFrame] = []
+
             if pick_home.any():
-                h = out_df.loc[pick_home, ["home_moneyline", "home_team", "away_team", "home_score", "away_score", "_y_pred"]].copy()
-                h["price"] = h["home_moneyline"].astype(float)
-                h["side_win"] = (h["home_score"] > h["away_score"]).astype(int)  # realized outcome
-                h["p_model"] = h["_y_pred"].clip(0.0, 1.0)
-                h["payout"] = h["price"].map(_american_to_payout)
-                picks.append(h[["p_model", "side_win", "payout"]])
+                home_df = pd.DataFrame(index=pred_series.index[pick_home])
+                home_df["p_model"] = pred_series.loc[pick_home].clip(0.0, 1.0)
+                home_df["side_win"] = (
+                    out_df.loc[pick_home, "home_score"] > out_df.loc[pick_home, "away_score"]
+                ).astype(int)
+                home_df["payout"] = home_prices.loc[pick_home].astype(float).apply(_american_to_payout)
+                picks.append(home_df[["p_model", "side_win", "payout"]])
 
-            # Away picks
             if pick_away.any():
-                a = out_df.loc[pick_away, ["away_moneyline", "home_team", "away_team", "home_score", "away_score", "_y_pred"]].copy()
-                a["price"] = a["away_moneyline"].astype(float)
-                a["side_win"] = (a["away_score"] > a["home_score"]).astype(int)
-                a["p_model"] = (1.0 - a["_y_pred"]).clip(0.0, 1.0)
-                a["payout"] = a["price"].map(_american_to_payout)
-                picks.append(a[["p_model", "side_win", "payout"]])
+                away_df = pd.DataFrame(index=pred_series.index[pick_away])
+                away_df["p_model"] = (1.0 - pred_series.loc[pick_away]).clip(0.0, 1.0)
+                away_df["side_win"] = (
+                    out_df.loc[pick_away, "away_score"] > out_df.loc[pick_away, "home_score"]
+                ).astype(int)
+                away_df["payout"] = away_prices.loc[pick_away].astype(float).apply(_american_to_payout)
+                picks.append(away_df[["p_model", "side_win", "payout"]])
 
-            if picks:
-                picks = pd.concat(picks, ignore_index=True)
-                n_bets = len(picks)
+            if not picks:
+                return None
 
-                # 1u flat stake return per bet: +payout if win, -1 if loss
-                returns = np.where(picks["side_win"] == 1, picks["payout"].values, -1.0)
-                roi = float(np.mean(returns))  # average per-bet return (units per unit staked)
+            picks_df = pd.concat(picks, ignore_index=True)
+            bet_count = len(picks_df)
+            returns = np.where(picks_df["side_win"] == 1, picks_df["payout"].values, -1.0)
+            roi_val = float(np.mean(returns))
+            m = returns.mean()
+            s = returns.std(ddof=1) if bet_count > 1 else 0.0
+            se = s / math.sqrt(max(bet_count, 1))
+            z = 1.96
+            roi_lo_val, roi_hi_val = float(m - z * se), float(m + z * se)
+            hit_val = float(np.mean(picks_df["side_win"]))
+            return {
+                "roi": roi_val,
+                "roi_lo": roi_lo_val,
+                "roi_hi": roi_hi_val,
+                "hit_rate": hit_val,
+                "n_bets": bet_count,
+                "label": label,
+            }
 
-                # Normal-approx CI for mean with finite-sample correction
-                m = returns.mean()
-                s = returns.std(ddof=1) if n_bets > 1 else 0.0
-                z = 1.96
-                se = s / math.sqrt(max(n_bets, 1))
-                roi_lo, roi_hi = float(m - z * se), float(m + z * se)
+        if target.endswith("_win_prob") and {"home_moneyline", "away_moneyline"}.issubset(out_df.columns):
+            prediction_candidates: List[Tuple[str, np.ndarray]] = []
+            if len(out_df):
+                base_label = "calibrated" if calibration_record is not None else "model"
+                prediction_candidates.append((base_label, out_df["_y_pred"].to_numpy(dtype=float)))
+                if "_y_pred_raw" in out_df.columns:
+                    prediction_candidates.append(("raw", out_df["_y_pred_raw"].to_numpy(dtype=float)))
 
-                # Hit rate
-                hit_rate = float(np.mean(picks["side_win"]))
+            best_option: Optional[Dict[str, Any]] = None
+            seen_labels: set = set()
+            for label, preds_array in prediction_candidates:
+                if label in seen_labels:
+                    continue
+                seen_labels.add(label)
+                evaluation = _evaluate_edges(preds_array, label)
+                if evaluation is None:
+                    continue
+                if best_option is None or evaluation["roi"] > best_option["roi"]:
+                    best_option = evaluation
+
+            if best_option is not None:
+                roi = best_option["roi"]
+                roi_lo = best_option["roi_lo"]
+                roi_hi = best_option["roi_hi"]
+                hit_rate = best_option["hit_rate"]
+                n_bets = best_option["n_bets"]
+                edge_source = best_option["label"]
 
         # Persist backtest metrics per fold + overall
         for row in per_fold:
@@ -7758,6 +7816,7 @@ class ModelTrainer:
                 "roi_ci": (roi_lo, roi_hi) if roi_lo is not None else None,
                 "hit_rate": hit_rate,
                 "bets": n_bets,
+                "edge_source": edge_source,
                 "mode": evaluation_mode,
             }
         else:
@@ -7771,12 +7830,13 @@ class ModelTrainer:
                 "roi_ci": (roi_lo, roi_hi) if roi_lo is not None else None,
                 "hit_rate": hit_rate,
                 "bets": n_bets,
+                "edge_source": edge_source,
                 "mode": evaluation_mode,
             }
         self.db.record_backtest_metrics(self.run_id, target, summary, sample_size=int(len(out_df)))
 
         logging.info(
-            "%s %s | folds=%d | MAE=%.3f | RMSE=%.3f | MAE_vs_close=%s | ROI=%s (CI=%s) | bets=%d",
+            "%s %s | folds=%d | MAE=%.3f | RMSE=%.3f | MAE_vs_close=%s | ROI=%s (CI=%s) | bets=%d | edge_source=%s",
             target,
             evaluation_mode,
             summary["folds"],
@@ -7786,6 +7846,7 @@ class ModelTrainer:
             f"{summary['roi']:.3f}" if summary["roi"] is not None else "n/a",
             f"({summary['roi_ci'][0]:.3f},{summary['roi_ci'][1]:.3f})" if summary["roi_ci"] else "n/a",
             summary["bets"],
+            summary.get("edge_source") or "n/a",
         )
 
         # ---- Deployment guard: beat the vig with lower CI bound ----
