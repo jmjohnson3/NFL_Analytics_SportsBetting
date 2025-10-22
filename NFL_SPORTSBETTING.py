@@ -26,6 +26,7 @@ import logging
 import math
 import os
 import re
+import ssl
 import time
 import unicodedata
 import uuid
@@ -40,6 +41,8 @@ import aiohttp
 import numpy as np
 import pandas as pd
 import requests
+from aiohttp import client_exceptions
+import certifi
 from requests import HTTPError
 from requests.auth import HTTPBasicAuth
 from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
@@ -1380,6 +1383,8 @@ async def _odds_get_json(
     session: aiohttp.ClientSession,
     path: str,
     api_key: Optional[str],
+    *,
+    allow_insecure_ssl: bool,
     **params: Any,
 ) -> Optional[Any]:
     params = {"apiKey": api_key or ODDS_API_KEY, **params}
@@ -1391,6 +1396,11 @@ async def _odds_get_json(
                 odds_logger.warning("Odds GET %s -> %s\n%s", response.status, url, text[:600])
                 return None
             return await response.json()
+    except client_exceptions.ClientConnectorCertificateError:
+        if not allow_insecure_ssl:
+            raise
+        odds_logger.exception("GET failed: %s", url)
+        return None
     except Exception:
         odds_logger.exception("GET failed: %s", url)
         return None
@@ -1404,6 +1414,7 @@ async def odds_fetch_game_odds(
     markets: Sequence[str] | str = ("h2h", "spreads", "totals"),
     odds_format: str = ODDS_FORMAT,
     date_format: str = "iso",
+    allow_insecure_ssl: bool = False,
 ) -> pd.DataFrame:
     regions_param = ",".join(regions) if isinstance(regions, (list, tuple)) else regions
     markets_param = ",".join(markets) if isinstance(markets, (list, tuple)) else markets
@@ -1412,6 +1423,7 @@ async def odds_fetch_game_odds(
         session,
         f"/sports/{NFL_SPORT_KEY}/odds",
         api_key,
+        allow_insecure_ssl=allow_insecure_ssl,
         regions=regions_param,
         markets=markets_param,
         oddsFormat=odds_format,
@@ -1484,6 +1496,7 @@ async def odds_fetch_prop_odds(
     regions: Sequence[str] | str = ("us", "us2"),
     odds_format: str = ODDS_FORMAT,
     date_format: str = "iso",
+    allow_insecure_ssl: bool = False,
 ) -> pd.DataFrame:
     if isinstance(event_ids, str):
         event_ids = [event_ids]
@@ -1514,6 +1527,7 @@ async def odds_fetch_prop_odds(
             session,
             f"/sports/{NFL_SPORT_KEY}/events/{event_id}/odds",
             api_key,
+            allow_insecure_ssl=allow_insecure_ssl,
             regions=regions_param,
             markets=prop_markets,
             oddsFormat=odds_format,
@@ -3131,6 +3145,17 @@ class OddsApiClient:
         self.timeout = timeout
         self.allow_insecure_ssl = allow_insecure_ssl
 
+    def _build_connector(self, allow_insecure: bool) -> Optional[aiohttp.TCPConnector]:
+        if allow_insecure:
+            return aiohttp.TCPConnector(ssl=False)
+        try:
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ssl_context = None
+        if ssl_context is None:
+            return None
+        return aiohttp.TCPConnector(ssl=ssl_context)
+
     @staticmethod
     def _normalize_bound(value: Optional[dt.datetime]) -> Optional[dt.datetime]:
         if value is None:
@@ -3314,58 +3339,70 @@ class OddsApiClient:
     ) -> List[Dict[str, Any]]:
         api_key = self.api_key or ODDS_API_KEY
         timeout = aiohttp.ClientTimeout(total=self.timeout)
-        connector: Optional[aiohttp.TCPConnector] = None
-        if self.allow_insecure_ssl:
-            connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            game_df = await odds_fetch_game_odds(
-                session,
-                api_key=api_key,
-                regions=ODDS_REGIONS,
-                markets=ODDS_DEFAULT_MARKETS,
-                odds_format=ODDS_FORMAT,
-            )
-            if not game_df.empty:
-                game_df['commence_dt'] = pd.to_datetime(
-                    game_df['commence_time'], errors='coerce', utc=True
+
+        async def run_fetch(allow_insecure: bool) -> List[Dict[str, Any]]:
+            connector = self._build_connector(allow_insecure)
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                game_df = await odds_fetch_game_odds(
+                    session,
+                    api_key=api_key,
+                    regions=ODDS_REGIONS,
+                    markets=ODDS_DEFAULT_MARKETS,
+                    odds_format=ODDS_FORMAT,
+                    allow_insecure_ssl=allow_insecure,
                 )
-                start_bound = self._normalize_bound(start)
-                end_bound = self._normalize_bound(end)
-                if start_bound is not None:
-                    game_df = game_df[game_df['commence_dt'] >= start_bound]
-                if end_bound is not None:
-                    game_df = game_df[game_df['commence_dt'] <= end_bound]
-            prop_df = pd.DataFrame()
-            if include_player_props:
-                if not game_df.empty and 'event_id' in game_df.columns:
-                    event_ids = (
-                        game_df['event_id']
-                        .dropna()
-                        .astype(str)
-                        .drop_duplicates()
-                        .tolist()
+                if not game_df.empty:
+                    game_df['commence_dt'] = pd.to_datetime(
+                        game_df['commence_time'], errors='coerce', utc=True
                     )
-                else:
-                    event_ids = []
-                if event_ids:
-                    prop_df = await odds_fetch_prop_odds(
-                        session,
-                        api_key=api_key,
-                        event_ids=event_ids,
-                        regions=ODDS_REGIONS,
-                        odds_format=ODDS_FORMAT,
-                    )
-                    if not prop_df.empty:
-                        prop_df['commence_dt'] = pd.to_datetime(
-                            prop_df['commence_time'], errors='coerce', utc=True
+                    start_bound = self._normalize_bound(start)
+                    end_bound = self._normalize_bound(end)
+                    if start_bound is not None:
+                        game_df = game_df[game_df['commence_dt'] >= start_bound]
+                    if end_bound is not None:
+                        game_df = game_df[game_df['commence_dt'] <= end_bound]
+                prop_df = pd.DataFrame()
+                if include_player_props:
+                    if not game_df.empty and 'event_id' in game_df.columns:
+                        event_ids = (
+                            game_df['event_id']
+                            .dropna()
+                            .astype(str)
+                            .drop_duplicates()
+                            .tolist()
                         )
-                        start_bound = self._normalize_bound(start)
-                        end_bound = self._normalize_bound(end)
-                        if start_bound is not None:
-                            prop_df = prop_df[prop_df['commence_dt'] >= start_bound]
-                        if end_bound is not None:
-                            prop_df = prop_df[prop_df['commence_dt'] <= end_bound]
-            return self._assemble_events(game_df, prop_df, start, end)
+                    else:
+                        event_ids = []
+                    if event_ids:
+                        prop_df = await odds_fetch_prop_odds(
+                            session,
+                            api_key=api_key,
+                            event_ids=event_ids,
+                            regions=ODDS_REGIONS,
+                            odds_format=ODDS_FORMAT,
+                            allow_insecure_ssl=allow_insecure,
+                        )
+                        if not prop_df.empty:
+                            prop_df['commence_dt'] = pd.to_datetime(
+                                prop_df['commence_time'], errors='coerce', utc=True
+                            )
+                            start_bound = self._normalize_bound(start)
+                            end_bound = self._normalize_bound(end)
+                            if start_bound is not None:
+                                prop_df = prop_df[prop_df['commence_dt'] >= start_bound]
+                            if end_bound is not None:
+                                prop_df = prop_df[prop_df['commence_dt'] <= end_bound]
+                return self._assemble_events(game_df, prop_df, start, end)
+
+        try:
+            return await run_fetch(self.allow_insecure_ssl)
+        except client_exceptions.ClientConnectorCertificateError:
+            if self.allow_insecure_ssl:
+                raise
+            odds_logger.warning(
+                "SSL verification failed when fetching odds; retrying with certificate verification disabled"
+            )
+            return await run_fetch(True)
 
     def fetch_odds(
         self,
