@@ -1322,6 +1322,9 @@ ODDS_DEFAULT_MARKETS = [
     "h2h",
     "totals",
 ]
+# TODO: Expand the TARGET_MARKET_INFO-style metadata (see PLAYER_PROP_MARKET_COLUMN_MAP
+# below) once we confirm additional prop coverage from the Odds API. The current list
+# intentionally mirrors the minimal set of live markets that we have verified so far.
 ODDS_PLAYER_PROP_MARKETS = [
     "player_pass_tds",
     "player_pass_yds",
@@ -1358,6 +1361,10 @@ ODDS_PLAYER_PROP_MARKET_SYNONYMS = {
     "player_receiving_yds": "player_reception_yds",
 }
 
+# TODO: The downstream ROI evaluation expects every supported market to surface both
+# live odds and historical closing lines. Audit this mapping once live prices flow
+# consistently so the feature matrix exposes the same set of columns that the odds
+# ingestion produces.
 PLAYER_PROP_MARKET_COLUMN_MAP = {
     "player_pass_tds": "line_passing_tds",
     "player_pass_yds": "line_passing_yards",
@@ -1829,6 +1836,21 @@ async def odds_fetch_prop_odds(
         *(fetch_event(event_id) for event_id in event_ids), return_exceptions=False
     )
 
+    missing_events = [
+        event_id for event_id, payload in zip(event_ids, results) if not payload
+    ]
+    if missing_events:
+        sample = ", ".join(missing_events[:3])
+        if len(missing_events) > 3:
+            sample = f"{sample}, …"
+        odds_logger.info(
+            "Live prop odds missing for %d event(s) (sample: %s | markets=%s | bookmakers=%s)",
+            len(missing_events),
+            sample or "n/a",
+            ",".join(request_markets),
+            bookmakers_param or "default",
+        )
+
     rows: List[Dict[str, Any]] = []
     for event_id, payload in zip(event_ids, results):
         if not payload:
@@ -1875,6 +1897,12 @@ async def odds_fetch_prop_odds(
 
     frame = pd.DataFrame(rows)
     if frame.empty:
+        odds_logger.debug(
+            "Odds API returned zero player prop rows for %d event(s) | markets=%s | bookmakers=%s",
+            len(event_ids),
+            ",".join(request_markets),
+            bookmakers_param or "default",
+        )
         return frame
 
     frame["decimal_odds"] = frame["american_odds"].apply(odds_american_to_decimal)
@@ -3747,6 +3775,9 @@ class OddsApiClient:
 
         event_meta: Dict[str, Dict[str, Any]] = {}
 
+        # TODO: Guard against index alignment issues here. The Odds API can drop games
+        # between calls, so any upstream filtering that mutates ``frame.index`` risks
+        # leaking stale labels into ``event_meta`` if we ever rely on positional joins.
         def update_meta(frame: pd.DataFrame) -> None:
             if frame is None or frame.empty:
                 return
@@ -9790,6 +9821,10 @@ class ModelTrainer:
             valid_mask = (home_valid | away_valid) & results_mask
 
             synthetic_odds_used = False
+            # TODO: Ensure historical odds are persisted prior to evaluation so that
+            # live ROI metrics no longer rely on this synthetic -110 moneyline
+            # fallback. Once genuine prices are available, this branch should become
+            # an explicit opt-in emergency path.
             if not valid_mask.any():
                 logging.debug(
                     "%s: no rows with market odds; using synthetic -110 moneylines for diagnostics",
@@ -11735,6 +11770,9 @@ def main() -> None:
     )
     supplemental_loader = SupplementalDataLoader(config)
 
+    # TODO: Backfill automated regression tests that exercise the Odds API ingestion
+    # and ROI evaluation pipeline once live prop feeds are verified. The current
+    # integration path is only covered by manual end-to-end runs.
     ingestor = NFLIngestor(db, msf_client, odds_client, supplemental_loader)
     ingestor.ingest(config.seasons)
 
