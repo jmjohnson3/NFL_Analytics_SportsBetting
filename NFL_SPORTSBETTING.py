@@ -1313,13 +1313,27 @@ NFL_API_PASS = "MYSPORTSFEEDS"
 ODDS_API_KEY = "5b6f0290e265c3329b3ed27897d79eaf"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 NFL_SPORT_KEY = "americanfootball_nfl"
-ODDS_REGIONS = ["us"]
+ODDS_GAME_REGIONS = ["us"]
+ODDS_PROP_REGIONS = ["us", "us2"]
 ODDS_FORMAT = "american"
 ODDS_DEFAULT_MARKETS = [
     "h2h",
     "totals",
 ]
 ODDS_PLAYER_PROP_MARKETS = [
+    "player_pass_tds",
+    "player_pass_yds",
+    "player_rush_tds",
+    "player_rush_yds",
+    "player_receptions",
+    "player_reception_yds",
+    "player_anytime_td",
+]
+
+# Explicit list of market keys to request from the Odds API. Keeping this separate from
+# the canonical list prevents synonyms (e.g. ``*_yards``) from sneaking into outbound
+# requests, which previously triggered HTTP 422 errors.
+ODDS_PLAYER_PROP_MARKET_REQUEST_KEYS: List[str] = [
     "player_pass_tds",
     "player_pass_yds",
     "player_rush_tds",
@@ -1377,7 +1391,7 @@ ODDS_MARKET_CANONICAL_MAP = {
     "player_anytime_td": "ANY_TD",
 }
 
-ODDS_PROP_MAX_CONCURRENCY = 4
+ODDS_PROP_MAX_CONCURRENCY = 1
 
 odds_logger = logging.getLogger(__name__)
 
@@ -1398,11 +1412,104 @@ def odds_american_to_prob(american: float) -> float:
     return 1.0 / odds_american_to_decimal(american)
 
 
+def odds_normalize_datetime(value: Optional[dt.datetime]) -> Optional[dt.datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone(dt.timezone.utc)
+
+
+def odds_isoformat(value: Optional[dt.datetime]) -> Optional[str]:
+    normalized = odds_normalize_datetime(value)
+    if normalized is None:
+        return None
+    return normalized.isoformat().replace("+00:00", "Z")
+
+
 def _odds_build_url(path: str, params: Dict[str, Any]) -> str:
     base = ODDS_BASE.rstrip("/")
     if not path.startswith("/"):
         path = "/" + path
     return f"{base}{path}?{urlencode(params, doseq=True)}"
+
+
+def _merge_odds_event_payload(
+    base: Optional[Dict[str, Any]], addition: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Combine two Odds API event payloads, keeping the most recent bookmaker data."""
+
+    if base is None:
+        return addition
+    if addition is None or base is addition:
+        return base
+
+    base.setdefault("bookmakers", [])
+    addition_bookmakers = addition.get("bookmakers") or []
+
+    for key in ["id", "sport_key", "commence_time", "home_team", "away_team"]:
+        if not base.get(key) and addition.get(key):
+            base[key] = addition.get(key)
+
+    bookmaker_map: Dict[str, Dict[str, Any]] = {}
+    for bookmaker in base.get("bookmakers", []):
+        book_key = bookmaker.get("key") or bookmaker.get("title")
+        if not book_key:
+            continue
+        bookmaker.setdefault("markets", [])
+        bookmaker_map[book_key] = bookmaker
+
+    for add_book in addition_bookmakers:
+        book_key = add_book.get("key") or add_book.get("title")
+        if not book_key:
+            continue
+        add_book.setdefault("markets", [])
+        existing = bookmaker_map.get(book_key)
+        if existing is None:
+            base["bookmakers"].append(add_book)
+            bookmaker_map[book_key] = add_book
+            continue
+
+        existing_last = parse_dt(existing.get("last_update")) if existing.get("last_update") else None
+        addition_last = parse_dt(add_book.get("last_update")) if add_book.get("last_update") else None
+        if addition_last and (existing_last is None or addition_last > existing_last):
+            existing["last_update"] = add_book.get("last_update")
+
+        market_map = {
+            (market.get("key") or "").lower(): market for market in existing.get("markets", []) or []
+        }
+        for add_market in add_book.get("markets", []) or []:
+            market_key = (add_market.get("key") or "").lower()
+            if not market_key:
+                continue
+            target_market = market_map.get(market_key)
+            if target_market is None:
+                existing.setdefault("markets", []).append(add_market)
+                market_map[market_key] = add_market
+                continue
+
+            existing_outcomes = target_market.get("outcomes") or []
+            outcome_map = {
+                (
+                    outcome.get("name"),
+                    outcome.get("description"),
+                    outcome.get("participant"),
+                ): outcome
+                for outcome in existing_outcomes
+            }
+            for add_outcome in add_market.get("outcomes", []) or []:
+                key = (
+                    add_outcome.get("name"),
+                    add_outcome.get("description"),
+                    add_outcome.get("participant"),
+                )
+                if key in outcome_map:
+                    outcome_map[key].update({k: v for k, v in add_outcome.items() if v is not None})
+                else:
+                    existing_outcomes.append(add_outcome)
+            target_market["outcomes"] = existing_outcomes
+
+    return base
 
 
 async def _odds_get_json(
@@ -1481,6 +1588,7 @@ async def odds_fetch_game_odds(
 
         for bookmaker in event.get("bookmakers", []) or []:
             book_key = bookmaker.get("key") or bookmaker.get("title")
+            last_update = bookmaker.get("last_update") or bookmaker.get("lastUpdate")
             for market in bookmaker.get("markets", []) or []:
                 market_key = str(market.get("key", "")).lower()
                 market_label = ODDS_MARKET_CANONICAL_MAP.get(market_key, market_key.upper())
@@ -1500,6 +1608,7 @@ async def odds_fetch_game_odds(
                             "side": outcome_name,
                             "line": float(line) if line is not None else np.nan,
                             "american_odds": float(price) if price is not None else np.nan,
+                            "last_update": last_update,
                         }
                     )
 
@@ -1511,6 +1620,8 @@ async def odds_fetch_game_odds(
     frame["imp_prob"] = frame["american_odds"].apply(odds_american_to_prob)
     if "line" in frame.columns:
         frame["line"] = pd.to_numeric(frame["line"], errors="coerce")
+    if "last_update" in frame.columns:
+        frame["last_update"] = frame["last_update"].astype(str)
     return frame.reset_index(drop=True)
 
 
@@ -1546,22 +1657,41 @@ async def odds_fetch_prop_odds(
         )
 
     regions_param = ",".join(regions) if isinstance(regions, (list, tuple)) else regions
-    prop_markets = ",".join(sorted(set(ODDS_PLAYER_PROP_MARKETS)))
+    request_markets = list(ODDS_PLAYER_PROP_MARKET_REQUEST_KEYS)
 
     semaphore = asyncio.Semaphore(max(1, ODDS_PROP_MAX_CONCURRENCY))
 
     async def fetch_event(event_id: str) -> Optional[Any]:
         async with semaphore:
-            return await _odds_get_json(
-                session,
-                f"/sports/{NFL_SPORT_KEY}/events/{event_id}/odds",
-                api_key,
-                allow_insecure_ssl=allow_insecure_ssl,
-                regions=regions_param,
-                markets=prop_markets,
-                oddsFormat=odds_format,
-                dateFormat=date_format,
-            )
+            async def fetch_subset(markets: Sequence[str]) -> Optional[Any]:
+                if not markets:
+                    return None
+                payload = await _odds_get_json(
+                    session,
+                    f"/sports/{NFL_SPORT_KEY}/events/{event_id}/odds",
+                    api_key,
+                    allow_insecure_ssl=allow_insecure_ssl,
+                    regions=regions_param,
+                    markets=",".join(markets),
+                    oddsFormat=odds_format,
+                    dateFormat=date_format,
+                )
+                await asyncio.sleep(0.3)
+                if payload:
+                    return payload
+                if len(markets) == 1:
+                    odds_logger.debug(
+                        "Odds API did not return data for prop market %s on event %s",
+                        markets[0],
+                        event_id,
+                    )
+                    return None
+                split = max(1, len(markets) // 2)
+                left = await fetch_subset(markets[:split])
+                right = await fetch_subset(markets[split:])
+                return _merge_odds_event_payload(left, right)
+
+            return await fetch_subset(request_markets)
 
     results = await asyncio.gather(
         *(fetch_event(event_id) for event_id in event_ids), return_exceptions=False
@@ -1606,6 +1736,8 @@ async def odds_fetch_prop_odds(
                             "side": side,
                             "line": float(line) if line is not None else np.nan,
                             "american_odds": float(price),
+                            "last_update": bookmaker.get("last_update")
+                            or bookmaker.get("lastUpdate"),
                         }
                     )
 
@@ -1617,7 +1749,169 @@ async def odds_fetch_prop_odds(
     frame["imp_prob"] = frame["american_odds"].apply(odds_american_to_prob)
     if "line" in frame.columns:
         frame["line"] = pd.to_numeric(frame["line"], errors="coerce")
+    if "last_update" in frame.columns:
+        frame["last_update"] = frame["last_update"].astype(str)
     return frame.reset_index(drop=True)
+
+
+async def odds_fetch_events_range(
+    session: aiohttp.ClientSession,
+    *,
+    api_key: Optional[str],
+    start: Optional[dt.datetime],
+    end: Optional[dt.datetime],
+    date_format: str = "iso",
+    allow_insecure_ssl: bool = False,
+) -> pd.DataFrame:
+    start_dt = odds_normalize_datetime(start) or (default_now_utc() - dt.timedelta(days=7))
+    end_dt = odds_normalize_datetime(end) or (start_dt + dt.timedelta(days=14))
+    if end_dt < start_dt:
+        start_dt, end_dt = end_dt, start_dt
+
+    rows: List[Dict[str, Any]] = []
+    current_date = start_dt.date()
+    end_date = end_dt.date()
+
+    while current_date <= end_date:
+        day_start = dt.datetime.combine(current_date, dt.time.min, tzinfo=dt.timezone.utc)
+        day_end = day_start + dt.timedelta(days=1)
+        payload = await _odds_get_json(
+            session,
+            f"/sports/{NFL_SPORT_KEY}/events",
+            api_key,
+            allow_insecure_ssl=allow_insecure_ssl,
+            dateFormat=date_format,
+            commenceTimeFrom=odds_isoformat(day_start),
+            commenceTimeTo=odds_isoformat(day_end),
+        )
+        if payload:
+            for event in payload:
+                rows.append(
+                    {
+                        "event_id": str(event.get("id") or ""),
+                        "commence_time": event.get("commence_time")
+                        or event.get("commenceTime"),
+                        "home_team": event.get("home_team") or event.get("homeTeam"),
+                        "away_team": event.get("away_team") or event.get("awayTeam"),
+                    }
+                )
+        await asyncio.sleep(0.25)
+        current_date += dt.timedelta(days=1)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df[df["event_id"].astype(bool)]
+    df = df.drop_duplicates(subset=["event_id"], keep="last")
+    df["commence_dt"] = pd.to_datetime(df["commence_time"], errors="coerce", utc=True)
+    return df.reset_index(drop=True)
+
+
+async def odds_fetch_event_game_markets(
+    session: aiohttp.ClientSession,
+    event_ids: Sequence[str] | str,
+    *,
+    api_key: Optional[str],
+    regions: Sequence[str] | str = ("us",),
+    markets: Sequence[str] | str = ("h2h", "totals"),
+    odds_format: str = ODDS_FORMAT,
+    date_format: str = "iso",
+    allow_insecure_ssl: bool = False,
+) -> pd.DataFrame:
+    if isinstance(event_ids, str):
+        event_ids = [event_ids]
+    event_ids = [event_id for event_id in (event_ids or []) if event_id]
+    if not event_ids:
+        return pd.DataFrame(
+            columns=[
+                "event_id",
+                "commence_time",
+                "home_team",
+                "away_team",
+                "book",
+                "market",
+                "side",
+                "line",
+                "american_odds",
+                "decimal_odds",
+                "imp_prob",
+                "last_update",
+            ]
+        )
+
+    regions_param = ",".join(regions) if isinstance(regions, (list, tuple)) else regions
+    markets_param = ",".join(markets) if isinstance(markets, (list, tuple)) else markets
+    markets_filter = {
+        m.lower() for m in (markets if isinstance(markets, (list, tuple)) else [markets])
+    }
+
+    semaphore = asyncio.Semaphore(2)
+
+    async def fetch_event(event_id: str) -> Optional[Any]:
+        async with semaphore:
+            payload = await _odds_get_json(
+                session,
+                f"/sports/{NFL_SPORT_KEY}/events/{event_id}/odds",
+                api_key,
+                allow_insecure_ssl=allow_insecure_ssl,
+                regions=regions_param,
+                markets=markets_param,
+                oddsFormat=odds_format,
+                dateFormat=date_format,
+            )
+            await asyncio.sleep(0.25)
+            return payload
+
+    results = await asyncio.gather(
+        *(fetch_event(event_id) for event_id in event_ids), return_exceptions=False
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for event_id, payload in zip(event_ids, results):
+        if not payload:
+            continue
+        home_team = payload.get("home_team") or payload.get("homeTeam")
+        away_team = payload.get("away_team") or payload.get("awayTeam")
+        commence_time = payload.get("commence_time") or payload.get("commenceTime")
+
+        for bookmaker in payload.get("bookmakers", []) or []:
+            book_key = bookmaker.get("key") or bookmaker.get("title")
+            last_update = bookmaker.get("last_update") or bookmaker.get("lastUpdate")
+            for market in bookmaker.get("markets", []) or []:
+                market_key = str(market.get("key", "")).lower()
+                if market_key not in markets_filter:
+                    continue
+                market_label = ODDS_MARKET_CANONICAL_MAP.get(market_key, market_key.upper())
+                for outcome in market.get("outcomes", []) or []:
+                    outcome_name = outcome.get("name")
+                    price = outcome.get("price")
+                    line = outcome.get("point") or outcome.get("total") or outcome.get("handicap")
+                    rows.append(
+                        {
+                            "event_id": event_id,
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "commence_time": commence_time,
+                            "book": book_key,
+                            "market": market_label,
+                            "side": outcome_name,
+                            "line": float(line) if line is not None else np.nan,
+                            "american_odds": float(price) if price is not None else np.nan,
+                            "last_update": last_update,
+                        }
+                    )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["decimal_odds"] = df["american_odds"].apply(odds_american_to_decimal)
+    df["imp_prob"] = df["american_odds"].apply(odds_american_to_prob)
+    if "line" in df.columns:
+        df["line"] = pd.to_numeric(df["line"], errors="coerce")
+    df["commence_dt"] = pd.to_datetime(df["commence_time"], errors="coerce", utc=True)
+    if "last_update" in df.columns:
+        df["last_update"] = df["last_update"].astype(str)
+    return df.reset_index(drop=True)
 
 def env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -3303,6 +3597,23 @@ class OddsApiClient:
                 book['markets'].append(market_struct)
             market_struct['outcomes'].append(outcome)
 
+        def assign_last_update(book: Dict[str, Any], raw_value: Any) -> None:
+            if raw_value is None:
+                return
+            if isinstance(raw_value, float) and math.isnan(raw_value):
+                return
+            if isinstance(raw_value, pd.Timestamp):
+                iso_val = self._to_iso(raw_value.to_pydatetime())
+            elif isinstance(raw_value, dt.datetime):
+                iso_val = self._to_iso(raw_value)
+            else:
+                text = str(raw_value).strip()
+                if not text or text.lower() == 'nan':
+                    return
+                iso_val = text
+            if iso_val:
+                book['last_update'] = iso_val
+
         if game_df is not None and not game_df.empty:
             for _, row in game_df.iterrows():
                 eid = str(row.get('event_id') or '')
@@ -3313,6 +3624,7 @@ class OddsApiClient:
                 if pd.isna(price):
                     continue
                 book = get_bookmaker(eid, book_name)
+                assign_last_update(book, row.get('last_update'))
                 market_key = normalize_market(str(row.get('market') or ''))
                 outcome: Dict[str, Any] = {
                     'name': row.get('side'),
@@ -3335,6 +3647,7 @@ class OddsApiClient:
                 if pd.isna(price):
                     continue
                 book = get_bookmaker(eid, book_name)
+                assign_last_update(book, row.get('last_update'))
                 market_key = normalize_market(str(row.get('market') or ''))
                 outcome: Dict[str, Any] = {
                     'name': row.get('side'),
@@ -3371,6 +3684,7 @@ class OddsApiClient:
         start: Optional[dt.datetime],
         end: Optional[dt.datetime],
         include_player_props: bool,
+        include_historical: bool,
     ) -> List[Dict[str, Any]]:
         api_key = self.api_key or ODDS_API_KEY
         timeout = aiohttp.ClientTimeout(total=self.timeout)
@@ -3381,7 +3695,7 @@ class OddsApiClient:
                 game_df = await odds_fetch_game_odds(
                     session,
                     api_key=api_key,
-                    regions=ODDS_REGIONS,
+                    regions=ODDS_GAME_REGIONS,
                     markets=ODDS_DEFAULT_MARKETS,
                     odds_format=ODDS_FORMAT,
                     allow_insecure_ssl=allow_insecure,
@@ -3390,6 +3704,74 @@ class OddsApiClient:
                     game_df['commence_dt'] = pd.to_datetime(
                         game_df['commence_time'], errors='coerce', utc=True
                     )
+                    start_bound = self._normalize_bound(start)
+                    end_bound = self._normalize_bound(end)
+                    if start_bound is not None:
+                        game_df = game_df[game_df['commence_dt'] >= start_bound]
+                    if end_bound is not None:
+                        game_df = game_df[game_df['commence_dt'] <= end_bound]
+                events_meta = pd.DataFrame()
+                if include_historical:
+                    events_meta = await odds_fetch_events_range(
+                        session,
+                        api_key=api_key,
+                        start=start,
+                        end=end,
+                        allow_insecure_ssl=allow_insecure,
+                    )
+                    if not events_meta.empty:
+                        events_meta['event_id'] = events_meta['event_id'].astype(str)
+                        events_meta['commence_dt'] = pd.to_datetime(
+                            events_meta['commence_time'], errors='coerce', utc=True
+                        )
+                        existing_ids: Set[str] = set()
+                        if not game_df.empty and 'event_id' in game_df.columns:
+                            existing_ids = set(game_df['event_id'].dropna().astype(str))
+                        hist_event_ids = [
+                            eid for eid in events_meta['event_id'] if eid and eid not in existing_ids
+                        ]
+                        if hist_event_ids:
+                            history_games = await odds_fetch_event_game_markets(
+                                session,
+                                api_key=api_key,
+                                event_ids=hist_event_ids,
+                                regions=ODDS_GAME_REGIONS,
+                                markets=ODDS_DEFAULT_MARKETS,
+                                odds_format=ODDS_FORMAT,
+                                allow_insecure_ssl=allow_insecure,
+                            )
+                            if not history_games.empty:
+                                history_games = history_games.merge(
+                                    events_meta[
+                                        [
+                                            'event_id',
+                                            'home_team',
+                                            'away_team',
+                                            'commence_time',
+                                            'commence_dt',
+                                        ]
+                                    ],
+                                    on='event_id',
+                                    how='left',
+                                    suffixes=('', '_meta'),
+                                )
+                                for column in ['home_team', 'away_team', 'commence_time', 'commence_dt']:
+                                    meta_col = f"{column}_meta"
+                                    if meta_col in history_games.columns:
+                                        history_games[column] = history_games[column].fillna(
+                                            history_games[meta_col]
+                                        )
+                                        history_games.drop(columns=[meta_col], inplace=True)
+                                if 'commence_dt' in history_games.columns:
+                                    history_games['commence_dt'] = pd.to_datetime(
+                                        history_games['commence_dt'], errors='coerce', utc=True
+                                    )
+                                game_df = (
+                                    pd.concat([game_df, history_games], ignore_index=True)
+                                    if not game_df.empty
+                                    else history_games
+                                )
+                if not game_df.empty:
                     start_bound = self._normalize_bound(start)
                     end_bound = self._normalize_bound(end)
                     if start_bound is not None:
@@ -3413,7 +3795,7 @@ class OddsApiClient:
                             session,
                             api_key=api_key,
                             event_ids=event_ids,
-                            regions=ODDS_REGIONS,
+                            regions=ODDS_PROP_REGIONS,
                             odds_format=ODDS_FORMAT,
                             allow_insecure_ssl=allow_insecure,
                         )
@@ -3427,6 +3809,67 @@ class OddsApiClient:
                                 prop_df = prop_df[prop_df['commence_dt'] >= start_bound]
                             if end_bound is not None:
                                 prop_df = prop_df[prop_df['commence_dt'] <= end_bound]
+                    if include_historical and not events_meta.empty:
+                        hist_prop_ids = [
+                            eid
+                            for eid in events_meta['event_id']
+                            if eid and (prop_df.empty or eid not in set(prop_df['event_id'].astype(str)))
+                        ]
+                        if hist_prop_ids:
+                            history_props = await odds_fetch_prop_odds(
+                                session,
+                                api_key=api_key,
+                                event_ids=hist_prop_ids,
+                                regions=ODDS_PROP_REGIONS,
+                                odds_format=ODDS_FORMAT,
+                                allow_insecure_ssl=allow_insecure,
+                            )
+                            if not history_props.empty:
+                                history_props = history_props.merge(
+                                    events_meta[
+                                        [
+                                            'event_id',
+                                            'home_team',
+                                            'away_team',
+                                            'commence_time',
+                                            'commence_dt',
+                                        ]
+                                    ],
+                                    on='event_id',
+                                    how='left',
+                                    suffixes=('', '_meta'),
+                                )
+                                for column in ['home_team', 'away_team', 'commence_time', 'commence_dt']:
+                                    meta_col = f"{column}_meta"
+                                    if meta_col in history_props.columns:
+                                        history_props[column] = history_props[column].fillna(
+                                            history_props[meta_col]
+                                        )
+                                        history_props.drop(columns=[meta_col], inplace=True)
+                                if 'commence_time' in history_props.columns:
+                                    history_props['commence_dt'] = pd.to_datetime(
+                                        history_props['commence_time'], errors='coerce', utc=True
+                                    )
+                                if start_bound is not None:
+                                    history_props = history_props[
+                                        history_props['commence_dt'] >= start_bound
+                                    ]
+                                if end_bound is not None:
+                                    history_props = history_props[
+                                        history_props['commence_dt'] <= end_bound
+                                    ]
+                                prop_df = (
+                                    pd.concat([prop_df, history_props], ignore_index=True)
+                                    if not prop_df.empty
+                                    else history_props
+                                )
+                if not prop_df.empty and 'commence_dt' in prop_df.columns:
+                    start_bound = self._normalize_bound(start)
+                    end_bound = self._normalize_bound(end)
+                    if start_bound is not None:
+                        prop_df = prop_df[prop_df['commence_dt'] >= start_bound]
+                    if end_bound is not None:
+                        prop_df = prop_df[prop_df['commence_dt'] <= end_bound]
                 return self._assemble_events(game_df, prop_df, start, end)
 
         try:
@@ -3449,13 +3892,23 @@ class OddsApiClient:
     ) -> List[Dict[str, Any]]:
         try:
             return asyncio.run(
-                self._fetch_async(start=start, end=end, include_player_props=include_player_props)
+                self._fetch_async(
+                    start=start,
+                    end=end,
+                    include_player_props=include_player_props,
+                    include_historical=include_historical,
+                )
             )
         except RuntimeError:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 return loop.run_until_complete(
-                    self._fetch_async(start=start, end=end, include_player_props=include_player_props)
+                    self._fetch_async(
+                        start=start,
+                        end=end,
+                        include_player_props=include_player_props,
+                        include_historical=include_historical,
+                    )
                 )
             raise
 
