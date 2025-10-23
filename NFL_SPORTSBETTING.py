@@ -1625,6 +1625,65 @@ async def odds_fetch_game_odds(
     return frame.reset_index(drop=True)
 
 
+async def _odds_fetch_event_history(
+    session: aiohttp.ClientSession,
+    event_id: str,
+    *,
+    api_key: Optional[str],
+    regions: Sequence[str] | str,
+    markets: Sequence[str] | str,
+    odds_format: str,
+    date_format: str,
+    allow_insecure_ssl: bool,
+) -> Optional[Any]:
+    """Fetch odds history for an event and merge snapshots into a single payload."""
+
+    regions_param = ",".join(regions) if isinstance(regions, (list, tuple)) else regions
+    markets_param = ",".join(markets) if isinstance(markets, (list, tuple)) else markets
+
+    payload = await _odds_get_json(
+        session,
+        f"/sports/{NFL_SPORT_KEY}/events/{event_id}/odds-history",
+        api_key,
+        allow_insecure_ssl=allow_insecure_ssl,
+        regions=regions_param,
+        markets=markets_param,
+        oddsFormat=odds_format,
+        dateFormat=date_format,
+    )
+    await asyncio.sleep(0.3)
+
+    if not payload:
+        return None
+
+    # The history endpoint may return either a single snapshot dict or a list of
+    # snapshots ordered by update time. Merge everything into a single structure
+    # that mirrors the live odds payload shape so downstream parsing logic can
+    # remain unchanged.
+    if isinstance(payload, dict):
+        snapshots = payload.get("data") if "data" in payload else None
+        if isinstance(snapshots, list):
+            merged: Optional[Dict[str, Any]] = None
+            for snap in snapshots:
+                if isinstance(snap, dict):
+                    merged = _merge_odds_event_payload(merged, snap)
+            if merged is not None:
+                for key in ["id", "home_team", "away_team", "commence_time", "sport_key"]:
+                    if not merged.get(key) and payload.get(key):
+                        merged[key] = payload.get(key)
+                return merged
+        return payload
+
+    if isinstance(payload, list):
+        merged = None
+        for snap in payload:
+            if isinstance(snap, dict):
+                merged = _merge_odds_event_payload(merged, snap)
+        return merged
+
+    return None
+
+
 async def odds_fetch_prop_odds(
     session: aiohttp.ClientSession,
     event_ids: Sequence[str] | str,
@@ -1634,6 +1693,7 @@ async def odds_fetch_prop_odds(
     odds_format: str = ODDS_FORMAT,
     date_format: str = "iso",
     allow_insecure_ssl: bool = False,
+    fallback_to_history: bool = False,
 ) -> pd.DataFrame:
     if isinstance(event_ids, str):
         event_ids = [event_ids]
@@ -1677,8 +1737,22 @@ async def odds_fetch_prop_odds(
                     dateFormat=date_format,
                 )
                 await asyncio.sleep(0.3)
+                merged_payload: Optional[Any] = None
                 if payload:
-                    return payload
+                    merged_payload = payload
+                elif fallback_to_history:
+                    merged_payload = await _odds_fetch_event_history(
+                        session,
+                        event_id,
+                        api_key=api_key,
+                        regions=regions,
+                        markets=markets,
+                        odds_format=odds_format,
+                        date_format=date_format,
+                        allow_insecure_ssl=allow_insecure_ssl,
+                    )
+                if merged_payload:
+                    return merged_payload
                 if len(markets) == 1:
                     odds_logger.debug(
                         "Odds API did not return data for prop market %s on event %s",
@@ -1817,6 +1891,7 @@ async def odds_fetch_event_game_markets(
     odds_format: str = ODDS_FORMAT,
     date_format: str = "iso",
     allow_insecure_ssl: bool = False,
+    fallback_to_history: bool = False,
 ) -> pd.DataFrame:
     if isinstance(event_ids, str):
         event_ids = [event_ids]
@@ -1860,7 +1935,20 @@ async def odds_fetch_event_game_markets(
                 dateFormat=date_format,
             )
             await asyncio.sleep(0.25)
-            return payload
+            if payload:
+                return payload
+            if not fallback_to_history:
+                return None
+            return await _odds_fetch_event_history(
+                session,
+                event_id,
+                api_key=api_key,
+                regions=regions,
+                markets=markets,
+                odds_format=odds_format,
+                date_format=date_format,
+                allow_insecure_ssl=allow_insecure_ssl,
+            )
 
     results = await asyncio.gather(
         *(fetch_event(event_id) for event_id in event_ids), return_exceptions=False
@@ -3739,6 +3827,7 @@ class OddsApiClient:
                                 markets=ODDS_DEFAULT_MARKETS,
                                 odds_format=ODDS_FORMAT,
                                 allow_insecure_ssl=allow_insecure,
+                                fallback_to_history=True,
                             )
                             if not history_games.empty:
                                 history_games = history_games.merge(
@@ -3798,6 +3887,7 @@ class OddsApiClient:
                             regions=ODDS_PROP_REGIONS,
                             odds_format=ODDS_FORMAT,
                             allow_insecure_ssl=allow_insecure,
+                            fallback_to_history=True,
                         )
                         if not prop_df.empty:
                             prop_df['commence_dt'] = pd.to_datetime(
@@ -3823,6 +3913,7 @@ class OddsApiClient:
                                 regions=ODDS_PROP_REGIONS,
                                 odds_format=ODDS_FORMAT,
                                 allow_insecure_ssl=allow_insecure,
+                                fallback_to_history=True,
                             )
                             if not history_props.empty:
                                 history_props = history_props.merge(
