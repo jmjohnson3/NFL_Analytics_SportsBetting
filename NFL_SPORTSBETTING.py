@@ -1320,23 +1320,41 @@ ODDS_DEFAULT_MARKETS = [
     "totals",
 ]
 ODDS_PLAYER_PROP_MARKETS = [
-    "player_pass_yards",
     "player_pass_tds",
-    "player_rush_yards",
+    "player_pass_yds",
     "player_rush_tds",
+    "player_rush_yds",
     "player_receptions",
-    "player_receiving_yards",
-    "player_receiving_tds",
+    "player_reception_yds",
     "player_anytime_td",
 ]
+
+# Map raw market keys returned by the Odds API to their canonical equivalents.
+ODDS_PLAYER_PROP_MARKET_SYNONYMS = {
+    # Identity mappings for canonical keys
+    **{key: key for key in ODDS_PLAYER_PROP_MARKETS},
+    # Legacy / alternate spellings
+    "player_pass_yards": "player_pass_yds",
+    "player_rush_yards": "player_rush_yds",
+    "player_receiving_yards": "player_reception_yds",
+    "player_reception_yards": "player_reception_yds",
+    "player_rec_yds": "player_reception_yds",
+    "player_receiving_yds": "player_reception_yds",
+}
+
 PLAYER_PROP_MARKET_COLUMN_MAP = {
-    "player_pass_yards": "line_passing_yards",
     "player_pass_tds": "line_passing_tds",
-    "player_rush_yards": "line_rushing_yards",
+    "player_pass_yds": "line_passing_yards",
+    "player_pass_yards": "line_passing_yards",
     "player_rush_tds": "line_rushing_tds",
+    "player_rush_yds": "line_rushing_yards",
+    "player_rush_yards": "line_rushing_yards",
     "player_receptions": "line_receptions",
+    "player_reception_yds": "line_receiving_yards",
+    "player_reception_yards": "line_receiving_yards",
+    "player_rec_yds": "line_receiving_yards",
+    "player_receiving_yds": "line_receiving_yards",
     "player_receiving_yards": "line_receiving_yards",
-    "player_receiving_tds": "line_receiving_tds",
     "player_anytime_td": "line_anytime_td",
 }
 
@@ -1344,21 +1362,29 @@ ODDS_MARKET_CANONICAL_MAP = {
     "h2h": "MONEYLINE",
     "spreads": "SPREAD",
     "totals": "TOTAL",
-    "player_pass_yards": "PASS_YDS",
     "player_pass_tds": "PASS_TD",
-    "player_rush_yards": "RUSH_YDS",
-    "player_rush_tds": "RUSH_TD",
-    "player_receptions": "RECEPTIONS",
-    "player_receiving_yards": "REC_YDS",
-    "player_receiving_tds": "REC_TD",
-    "player_anytime_td": "ANY_TD",
-    # Alternate keys occasionally returned by the API
     "player_pass_yds": "PASS_YDS",
+    "player_pass_yards": "PASS_YDS",
+    "player_rush_tds": "RUSH_TD",
     "player_rush_yds": "RUSH_YDS",
+    "player_rush_yards": "RUSH_YDS",
+    "player_receptions": "RECEPTIONS",
     "player_reception_yds": "REC_YDS",
+    "player_reception_yards": "REC_YDS",
+    "player_rec_yds": "REC_YDS",
+    "player_receiving_yds": "REC_YDS",
+    "player_receiving_yards": "REC_YDS",
+    "player_anytime_td": "ANY_TD",
 }
 
+ODDS_PROP_MAX_CONCURRENCY = 4
+
 odds_logger = logging.getLogger(__name__)
+
+
+def canonical_prop_market_key(market_key: str) -> str:
+    normalized = (market_key or "").lower()
+    return ODDS_PLAYER_PROP_MARKET_SYNONYMS.get(normalized, normalized)
 
 
 def odds_american_to_decimal(american: float) -> float:
@@ -1520,22 +1546,26 @@ async def odds_fetch_prop_odds(
         )
 
     regions_param = ",".join(regions) if isinstance(regions, (list, tuple)) else regions
-    prop_markets = ",".join(ODDS_PLAYER_PROP_MARKETS)
+    prop_markets = ",".join(sorted(set(ODDS_PLAYER_PROP_MARKETS)))
 
-    tasks = [
-        _odds_get_json(
-            session,
-            f"/sports/{NFL_SPORT_KEY}/events/{event_id}/odds",
-            api_key,
-            allow_insecure_ssl=allow_insecure_ssl,
-            regions=regions_param,
-            markets=prop_markets,
-            oddsFormat=odds_format,
-            dateFormat=date_format,
-        )
-        for event_id in event_ids
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=False)
+    semaphore = asyncio.Semaphore(max(1, ODDS_PROP_MAX_CONCURRENCY))
+
+    async def fetch_event(event_id: str) -> Optional[Any]:
+        async with semaphore:
+            return await _odds_get_json(
+                session,
+                f"/sports/{NFL_SPORT_KEY}/events/{event_id}/odds",
+                api_key,
+                allow_insecure_ssl=allow_insecure_ssl,
+                regions=regions_param,
+                markets=prop_markets,
+                oddsFormat=odds_format,
+                dateFormat=date_format,
+            )
+
+    results = await asyncio.gather(
+        *(fetch_event(event_id) for event_id in event_ids), return_exceptions=False
+    )
 
     rows: List[Dict[str, Any]] = []
     for event_id, payload in zip(event_ids, results):
@@ -1548,12 +1578,17 @@ async def odds_fetch_prop_odds(
         for bookmaker in payload.get("bookmakers", []) or []:
             book_key = bookmaker.get("key") or bookmaker.get("title")
             for market in bookmaker.get("markets", []) or []:
-                market_key = str(market.get("key", "")).lower()
-                market_label = ODDS_MARKET_CANONICAL_MAP.get(market_key, market_key.upper())
+                market_key_raw = str(market.get("key", "")).lower()
+                canonical_key = canonical_prop_market_key(market_key_raw)
+                if canonical_key not in ODDS_PLAYER_PROP_MARKETS:
+                    continue
+                market_label = ODDS_MARKET_CANONICAL_MAP.get(
+                    canonical_key, canonical_key.upper()
+                )
                 for outcome in market.get("outcomes", []) or []:
                     player = outcome.get("description") or outcome.get("participant") or ""
                     side = (outcome.get("name") or "").title()
-                    if market_key == "player_anytime_td":
+                    if canonical_key == "player_anytime_td":
                         side = {"Yes": "Over", "No": "Under"}.get(side, side)
                     price = outcome.get("price")
                     line = outcome.get("point")
@@ -3989,7 +4024,8 @@ class NFLIngestor:
                                 }
                             )
 
-                    elif market_key in ODDS_PLAYER_PROP_MARKETS:
+                    elif canonical_prop_market_key(market_key) in ODDS_PLAYER_PROP_MARKETS:
+                        normalized_market_key = canonical_prop_market_key(market_key)
                         player_buckets: Dict[str, Dict[str, Any]] = {}
 
                         for outcome in outcomes:
@@ -4071,7 +4107,7 @@ class NFLIngestor:
                                     opponent = home_team
                             prop_rows.append(
                                 {
-                                    "prop_id": f"{game_id}:{sportsbook}:{market_key}:{player_key}",
+                                    "prop_id": f"{game_id}:{sportsbook}:{normalized_market_key}:{player_key}",
                                     "game_id": game_id,
                                     "event_id": event_id,
                                     "player_id": str(info.get("player_id")) if info.get("player_id") else None,
@@ -4079,7 +4115,7 @@ class NFLIngestor:
                                     "player_name_norm": player_name_norm,
                                     "team": team_abbr,
                                     "opponent": opponent,
-                                    "market": market_key,
+                                    "market": normalized_market_key,
                                     "line": info.get("line"),
                                     "over_odds": info.get("over_odds"),
                                     "under_odds": info.get("under_odds"),
