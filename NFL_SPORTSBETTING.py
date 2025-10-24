@@ -693,12 +693,61 @@ def build_player_prop_candidates(
     if pred_df.empty or odds_df.empty:
         return pd.DataFrame()
 
-    key_cols = ["market", "player_id"]
+    pred_df = pred_df.copy()
+    odds_df = odds_df.copy()
+
+    def _normalize_identifier(value: Any) -> str:
+        if pd.isna(value):
+            return ""
+        text = str(value).strip()
+        if not text or text.lower() in {"nan", "none"}:
+            return ""
+        if text.endswith(".0"):
+            text = text[:-2]
+        return text
+
+    def _build_join_keys(frame: pd.DataFrame) -> pd.Series:
+        def _make_key(row: pd.Series) -> str:
+            identifier = _normalize_identifier(row.get("player_id"))
+            if identifier:
+                return identifier
+
+            name = row.get("player_name") or row.get("player") or row.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return ""
+
+            team_val = row.get("team") or row.get("team_abbr")
+            team_key = str(team_val).strip().upper() if isinstance(team_val, str) else ""
+            name_key = robust_player_name_key(name)
+            return f"{name_key}::{team_key}" if team_key else name_key
+
+        if frame.empty:
+            return pd.Series(dtype=str)
+
+        return frame.apply(_make_key, axis=1)
+
+    pred_df["player_join_key"] = _build_join_keys(pred_df)
+    odds_df["player_join_key"] = _build_join_keys(odds_df)
+
+    pred_df = pred_df[pred_df["player_join_key"].astype(bool)].copy()
+    odds_df = odds_df[odds_df["player_join_key"].astype(bool)].copy()
+
+    if pred_df.empty or odds_df.empty:
+        return pd.DataFrame()
+
+    key_cols = ["market", "player_join_key"]
     if "line" in odds_df.columns:
         key_cols.append("line")
     odds_best = pick_best_odds(odds_df, by_cols=key_cols, price_col="american_odds")
+    if odds_best.empty:
+        return pd.DataFrame()
 
-    merged = pred_df.merge(odds_best, on=["market", "player_id"], how="inner", suffixes=("", "_book"))
+    merged = pred_df.merge(
+        odds_best,
+        on=["market", "player_join_key"],
+        how="inner",
+        suffixes=("", "_book"),
+    )
     rows: List[Dict[str, Any]] = []
     for _, row in merged.iterrows():
         market = row["market"]
