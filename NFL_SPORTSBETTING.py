@@ -738,9 +738,31 @@ def build_player_prop_candidates(
     key_cols = ["market", "player_join_key"]
     if "line" in odds_df.columns:
         key_cols.append("line")
+    if "side" in odds_df.columns:
+        key_cols.append("side")
+
     odds_best = pick_best_odds(odds_df, by_cols=key_cols, price_col="american_odds")
     if odds_best.empty:
         return pd.DataFrame()
+
+    allowed_side_map = {
+        "anytime_td": {"yes", "over"},
+        "passing_yards": {"over"},
+        "receiving_yards": {"over"},
+        "receptions": {"over"},
+        "rushing_yards": {"over"},
+    }
+    if "side" in odds_best.columns:
+        odds_best["_side_norm"] = odds_best["side"].fillna("").str.lower()
+        odds_best = odds_best[
+            odds_best.apply(
+                lambda row: row["_side_norm"]
+                in allowed_side_map.get(row["market"], {row["_side_norm"]}),
+                axis=1,
+            )
+        ].drop(columns=["_side_norm"], errors="ignore")
+        if odds_best.empty:
+            return pd.DataFrame()
 
     merged = pred_df.merge(
         odds_best,
