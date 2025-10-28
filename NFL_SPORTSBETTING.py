@@ -811,6 +811,53 @@ def build_player_prop_candidates(
             }
         )
 
+    key_columns = [
+        "_event_key",
+        "_player_id_key",
+        "_player_name_key",
+        "_player_team_key",
+        "_player_id_event_key",
+        "_player_name_event_key",
+        "_player_team_event_key",
+    ]
+
+    def _annotate_keys(frame: pd.DataFrame) -> pd.DataFrame:
+        base = frame.copy()
+        base = base.drop(columns=key_columns, errors="ignore")
+
+        if base.empty:
+            result = base
+            for col in key_columns:
+                result[col] = pd.Series(dtype=str)
+            return result
+
+        keys = frame.apply(_extract_keys, axis=1)
+        result = base
+        for col in key_columns:
+            result[col] = keys[col]
+
+        mask = result["_player_team_key"].astype(bool)
+        result.loc[~mask, "_player_team_key"] = result.loc[~mask, "_player_name_key"]
+        mask_event = result["_player_team_event_key"].astype(bool)
+        result.loc[~mask_event, "_player_team_event_key"] = result.loc[
+            ~mask_event, "_player_name_event_key"
+        ]
+        return result
+
+    pred_df = _annotate_keys(pred_df)
+    odds_df = _annotate_keys(odds_df)
+
+    pred_df = pred_df[
+        pred_df["_player_id_key"].astype(bool)
+        | pred_df["_player_team_key"].astype(bool)
+        | pred_df["_player_name_key"].astype(bool)
+    ].copy()
+    odds_df = odds_df[
+        odds_df["_player_id_key"].astype(bool)
+        | odds_df["_player_team_key"].astype(bool)
+        | odds_df["_player_name_key"].astype(bool)
+    ].copy()
+
     def _annotate_keys(frame: pd.DataFrame) -> pd.DataFrame:
         if frame.empty:
             result = frame.copy()
