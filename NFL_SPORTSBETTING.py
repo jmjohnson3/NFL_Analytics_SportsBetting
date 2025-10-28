@@ -789,6 +789,10 @@ def build_player_prop_candidates(
     ].copy()
 
         key_cols = ["market", key_col]
+        if not key_col.endswith("_event_key"):
+            if "_event_key" in preds.columns and "_event_key" in offers.columns:
+                if preds["_event_key"].astype(bool).any() and offers["_event_key"].astype(bool).any():
+                    key_cols.append("_event_key")
         if "line" in offers.columns:
             key_cols.append("line")
         if "side" in offers.columns:
@@ -797,18 +801,6 @@ def build_player_prop_candidates(
         best = pick_best_odds(offers, by_cols=key_cols, price_col="american_odds")
         if best.empty:
             return pd.DataFrame()
-
-        if "side" in best.columns:
-            best["_side_norm"] = best["side"].fillna("").str.lower()
-            best = best[
-                best.apply(
-                    lambda row: row["_side_norm"]
-                    in allowed_side_map.get(row["market"], {row["_side_norm"]}),
-                    axis=1,
-                )
-            ].drop(columns=["_side_norm"], errors="ignore")
-            if best.empty:
-                return pd.DataFrame()
 
     pred_df["_pred_index"] = np.arange(len(pred_df))
     odds_df["_odds_index"] = np.arange(len(odds_df))
@@ -855,9 +847,15 @@ def build_player_prop_candidates(
             if best.empty:
                 return pd.DataFrame()
 
+        join_cols = [
+            col for col in key_cols if col in preds.columns and col in best.columns
+        ]
+        if not join_cols:
+            join_cols = ["market", key_col]
+
         return preds.merge(
             best,
-            on=["market", key_col],
+            on=join_cols,
             how="inner",
             suffixes=("", "_book"),
         )
