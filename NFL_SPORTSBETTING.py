@@ -821,8 +821,18 @@ def build_player_prop_candidates(
         "_player_team_event_key",
     ]
 
+    def _as_series(df: pd.DataFrame, column: str) -> pd.Series:
+        """Return the named column as a Series even if duplicates created a DataFrame."""
+
+        values = df[column]
+        if isinstance(values, pd.DataFrame):
+            # Retain the first occurrence – duplicate columns are equivalent for our keys.
+            values = values.iloc[:, 0]
+        return values
+
     def _annotate_keys(frame: pd.DataFrame) -> pd.DataFrame:
         base = frame.copy()
+        base = base.loc[:, ~base.columns.duplicated(keep="first")]
         base = base.drop(columns=key_columns, errors="ignore")
 
         if base.empty:
@@ -836,12 +846,19 @@ def build_player_prop_candidates(
         for col in key_columns:
             result[col] = keys[col]
 
-        mask = result["_player_team_key"].astype(bool)
-        result.loc[~mask, "_player_team_key"] = result.loc[~mask, "_player_name_key"]
-        mask_event = result["_player_team_event_key"].astype(bool)
-        result.loc[~mask_event, "_player_team_event_key"] = result.loc[
-            ~mask_event, "_player_name_event_key"
-        ]
+        team_values = _as_series(result, "_player_team_key")
+        mask = team_values.astype(bool)
+        if not mask.all():
+            name_values = _as_series(result, "_player_name_key")
+            replacement = name_values.loc[~mask]
+            result.loc[~mask, "_player_team_key"] = replacement
+
+        team_event_values = _as_series(result, "_player_team_event_key")
+        mask_event = team_event_values.astype(bool)
+        if not mask_event.all():
+            name_event_values = _as_series(result, "_player_name_event_key")
+            replacement_event = name_event_values.loc[~mask_event]
+            result.loc[~mask_event, "_player_team_event_key"] = replacement_event
         return result
 
     pred_df = _annotate_keys(pred_df)
@@ -858,77 +875,10 @@ def build_player_prop_candidates(
         | odds_df["_player_name_key"].astype(bool)
     ].copy()
 
-    def _annotate_keys(frame: pd.DataFrame) -> pd.DataFrame:
-        if frame.empty:
-            result = frame.copy()
-            result["_event_key"] = pd.Series(dtype=str)
-            result["_player_id_key"] = pd.Series(dtype=str)
-            result["_player_name_key"] = pd.Series(dtype=str)
-            result["_player_team_key"] = pd.Series(dtype=str)
-            result["_player_id_event_key"] = pd.Series(dtype=str)
-            result["_player_name_event_key"] = pd.Series(dtype=str)
-            result["_player_team_event_key"] = pd.Series(dtype=str)
-            return result
-
-        keys = frame.apply(_extract_keys, axis=1)
-        out = pd.concat([frame.copy(), keys], axis=1)
-        mask = out["_player_team_key"].astype(bool)
-        out.loc[~mask, "_player_team_key"] = out.loc[~mask, "_player_name_key"]
-        mask_event = out["_player_team_event_key"].astype(bool)
-        out.loc[~mask_event, "_player_team_event_key"] = out.loc[
-            ~mask_event, "_player_name_event_key"
-        ]
-        return out
-
-    pred_df = _annotate_keys(pred_df)
-    odds_df = _annotate_keys(odds_df)
-
-    pred_df = pred_df[
-        pred_df["_player_id_key"].astype(bool)
-        | pred_df["_player_team_key"].astype(bool)
-        | pred_df["_player_name_key"].astype(bool)
-    ].copy()
-    odds_df = odds_df[
-        odds_df["_player_id_key"].astype(bool)
-        | odds_df["_player_team_key"].astype(bool)
-        | odds_df["_player_name_key"].astype(bool)
-    ].copy()
-
-    def _annotate_keys(frame: pd.DataFrame) -> pd.DataFrame:
-        if frame.empty:
-            result = frame.copy()
-            result["_event_key"] = pd.Series(dtype=str)
-            result["_player_id_key"] = pd.Series(dtype=str)
-            result["_player_name_key"] = pd.Series(dtype=str)
-            result["_player_team_key"] = pd.Series(dtype=str)
-            result["_player_id_event_key"] = pd.Series(dtype=str)
-            result["_player_name_event_key"] = pd.Series(dtype=str)
-            result["_player_team_event_key"] = pd.Series(dtype=str)
-            return result
-
-        keys = frame.apply(_extract_keys, axis=1)
-        out = pd.concat([frame.copy(), keys], axis=1)
-        mask = out["_player_team_key"].astype(bool)
-        out.loc[~mask, "_player_team_key"] = out.loc[~mask, "_player_name_key"]
-        mask_event = out["_player_team_event_key"].astype(bool)
-        out.loc[~mask_event, "_player_team_event_key"] = out.loc[
-            ~mask_event, "_player_name_event_key"
-        ]
-        return out
-
-    pred_df = _annotate_keys(pred_df)
-    odds_df = _annotate_keys(odds_df)
-
-    pred_df = pred_df[
-        pred_df["_player_id_key"].astype(bool)
-        | pred_df["_player_team_key"].astype(bool)
-        | pred_df["_player_name_key"].astype(bool)
-    ].copy()
-    odds_df = odds_df[
-        odds_df["_player_id_key"].astype(bool)
-        | odds_df["_player_team_key"].astype(bool)
-        | odds_df["_player_name_key"].astype(bool)
-    ].copy()
+    pred_df["_pred_index"] = np.arange(len(pred_df))
+    odds_df["_odds_index"] = np.arange(len(odds_df))
+    pred_df = pred_df.set_index("_pred_index", drop=False)
+    odds_df = odds_df.set_index("_odds_index", drop=False)
 
     merged_frames: List[pd.DataFrame] = []
     remaining_pred = pred_df
@@ -945,7 +895,7 @@ def build_player_prop_candidates(
         preds_slice = remaining_pred[remaining_pred[key_col].astype(bool)].copy()
         offers_slice = remaining_odds[remaining_odds[key_col].astype(bool)].copy()
         merged_slice = _merge_player_prop_on_key(
-            preds_slice, offers_slice, key_col, allowed_side_map
+            preds_slice, offers_slice, key_col
         )
         if merged_slice.empty:
             continue
@@ -960,19 +910,6 @@ def build_player_prop_candidates(
             remaining_pred = remaining_pred.drop(index=matched_pred_idx, errors="ignore")
         if matched_odds_idx:
             remaining_odds = remaining_odds.drop(index=matched_odds_idx, errors="ignore")
-
-    pred_df["_pred_index"] = np.arange(len(pred_df))
-    odds_df["_odds_index"] = np.arange(len(odds_df))
-    pred_df = pred_df.set_index("_pred_index", drop=False)
-    odds_df = odds_df.set_index("_odds_index", drop=False)
-
-    allowed_side_map: Dict[str, Set[str]] = {
-        "anytime_td": {"yes", "over"},
-        "passing_yards": {"over"},
-        "receiving_yards": {"over"},
-        "receptions": {"over"},
-        "rushing_yards": {"over"},
-    }
 
     pred_df["_pred_index"] = np.arange(len(pred_df))
     odds_df["_odds_index"] = np.arange(len(odds_df))
