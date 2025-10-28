@@ -694,6 +694,53 @@ def pick_allowed_positions(target: str) -> Optional[Set[str]]:
 # =============================================================================
 
 
+def _merge_player_prop_on_key(
+    preds: pd.DataFrame,
+    offers: pd.DataFrame,
+    key_col: str,
+    allowed_side_map: Dict[str, Set[str]],
+) -> pd.DataFrame:
+    if preds.empty or offers.empty:
+        return pd.DataFrame()
+
+    key_cols: List[str] = ["market", key_col]
+    if not key_col.endswith("_event_key"):
+        if "_event_key" in preds.columns and "_event_key" in offers.columns:
+            if preds["_event_key"].astype(bool).any() and offers["_event_key"].astype(bool).any():
+                key_cols.append("_event_key")
+    if "line" in offers.columns:
+        key_cols.append("line")
+    if "side" in offers.columns:
+        key_cols.append("side")
+
+    best = pick_best_odds(offers, by_cols=key_cols, price_col="american_odds")
+    if best.empty:
+        return pd.DataFrame()
+
+    if "side" in best.columns:
+        best["_side_norm"] = best["side"].fillna("").str.lower()
+        best = best[
+            best.apply(
+                lambda row: row["_side_norm"]
+                in allowed_side_map.get(row["market"], {row["_side_norm"]}),
+                axis=1,
+            )
+        ].drop(columns=["_side_norm"], errors="ignore")
+        if best.empty:
+            return pd.DataFrame()
+
+    join_cols = [col for col in key_cols if col in preds.columns and col in best.columns]
+    if not join_cols:
+        join_cols = ["market", key_col]
+
+    return preds.merge(
+        best,
+        on=join_cols,
+        how="inner",
+        suffixes=("", "_book"),
+    )
+
+
 def build_player_prop_candidates(
     pred_df: pd.DataFrame, odds_df: pd.DataFrame
 ) -> pd.DataFrame:
@@ -788,53 +835,6 @@ def build_player_prop_candidates(
         | odds_df["_player_name_key"].astype(bool)
     ].copy()
 
-        key_cols = ["market", key_col]
-        if not key_col.endswith("_event_key"):
-            if "_event_key" in preds.columns and "_event_key" in offers.columns:
-                if preds["_event_key"].astype(bool).any() and offers["_event_key"].astype(bool).any():
-                    key_cols.append("_event_key")
-        if "line" in offers.columns:
-            key_cols.append("line")
-        if "side" in offers.columns:
-            key_cols.append("side")
-
-        best = pick_best_odds(offers, by_cols=key_cols, price_col="american_odds")
-        if best.empty:
-            return pd.DataFrame()
-
-    pred_df["_pred_index"] = np.arange(len(pred_df))
-    odds_df["_odds_index"] = np.arange(len(odds_df))
-    pred_df = pred_df.set_index("_pred_index", drop=False)
-    odds_df = odds_df.set_index("_odds_index", drop=False)
-
-    allowed_side_map = {
-        "anytime_td": {"yes", "over"},
-        "passing_yards": {"over"},
-        "receiving_yards": {"over"},
-        "receptions": {"over"},
-        "rushing_yards": {"over"},
-    }
-
-    def _merge_on_key(
-        preds: pd.DataFrame, offers: pd.DataFrame, key_col: str
-    ) -> pd.DataFrame:
-        if preds.empty or offers.empty:
-            return pd.DataFrame()
-
-        key_cols = ["market", key_col]
-        if not key_col.endswith("_event_key"):
-            if "_event_key" in preds.columns and "_event_key" in offers.columns:
-                if preds["_event_key"].astype(bool).any() and offers["_event_key"].astype(bool).any():
-                    key_cols.append("_event_key")
-        if "line" in offers.columns:
-            key_cols.append("line")
-        if "side" in offers.columns:
-            key_cols.append("side")
-
-        best = pick_best_odds(offers, by_cols=key_cols, price_col="american_odds")
-        if best.empty:
-            return pd.DataFrame()
-
         if "side" in best.columns:
             best["_side_norm"] = best["side"].fillna("").str.lower()
             best = best[
@@ -860,6 +860,19 @@ def build_player_prop_candidates(
             suffixes=("", "_book"),
         )
 
+    pred_df["_pred_index"] = np.arange(len(pred_df))
+    odds_df["_odds_index"] = np.arange(len(odds_df))
+    pred_df = pred_df.set_index("_pred_index", drop=False)
+    odds_df = odds_df.set_index("_odds_index", drop=False)
+
+    allowed_side_map: Dict[str, Set[str]] = {
+        "anytime_td": {"yes", "over"},
+        "passing_yards": {"over"},
+        "receiving_yards": {"over"},
+        "receptions": {"over"},
+        "rushing_yards": {"over"},
+    }
+
     merged_frames: List[pd.DataFrame] = []
     remaining_pred = pred_df
     remaining_odds = odds_df
@@ -874,7 +887,9 @@ def build_player_prop_candidates(
     ):
         preds_slice = remaining_pred[remaining_pred[key_col].astype(bool)].copy()
         offers_slice = remaining_odds[remaining_odds[key_col].astype(bool)].copy()
-        merged_slice = _merge_on_key(preds_slice, offers_slice, key_col)
+        merged_slice = _merge_player_prop_on_key(
+            preds_slice, offers_slice, key_col, allowed_side_map
+        )
         if merged_slice.empty:
             continue
         merged_frames.append(merged_slice)
