@@ -788,8 +788,27 @@ def build_player_prop_candidates(
         | odds_df["_player_name_key"].astype(bool)
     ].copy()
 
-    if pred_df.empty or odds_df.empty:
-        return pd.DataFrame()
+        key_cols = ["market", key_col]
+        if "line" in offers.columns:
+            key_cols.append("line")
+        if "side" in offers.columns:
+            key_cols.append("side")
+
+        best = pick_best_odds(offers, by_cols=key_cols, price_col="american_odds")
+        if best.empty:
+            return pd.DataFrame()
+
+        if "side" in best.columns:
+            best["_side_norm"] = best["side"].fillna("").str.lower()
+            best = best[
+                best.apply(
+                    lambda row: row["_side_norm"]
+                    in allowed_side_map.get(row["market"], {row["_side_norm"]}),
+                    axis=1,
+                )
+            ].drop(columns=["_side_norm"], errors="ignore")
+            if best.empty:
+                return pd.DataFrame()
 
     pred_df["_pred_index"] = np.arange(len(pred_df))
     odds_df["_odds_index"] = np.arange(len(odds_df))
