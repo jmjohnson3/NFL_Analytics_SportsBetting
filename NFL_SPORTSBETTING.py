@@ -732,26 +732,46 @@ def build_player_prop_candidates(
 
         team_join = f"{name_key}::{team_key}" if name_key and team_key else name_key
 
+        event_val = row.get("event_id") or row.get("game_id")
+        event_key = _normalize_identifier(event_val)
+
+        def _with_event(base: str) -> str:
+            if base and event_key:
+                return f"{base}::{event_key}"
+            return ""
+
         return pd.Series(
             {
+                "_event_key": event_key,
                 "_player_id_key": identifier,
                 "_player_name_key": name_key,
                 "_player_team_key": team_join,
+                "_player_id_event_key": _with_event(identifier),
+                "_player_name_event_key": _with_event(name_key),
+                "_player_team_event_key": _with_event(team_join if team_join else name_key),
             }
         )
 
     def _annotate_keys(frame: pd.DataFrame) -> pd.DataFrame:
         if frame.empty:
             result = frame.copy()
+            result["_event_key"] = pd.Series(dtype=str)
             result["_player_id_key"] = pd.Series(dtype=str)
             result["_player_name_key"] = pd.Series(dtype=str)
             result["_player_team_key"] = pd.Series(dtype=str)
+            result["_player_id_event_key"] = pd.Series(dtype=str)
+            result["_player_name_event_key"] = pd.Series(dtype=str)
+            result["_player_team_event_key"] = pd.Series(dtype=str)
             return result
 
         keys = frame.apply(_extract_keys, axis=1)
         out = pd.concat([frame.copy(), keys], axis=1)
         mask = out["_player_team_key"].astype(bool)
         out.loc[~mask, "_player_team_key"] = out.loc[~mask, "_player_name_key"]
+        mask_event = out["_player_team_event_key"].astype(bool)
+        out.loc[~mask_event, "_player_team_event_key"] = out.loc[
+            ~mask_event, "_player_name_event_key"
+        ]
         return out
 
     pred_df = _annotate_keys(pred_df)
@@ -768,8 +788,27 @@ def build_player_prop_candidates(
         | odds_df["_player_name_key"].astype(bool)
     ].copy()
 
-    if pred_df.empty or odds_df.empty:
-        return pd.DataFrame()
+        key_cols = ["market", key_col]
+        if "line" in offers.columns:
+            key_cols.append("line")
+        if "side" in offers.columns:
+            key_cols.append("side")
+
+        best = pick_best_odds(offers, by_cols=key_cols, price_col="american_odds")
+        if best.empty:
+            return pd.DataFrame()
+
+        if "side" in best.columns:
+            best["_side_norm"] = best["side"].fillna("").str.lower()
+            best = best[
+                best.apply(
+                    lambda row: row["_side_norm"]
+                    in allowed_side_map.get(row["market"], {row["_side_norm"]}),
+                    axis=1,
+                )
+            ].drop(columns=["_side_norm"], errors="ignore")
+            if best.empty:
+                return pd.DataFrame()
 
     pred_df["_pred_index"] = np.arange(len(pred_df))
     odds_df["_odds_index"] = np.arange(len(odds_df))
@@ -791,6 +830,10 @@ def build_player_prop_candidates(
             return pd.DataFrame()
 
         key_cols = ["market", key_col]
+        if not key_col.endswith("_event_key"):
+            if "_event_key" in preds.columns and "_event_key" in offers.columns:
+                if preds["_event_key"].astype(bool).any() and offers["_event_key"].astype(bool).any():
+                    key_cols.append("_event_key")
         if "line" in offers.columns:
             key_cols.append("line")
         if "side" in offers.columns:
@@ -823,7 +866,14 @@ def build_player_prop_candidates(
     remaining_pred = pred_df
     remaining_odds = odds_df
 
-    for key_col in ("_player_id_key", "_player_team_key", "_player_name_key"):
+    for key_col in (
+        "_player_id_event_key",
+        "_player_team_event_key",
+        "_player_name_event_key",
+        "_player_id_key",
+        "_player_team_key",
+        "_player_name_key",
+    ):
         preds_slice = remaining_pred[remaining_pred[key_col].astype(bool)].copy()
         offers_slice = remaining_odds[remaining_odds[key_col].astype(bool)].copy()
         merged_slice = _merge_on_key(preds_slice, offers_slice, key_col)
@@ -842,9 +892,21 @@ def build_player_prop_candidates(
             remaining_odds = remaining_odds.drop(index=matched_odds_idx, errors="ignore")
 
     if not merged_frames:
+        logging.info(
+            "Player prop odds merge produced 0 matches (pred_rows=%d, odds_rows=%d)",
+            len(pred_df),
+            len(odds_df),
+        )
         return pd.DataFrame()
 
     merged = pd.concat(merged_frames, ignore_index=True, sort=False)
+    logging.info(
+        "Player prop odds merge matched %d predictions to %d sportsbook offers (pred_rows=%d, odds_rows=%d)",
+        merged["_pred_index"].nunique(),
+        merged.get("_odds_index_book", merged.get("_odds_index", pd.Series())).nunique(),
+        len(pred_df),
+        len(odds_df),
+    )
     rows: List[Dict[str, Any]] = []
     for _, row in merged.iterrows():
         market = row["market"]
@@ -11506,7 +11568,15 @@ def predict_upcoming_games(
         def _build_player_index(frame: pd.DataFrame) -> pd.DataFrame:
             cols = [
                 col
-                for col in ["player_id", "player_name", "team", "opponent", "position"]
+                for col in [
+                    "player_id",
+                    "player_name",
+                    "team",
+                    "opponent",
+                    "position",
+                    "game_id",
+                    "event_id",
+                ]
                 if col in frame.columns
             ]
             return frame[cols].copy()
