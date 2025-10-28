@@ -875,6 +875,96 @@ def build_player_prop_candidates(
         | odds_df["_player_name_key"].astype(bool)
     ].copy()
 
+    def _as_series(df: pd.DataFrame, column: str) -> pd.Series:
+        """Return the named column as a Series even if duplicates created a DataFrame."""
+
+        values = df[column]
+        if isinstance(values, pd.DataFrame):
+            # Retain the first occurrence – duplicate columns are equivalent for our keys.
+            values = values.iloc[:, 0]
+        return values
+
+    def _annotate_keys(frame: pd.DataFrame) -> pd.DataFrame:
+        base = frame.copy()
+        base = base.loc[:, ~base.columns.duplicated(keep="first")]
+        base = base.drop(columns=key_columns, errors="ignore")
+
+        if base.empty:
+            result = base
+            for col in key_columns:
+                result[col] = pd.Series(dtype=str)
+            return result
+
+        keys = frame.apply(_extract_keys, axis=1)
+        result = base
+        for col in key_columns:
+            result[col] = keys[col]
+
+        team_values = _as_series(result, "_player_team_key")
+        mask = team_values.astype(bool)
+        if not mask.all():
+            name_values = _as_series(result, "_player_name_key")
+            replacement = name_values.loc[~mask]
+            result.loc[~mask, "_player_team_key"] = replacement
+
+        team_event_values = _as_series(result, "_player_team_event_key")
+        mask_event = team_event_values.astype(bool)
+        if not mask_event.all():
+            name_event_values = _as_series(result, "_player_name_event_key")
+            replacement_event = name_event_values.loc[~mask_event]
+            result.loc[~mask_event, "_player_team_event_key"] = replacement_event
+        return result
+
+    pred_df = _annotate_keys(pred_df)
+    odds_df = _annotate_keys(odds_df)
+
+    pred_df = pred_df[
+        pred_df["_player_id_key"].astype(bool)
+        | pred_df["_player_team_key"].astype(bool)
+        | pred_df["_player_name_key"].astype(bool)
+    ].copy()
+    odds_df = odds_df[
+        odds_df["_player_id_key"].astype(bool)
+        | odds_df["_player_team_key"].astype(bool)
+        | odds_df["_player_name_key"].astype(bool)
+    ].copy()
+
+    pred_df["_pred_index"] = np.arange(len(pred_df))
+    odds_df["_odds_index"] = np.arange(len(odds_df))
+    pred_df = pred_df.set_index("_pred_index", drop=False)
+    odds_df = odds_df.set_index("_odds_index", drop=False)
+
+    merged_frames: List[pd.DataFrame] = []
+    remaining_pred = pred_df
+    remaining_odds = odds_df
+
+    for key_col in (
+        "_player_id_event_key",
+        "_player_team_event_key",
+        "_player_name_event_key",
+        "_player_id_key",
+        "_player_team_key",
+        "_player_name_key",
+    ):
+        preds_slice = remaining_pred[remaining_pred[key_col].astype(bool)].copy()
+        offers_slice = remaining_odds[remaining_odds[key_col].astype(bool)].copy()
+        merged_slice = _merge_player_prop_on_key(
+            preds_slice, offers_slice, key_col
+        )
+        if merged_slice.empty:
+            continue
+        merged_frames.append(merged_slice)
+        matched_pred_idx = merged_slice["_pred_index"].unique().tolist()
+        matched_odds_idx = (
+            merged_slice["_odds_index_book"].unique().tolist()
+            if "_odds_index_book" in merged_slice.columns
+            else []
+        )
+        if matched_pred_idx:
+            remaining_pred = remaining_pred.drop(index=matched_pred_idx, errors="ignore")
+        if matched_odds_idx:
+            remaining_odds = remaining_odds.drop(index=matched_odds_idx, errors="ignore")
+
     pred_df["_pred_index"] = np.arange(len(pred_df))
     odds_df["_odds_index"] = np.arange(len(odds_df))
     pred_df = pred_df.set_index("_pred_index", drop=False)
@@ -10736,9 +10826,28 @@ class ModelTrainer:
             )
             return {}
 
+        train_df, test_df, sorted_df = self._chronological_split(df)
+
+        if available_numeric:
+            train_numeric = [
+                col for col in available_numeric if train_df[col].notna().any()
+            ]
+            dropped_train_numeric = sorted(set(available_numeric) - set(train_numeric))
+            if dropped_train_numeric:
+                logging.debug(
+                    "Dropping numeric game features with no observed training values: %s",
+                    ", ".join(dropped_train_numeric),
+                )
+            available_numeric = train_numeric
+
+        if not available_numeric and not available_categorical:
+            logging.warning(
+                "No usable features with observed training values available to train game-level models.",
+            )
+            return {}
+
         feature_columns = available_numeric + available_categorical
 
-        train_df, test_df, sorted_df = self._chronological_split(df)
         X_train = train_df[feature_columns]
         X_test = test_df[feature_columns]
 
