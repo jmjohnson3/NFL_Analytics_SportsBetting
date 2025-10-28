@@ -694,16 +694,27 @@ def pick_allowed_positions(target: str) -> Optional[Set[str]]:
 # =============================================================================
 
 
+PLAYER_PROP_ALLOWED_SIDES: Dict[str, Set[str]] = {
+    "anytime_td": {"yes", "over"},
+    "passing_yards": {"over"},
+    "receiving_yards": {"over"},
+    "receptions": {"over"},
+    "rushing_yards": {"over"},
+}
+
+
 def _merge_player_prop_on_key(
     preds: pd.DataFrame,
     offers: pd.DataFrame,
     key_col: str,
-    allowed_side_map: Dict[str, Set[str]],
+    allowed_side_map: Optional[Dict[str, Set[str]]] = None,
 ) -> pd.DataFrame:
     """Merge prediction rows with sportsbook offers using a specific join key."""
 
     if preds.empty or offers.empty:
         return pd.DataFrame()
+
+    allowed_lookup = allowed_side_map or PLAYER_PROP_ALLOWED_SIDES
 
     key_cols: List[str] = ["market", key_col]
 
@@ -728,7 +739,7 @@ def _merge_player_prop_on_key(
         best = best[
             best.apply(
                 lambda row: row["_side_norm"]
-                in allowed_side_map.get(row["market"], {row["_side_norm"]}),
+                in allowed_lookup.get(row["market"], {row["_side_norm"]}),
                 axis=1,
             )
         ].drop(columns=["_side_norm"], errors="ignore")
@@ -836,6 +847,42 @@ def build_player_prop_candidates(
         | odds_df["_player_name_key"].astype(bool)
     ].copy()
 
+    def _annotate_keys(frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            result = frame.copy()
+            result["_event_key"] = pd.Series(dtype=str)
+            result["_player_id_key"] = pd.Series(dtype=str)
+            result["_player_name_key"] = pd.Series(dtype=str)
+            result["_player_team_key"] = pd.Series(dtype=str)
+            result["_player_id_event_key"] = pd.Series(dtype=str)
+            result["_player_name_event_key"] = pd.Series(dtype=str)
+            result["_player_team_event_key"] = pd.Series(dtype=str)
+            return result
+
+        keys = frame.apply(_extract_keys, axis=1)
+        out = pd.concat([frame.copy(), keys], axis=1)
+        mask = out["_player_team_key"].astype(bool)
+        out.loc[~mask, "_player_team_key"] = out.loc[~mask, "_player_name_key"]
+        mask_event = out["_player_team_event_key"].astype(bool)
+        out.loc[~mask_event, "_player_team_event_key"] = out.loc[
+            ~mask_event, "_player_name_event_key"
+        ]
+        return out
+
+    pred_df = _annotate_keys(pred_df)
+    odds_df = _annotate_keys(odds_df)
+
+    pred_df = pred_df[
+        pred_df["_player_id_key"].astype(bool)
+        | pred_df["_player_team_key"].astype(bool)
+        | pred_df["_player_name_key"].astype(bool)
+    ].copy()
+    odds_df = odds_df[
+        odds_df["_player_id_key"].astype(bool)
+        | odds_df["_player_team_key"].astype(bool)
+        | odds_df["_player_name_key"].astype(bool)
+    ].copy()
+
     merged_frames: List[pd.DataFrame] = []
     remaining_pred = pred_df
     remaining_odds = odds_df
@@ -880,6 +927,11 @@ def build_player_prop_candidates(
         "rushing_yards": {"over"},
     }
 
+    pred_df["_pred_index"] = np.arange(len(pred_df))
+    odds_df["_odds_index"] = np.arange(len(odds_df))
+    pred_df = pred_df.set_index("_pred_index", drop=False)
+    odds_df = odds_df.set_index("_odds_index", drop=False)
+
     merged_frames: List[pd.DataFrame] = []
     remaining_pred = pred_df
     remaining_odds = odds_df
@@ -895,7 +947,7 @@ def build_player_prop_candidates(
         preds_slice = remaining_pred[remaining_pred[key_col].astype(bool)].copy()
         offers_slice = remaining_odds[remaining_odds[key_col].astype(bool)].copy()
         merged_slice = _merge_player_prop_on_key(
-            preds_slice, offers_slice, key_col, allowed_side_map
+            preds_slice, offers_slice, key_col
         )
         if merged_slice.empty:
             continue
