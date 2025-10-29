@@ -486,6 +486,23 @@ def write_csv_safely(df: pd.DataFrame, path: str) -> None:
         logging.exception("Failed to write %s", path)
 
 
+def append_csv_safely(df: pd.DataFrame, path: str) -> None:
+    """Append rows to a CSV, creating it if necessary."""
+
+    if df is None or df.empty:
+        logging.info("No rows to append for %s", path)
+        return
+
+    try:
+        path_obj = Path(path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        exists = path_obj.exists()
+        df.to_csv(path_obj, mode="a" if exists else "w", header=not exists, index=False)
+        logging.info("Appended %d rows -> %s", len(df), path)
+    except Exception:
+        logging.exception("Failed to append %s", path)
+
+
 def extract_pricing_odds(
     odds_payload: Iterable[Dict[str, Any]],
     valid_game_ids: Optional[Iterable[Any]] = None,
@@ -573,13 +590,20 @@ def extract_pricing_odds(
 
                         name_lower = name_raw.lower()
                         desc_lower = desc_raw.lower()
-                        if name_lower in {"over", "under"}:
+                        side_tokens = {"over", "under", "yes", "no"}
+
+                        if name_lower in side_tokens:
                             side = name_raw.title()
                             player_name = desc_raw or participant
-                        elif desc_lower in {"over", "under"}:
+                        elif desc_lower in side_tokens:
                             side = desc_raw.title()
                             player_name = name_raw or participant
-                        elif name_lower.endswith(" over") or name_lower.endswith(" under"):
+                        elif (
+                            name_lower.endswith(" over")
+                            or name_lower.endswith(" under")
+                            or name_lower.endswith(" yes")
+                            or name_lower.endswith(" no")
+                        ):
                             tokens = name_lower.rsplit(" ", 1)
                             side = tokens[1].title()
                             player_name = name_raw[: -len(tokens[1])].strip()
@@ -687,14 +711,73 @@ def pick_allowed_positions(target: str) -> Optional[Set[str]]:
 # =============================================================================
 
 
+PLAYER_PROP_ALLOWED_SIDES: Dict[str, Set[str]] = {
+    "anytime_td": {"yes", "over"},
+    "passing_yards": {"over"},
+    "receiving_yards": {"over"},
+    "receptions": {"over"},
+    "rushing_yards": {"over"},
+}
+
+
+def _merge_player_prop_on_key(
+    preds: pd.DataFrame,
+    offers: pd.DataFrame,
+    key_col: str,
+    allowed_side_map: Optional[Dict[str, Set[str]]] = None,
+) -> pd.DataFrame:
+    """Merge prediction rows with sportsbook offers using a specific join key."""
+
+    if preds.empty or offers.empty:
+        return pd.DataFrame()
+
+    allowed_lookup = allowed_side_map or PLAYER_PROP_ALLOWED_SIDES
+
+    key_cols: List[str] = ["market", key_col]
+
+    # Include event-level context when available so duplicate matchups resolve cleanly.
+    if not key_col.endswith("_event_key"):
+        if "_event_key" in preds.columns and "_event_key" in offers.columns:
+            if preds["_event_key"].astype(bool).any() and offers["_event_key"].astype(bool).any():
+                key_cols.append("_event_key")
+
+    if "line" in offers.columns:
+        key_cols.append("line")
+    if "side" in offers.columns:
+        key_cols.append("side")
+
+    best = pick_best_odds(offers, by_cols=key_cols, price_col="american_odds")
+    if best.empty:
+        return pd.DataFrame()
+
+    if "side" in best.columns:
+        best = best.copy()
+        best["_side_norm"] = best["side"].fillna("").str.lower()
+        best = best[
+            best.apply(
+                lambda row: row["_side_norm"]
+                in allowed_lookup.get(row["market"], {row["_side_norm"]}),
+                axis=1,
+            )
+        ].drop(columns=["_side_norm"], errors="ignore")
+        if best.empty:
+            return pd.DataFrame()
+
+    join_cols = [col for col in key_cols if col in preds.columns and col in best.columns]
+    if not join_cols:
+        join_cols = ["market", key_col]
+
+    return preds.merge(best, on=join_cols, how="inner", suffixes=("", "_book"))
+
+
 def build_player_prop_candidates(
     pred_df: pd.DataFrame, odds_df: pd.DataFrame
 ) -> pd.DataFrame:
     if pred_df.empty or odds_df.empty:
         return pd.DataFrame()
 
-    pred_df = pred_df.copy()
-    odds_df = odds_df.copy()
+    pred_df = pred_df.copy().reset_index(drop=True)
+    odds_df = odds_df.copy().reset_index(drop=True)
 
     def _normalize_identifier(value: Any) -> str:
         if pd.isna(value):
@@ -706,47 +789,163 @@ def build_player_prop_candidates(
             text = text[:-2]
         return text
 
-    def _build_join_keys(frame: pd.DataFrame) -> pd.Series:
-        def _make_key(row: pd.Series) -> str:
-            identifier = _normalize_identifier(row.get("player_id"))
-            if identifier:
-                return identifier
-
-            name = row.get("player_name") or row.get("player") or row.get("name")
-            if not isinstance(name, str) or not name.strip():
-                return ""
-
-            team_val = row.get("team") or row.get("team_abbr")
-            team_key = str(team_val).strip().upper() if isinstance(team_val, str) else ""
+    def _extract_keys(row: pd.Series) -> pd.Series:
+        identifier = _normalize_identifier(row.get("player_id"))
+        name = row.get("player_name") or row.get("player") or row.get("name")
+        if isinstance(name, str) and name.strip():
             name_key = robust_player_name_key(name)
-            return f"{name_key}::{team_key}" if team_key else name_key
+        else:
+            name_key = ""
 
-        if frame.empty:
-            return pd.Series(dtype=str)
+        team_val = row.get("team") or row.get("team_abbr")
+        team_norm = normalize_team_abbr(team_val)
+        if team_norm:
+            team_key = team_norm
+        elif isinstance(team_val, str):
+            team_key = team_val.strip().upper()
+        else:
+            team_key = ""
 
-        return frame.apply(_make_key, axis=1)
+        team_join = f"{name_key}::{team_key}" if name_key and team_key else name_key
 
-    pred_df["player_join_key"] = _build_join_keys(pred_df)
-    odds_df["player_join_key"] = _build_join_keys(odds_df)
+        event_val = row.get("event_id") or row.get("game_id")
+        event_key = _normalize_identifier(event_val)
 
-    pred_df = pred_df[pred_df["player_join_key"].astype(bool)].copy()
-    odds_df = odds_df[odds_df["player_join_key"].astype(bool)].copy()
+        def _with_event(base: str) -> str:
+            if base and event_key:
+                return f"{base}::{event_key}"
+            return ""
+
+        return pd.Series(
+            {
+                "_event_key": event_key,
+                "_player_id_key": identifier,
+                "_player_name_key": name_key,
+                "_player_team_key": team_join,
+                "_player_id_event_key": _with_event(identifier),
+                "_player_name_event_key": _with_event(name_key),
+                "_player_team_event_key": _with_event(team_join if team_join else name_key),
+            }
+        )
+
+    key_columns = [
+        "_event_key",
+        "_player_id_key",
+        "_player_name_key",
+        "_player_team_key",
+        "_player_id_event_key",
+        "_player_name_event_key",
+        "_player_team_event_key",
+    ]
+
+    def _as_series(df: pd.DataFrame, column: str) -> pd.Series:
+        """Return the named column as a Series even if duplicates created a DataFrame."""
+
+        values = df[column]
+        if isinstance(values, pd.DataFrame):
+            # Retain the first occurrence – duplicate columns are equivalent for our keys.
+            values = values.iloc[:, 0]
+        return values
+
+    def _annotate_keys(frame: pd.DataFrame) -> pd.DataFrame:
+        base = frame.copy()
+        base = base.loc[:, ~base.columns.duplicated(keep="first")]
+        base = base.drop(columns=key_columns, errors="ignore")
+
+        if base.empty:
+            result = base
+            for col in key_columns:
+                result[col] = pd.Series(dtype=str)
+            return result
+
+        keys = frame.apply(_extract_keys, axis=1)
+        result = base
+        for col in key_columns:
+            result[col] = keys[col]
+
+        team_values = _as_series(result, "_player_team_key")
+        mask = team_values.astype(bool)
+        if not mask.all():
+            name_values = _as_series(result, "_player_name_key")
+            replacement = name_values.loc[~mask]
+            result.loc[~mask, "_player_team_key"] = replacement
+
+        team_event_values = _as_series(result, "_player_team_event_key")
+        mask_event = team_event_values.astype(bool)
+        if not mask_event.all():
+            name_event_values = _as_series(result, "_player_name_event_key")
+            replacement_event = name_event_values.loc[~mask_event]
+            result.loc[~mask_event, "_player_team_event_key"] = replacement_event
+        return result
+
+    pred_df = _annotate_keys(pred_df)
+    odds_df = _annotate_keys(odds_df)
+
+    pred_df = pred_df[
+        pred_df["_player_id_key"].astype(bool)
+        | pred_df["_player_team_key"].astype(bool)
+        | pred_df["_player_name_key"].astype(bool)
+    ].copy()
+    odds_df = odds_df[
+        odds_df["_player_id_key"].astype(bool)
+        | odds_df["_player_team_key"].astype(bool)
+        | odds_df["_player_name_key"].astype(bool)
+    ].copy()
 
     if pred_df.empty or odds_df.empty:
         return pd.DataFrame()
 
-    key_cols = ["market", "player_join_key"]
-    if "line" in odds_df.columns:
-        key_cols.append("line")
-    odds_best = pick_best_odds(odds_df, by_cols=key_cols, price_col="american_odds")
-    if odds_best.empty:
+    pred_df["_pred_index"] = np.arange(len(pred_df))
+    odds_df["_odds_index"] = np.arange(len(odds_df))
+    pred_df = pred_df.set_index("_pred_index", drop=False)
+    odds_df = odds_df.set_index("_odds_index", drop=False)
+
+    merged_frames: List[pd.DataFrame] = []
+    remaining_pred = pred_df
+    remaining_odds = odds_df
+
+    for key_col in (
+        "_player_id_event_key",
+        "_player_team_event_key",
+        "_player_name_event_key",
+        "_player_id_key",
+        "_player_team_key",
+        "_player_name_key",
+    ):
+        preds_slice = remaining_pred[remaining_pred[key_col].astype(bool)].copy()
+        offers_slice = remaining_odds[remaining_odds[key_col].astype(bool)].copy()
+        merged_slice = _merge_player_prop_on_key(
+            preds_slice, offers_slice, key_col
+        )
+        if merged_slice.empty:
+            continue
+        merged_frames.append(merged_slice)
+        matched_pred_idx = merged_slice["_pred_index"].unique().tolist()
+        matched_odds_idx = (
+            merged_slice["_odds_index_book"].unique().tolist()
+            if "_odds_index_book" in merged_slice.columns
+            else []
+        )
+        if matched_pred_idx:
+            remaining_pred = remaining_pred.drop(index=matched_pred_idx, errors="ignore")
+        if matched_odds_idx:
+            remaining_odds = remaining_odds.drop(index=matched_odds_idx, errors="ignore")
+
+    if not merged_frames:
+        logging.info(
+            "Player prop odds merge produced 0 matches (pred_rows=%d, odds_rows=%d)",
+            len(pred_df),
+            len(odds_df),
+        )
         return pd.DataFrame()
 
-    merged = pred_df.merge(
-        odds_best,
-        on=["market", "player_join_key"],
-        how="inner",
-        suffixes=("", "_book"),
+    merged = pd.concat(merged_frames, ignore_index=True, sort=False)
+    logging.info(
+        "Player prop odds merge matched %d predictions to %d sportsbook offers (pred_rows=%d, odds_rows=%d)",
+        merged["_pred_index"].nunique(),
+        merged.get("_odds_index_book", merged.get("_odds_index", pd.Series())).nunique(),
+        len(pred_df),
+        len(odds_df),
     )
     rows: List[Dict[str, Any]] = []
     for _, row in merged.iterrows():
@@ -971,6 +1170,56 @@ def emit_priced_picks(
                 len(model_totals),
                 model_totals_path,
             )
+
+    paper_rows: List[Dict[str, Any]] = []
+    run_timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+    if props_filtered is not None and not props_filtered.empty:
+        for row in props_filtered.to_dict("records"):
+            paper_rows.append(
+                {
+                    "timestamp_utc": run_timestamp,
+                    "week_key": week_key,
+                    "bet_type": "player_prop",
+                    "market": row.get("market"),
+                    "player": row.get("player"),
+                    "team": row.get("team"),
+                    "opponent": row.get("opp"),
+                    "side": row.get("side"),
+                    "line": row.get("line"),
+                    "best_american": row.get("best_american"),
+                    "fair_american": row.get("fair_american"),
+                    "ev": row.get("ev"),
+                    "confidence": row.get("confidence"),
+                    "kelly_quarter": row.get("kelly_quarter"),
+                    "event_id": row.get("event_id") or row.get("game_id"),
+                }
+            )
+
+    if totals_filtered is not None and not totals_filtered.empty:
+        for row in totals_filtered.to_dict("records"):
+            paper_rows.append(
+                {
+                    "timestamp_utc": run_timestamp,
+                    "week_key": week_key,
+                    "bet_type": "game_total",
+                    "market": "total",
+                    "away_team": row.get("away"),
+                    "home_team": row.get("home"),
+                    "side": row.get("side"),
+                    "line": row.get("line"),
+                    "best_american": row.get("best_american"),
+                    "fair_american": row.get("fair_american"),
+                    "ev": row.get("ev"),
+                    "confidence": row.get("confidence"),
+                    "kelly_quarter": row.get("kelly_quarter"),
+                    "model_total": row.get("model_total"),
+                    "event_id": row.get("event_id") or row.get("game_id"),
+                }
+            )
+
+    if paper_rows:
+        paper_log_path = out_dir / "paper_trading_log.csv"
+        append_csv_safely(pd.DataFrame(paper_rows), str(paper_log_path))
 
     try:
         if props_filtered is not None and not props_filtered.empty:
@@ -3582,6 +3831,60 @@ class NFLDatabase:
             )
         return results
 
+    def fetch_games_with_odds_for_seasons(self, seasons: Iterable[str]) -> pd.DataFrame:
+        season_list = [str(season) for season in seasons if season is not None]
+        if not season_list:
+            return pd.DataFrame(
+                columns=[
+                    "game_id",
+                    "season",
+                    "week",
+                    "start_time",
+                    "home_team",
+                    "away_team",
+                    "home_moneyline",
+                    "away_moneyline",
+                    "odds_updated",
+                    "odds_event_id",
+                ]
+            )
+
+        columns = [
+            self.games.c.game_id,
+            self.games.c.season,
+            self.games.c.week,
+            self.games.c.start_time,
+            self.games.c.home_team,
+            self.games.c.away_team,
+            self.games.c.home_moneyline,
+            self.games.c.away_moneyline,
+            self.games.c.odds_updated,
+            self.games.c.odds_event_id,
+        ]
+
+        with self.engine.begin() as conn:
+            stmt = select(*columns).where(self.games.c.season.in_(season_list))
+            rows = conn.execute(stmt).fetchall()
+
+        frame = pd.DataFrame(
+            rows,
+            columns=[
+                "game_id",
+                "season",
+                "week",
+                "start_time",
+                "home_team",
+                "away_team",
+                "home_moneyline",
+                "away_moneyline",
+                "odds_updated",
+                "odds_event_id",
+            ],
+        )
+        if not frame.empty:
+            frame["start_time"] = pd.to_datetime(frame["start_time"], errors="coerce")
+        return frame
+
     def fetch_games_with_player_stats(self) -> set[str]:
         """Return the set of game IDs that already have player statistics stored."""
 
@@ -4635,16 +4938,39 @@ class NFLIngestor:
 
         games_by_event: Dict[str, Dict[str, Any]] = {}
         games_by_key: Dict[Tuple[str, str, Optional[dt.date]], List[Dict[str, Any]]] = defaultdict(list)
-        min_start: Optional[dt.datetime] = None
-        max_start: Optional[dt.datetime] = None
+        refresh_candidates: Dict[str, Dict[str, Any]] = {}
+        missing_count = 0
+        stale_count = 0
+        now_utc = default_now_utc()
+        stale_cutoff = now_utc - dt.timedelta(hours=6)
+        upcoming_window_end = now_utc + dt.timedelta(days=7)
+        recent_window_start = now_utc - dt.timedelta(days=14)
+
+        def _needs_refresh(row: Dict[str, Any], start_time: Optional[dt.datetime]) -> bool:
+            nonlocal missing_count, stale_count
+            home_price = row.get("home_moneyline")
+            away_price = row.get("away_moneyline")
+            odds_updated = _ensure_datetime(row.get("odds_updated"))
+
+            missing_prices = pd.isna(home_price) or pd.isna(away_price)
+            if missing_prices:
+                missing_count += 1
+                return True
+
+            if start_time is None:
+                return False
+
+            is_recent_game = recent_window_start <= start_time <= upcoming_window_end
+            if not is_recent_game:
+                return False
+
+            stale = odds_updated is None or odds_updated < stale_cutoff
+            if stale:
+                stale_count += 1
+            return stale
 
         for row in game_lookup_rows:
             start_time = _ensure_datetime(row.get("start_time"))
-            if start_time is not None:
-                if min_start is None or start_time < min_start:
-                    min_start = start_time
-                if max_start is None or start_time > max_start:
-                    max_start = start_time
             home = normalize_team_abbr(row.get("home_team"))
             away = normalize_team_abbr(row.get("away_team"))
             if home and away:
@@ -4653,6 +4979,46 @@ class NFLIngestor:
             event_id = row.get("odds_event_id")
             if event_id:
                 games_by_event[str(event_id)] = row
+
+            game_id = str(row.get("game_id")) if row.get("game_id") is not None else None
+            if game_id:
+                if _needs_refresh(row, start_time):
+                    refresh_candidates[game_id] = row
+                elif (
+                    start_time is not None
+                    and recent_window_start <= start_time <= upcoming_window_end
+                ):
+                    # Always refresh the upcoming slate to capture line movement and props
+                    refresh_candidates.setdefault(game_id, row)
+
+        rows_needing_refresh = list(refresh_candidates.values())
+
+        if rows_needing_refresh:
+            start_candidates = [
+                _ensure_datetime(row.get("start_time"))
+                for row in rows_needing_refresh
+                if _ensure_datetime(row.get("start_time")) is not None
+            ]
+            if start_candidates:
+                min_start = min(start_candidates)
+                max_start = max(start_candidates)
+            else:
+                min_start = now_utc - dt.timedelta(days=7)
+                max_start = now_utc + dt.timedelta(days=7)
+        else:
+            min_start = now_utc - dt.timedelta(days=7)
+            max_start = now_utc + dt.timedelta(days=7)
+
+        if not rows_needing_refresh:
+            logging.info("All tracked games already have up-to-date sportsbook odds.")
+            return
+
+        logging.info(
+            "Refreshing odds for %d games (missing=%d, stale=%d)",
+            len(rows_needing_refresh),
+            missing_count,
+            stale_count,
+        )
 
         if min_start is None:
             min_start = default_now_utc() - dt.timedelta(days=7)
@@ -4667,6 +5033,64 @@ class NFLIngestor:
             include_historical=True,
         )
         logging.info("Fetched %d odds entries", len(odds_data))
+
+        historical_rows = [
+            row
+            for row in rows_needing_refresh
+            if (
+                _ensure_datetime(row.get("start_time")) is not None
+                and _ensure_datetime(row.get("start_time")) < recent_window_start
+            )
+        ]
+        if historical_rows:
+            grouped_hist: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            for hist_row in historical_rows:
+                start_dt = _ensure_datetime(hist_row.get("start_time"))
+                season_key = str(hist_row.get("season") or (start_dt.year if start_dt else "unknown"))
+                grouped_hist[season_key].append(hist_row)
+
+            history_buffer = dt.timedelta(days=10)
+            chunk_span = dt.timedelta(days=45)
+            for season_key, season_rows in grouped_hist.items():
+                times = [
+                    _ensure_datetime(row.get("start_time"))
+                    for row in season_rows
+                    if _ensure_datetime(row.get("start_time")) is not None
+                ]
+                if not times:
+                    continue
+                season_start = min(times) - history_buffer
+                season_end = max(times) + history_buffer
+                logging.info(
+                    "Backfilling odds history for season %s (%d games)",
+                    season_key,
+                    len(season_rows),
+                )
+                current_start = season_start
+                while current_start <= season_end:
+                    current_end = min(current_start + chunk_span, season_end)
+                    logging.debug(
+                        "Historical odds window %s -> %s for season %s",
+                        current_start.isoformat(),
+                        current_end.isoformat(),
+                        season_key,
+                    )
+                    extra_data = self.odds_client.fetch_odds(
+                        start=current_start,
+                        end=current_end,
+                        include_player_props=True,
+                        include_historical=True,
+                    )
+                    if extra_data:
+                        logging.info(
+                            "Fetched %d additional odds entries for season %s window %s -> %s",
+                            len(extra_data),
+                            season_key,
+                            current_start.date(),
+                            current_end.date(),
+                        )
+                        odds_data.extend(extra_data)
+                    current_start = current_end + dt.timedelta(days=1)
 
         def _match_game(
             event_id: str,
@@ -4735,10 +5159,12 @@ class NFLIngestor:
         totals_rows: List[Dict[str, Any]] = []
         prop_rows: List[Dict[str, Any]] = []
 
+        seen_events: Set[str] = set()
         for event in odds_data:
             event_id = str(event.get("id") or "")
-            if not event_id:
+            if not event_id or event_id in seen_events:
                 continue
+            seen_events.add(event_id)
 
             commence_time = parse_dt(event.get("commence_time"))
             teams_list = [team for team in (event.get("teams") or []) if team]
@@ -6233,12 +6659,25 @@ class FeatureBuilder:
                     merged_strength.drop(columns=[hist_col], inplace=True)
             return merged_strength
 
+        def _ensure_penalty_columns(strength: pd.DataFrame) -> pd.DataFrame:
+            if strength is None or strength.empty:
+                return strength
+            for penalty_col in ("travel_penalty", "rest_penalty", "avg_timezone_diff_hours"):
+                if penalty_col not in strength.columns:
+                    strength[penalty_col] = 0.0
+                else:
+                    strength[penalty_col] = pd.to_numeric(
+                        strength[penalty_col], errors="coerce"
+                    ).fillna(0.0)
+            return strength
+
         if player_stats.empty:
             logging.warning(
                 "Player statistics table is empty. Player-level models will not be trained."
             )
             team_strength = self._compute_team_unit_strength(player_stats, advanced_metrics)
             team_strength = _merge_penalties_into_strength(team_strength)
+            team_strength = _ensure_penalty_columns(team_strength)
             self.team_strength_frame = team_strength
         else:
             enrichment_columns = [
@@ -6264,6 +6703,7 @@ class FeatureBuilder:
 
             team_strength = self._compute_team_unit_strength(player_stats, advanced_metrics)
             team_strength = _merge_penalties_into_strength(team_strength)
+            team_strength = _ensure_penalty_columns(team_strength)
 
             player_stats = player_stats.merge(
                 team_strength,
@@ -6702,8 +7142,12 @@ class FeatureBuilder:
             "away_rest_days",
         ]
         for col in penalty_fill_cols:
-            if col in games_context.columns:
-                games_context[col] = games_context[col].fillna(0.0)
+            if col not in games_context.columns:
+                games_context[col] = 0.0
+            else:
+                games_context[col] = pd.to_numeric(
+                    games_context[col], errors="coerce"
+                ).fillna(0.0)
 
         games_context["moneyline_diff"] = games_context["home_moneyline"] - games_context["away_moneyline"]
         games_context["implied_prob_diff"] = (
@@ -7820,8 +8264,12 @@ class FeatureBuilder:
             "opp_timezone_diff_hours",
         ]
         for col in penalty_cols:
-            if col in player_features.columns:
-                player_features[col] = player_features[col].fillna(0.0)
+            if col not in player_features.columns:
+                player_features[col] = 0.0
+            else:
+                player_features[col] = pd.to_numeric(
+                    player_features[col], errors="coerce"
+                ).fillna(0.0)
 
         player_features = player_features.drop(columns=["player_name_norm"], errors="ignore")
 
@@ -9871,30 +10319,33 @@ class ModelTrainer:
             away_valid = away_prices.notna() & away_probs.notna()
             valid_mask = (home_valid | away_valid) & results_mask
 
-            synthetic_odds_used = False
-            # TODO: Ensure historical odds are persisted prior to evaluation so that
-            # live ROI metrics no longer rely on this synthetic -110 moneyline
-            # fallback. Once genuine prices are available, this branch should become
-            # an explicit opt-in emergency path.
             if not valid_mask.any():
-                logging.debug(
-                    "%s: no rows with market odds; using synthetic -110 moneylines for diagnostics",
-                    target,
-                )
-                synthetic_odds_used = True
-                fallback_prices = pd.Series(-110.0, index=out_df.index, dtype=float)
-                implied = _american_to_prob(fallback_prices)
-                home_prices = fallback_prices.copy()
-                away_prices = fallback_prices.copy()
-                home_probs = implied.copy()
-                away_probs = implied.copy()
-                valid_mask = results_mask.copy()
-                home_valid = valid_mask.copy()
-                away_valid = valid_mask.copy()
-
-            if not valid_mask.any():
-                logging.debug("%s: no rows with complete market data for edge check", target)
+                missing_without_odds = results_mask & ~(home_valid | away_valid)
+                subset_cols = [
+                    col for col in ["game_id", "season", "week"] if col in out_df.columns
+                ]
+                if subset_cols:
+                    missing_rows = out_df.loc[missing_without_odds, subset_cols].drop_duplicates()
+                else:
+                    missing_rows = pd.DataFrame(index=out_df.index[missing_without_odds])
+                if not missing_rows.empty:
+                    logging.warning(
+                        "%s: skipping ROI evaluation because %d games lack recorded moneylines. "
+                        "Run the odds ingestion backfill to capture historical prices before betting decisions.",
+                        target,
+                        len(missing_rows),
+                    )
+                else:
+                    logging.warning("%s: no rows with complete market data for edge check", target)
                 return None
+
+            missing_without_odds = results_mask & ~(home_valid | away_valid)
+            if missing_without_odds.any():
+                logging.info(
+                    "%s: dropping %d completed games without stored moneylines from ROI calculation",
+                    target,
+                    int(missing_without_odds.sum()),
+                )
 
             pred_series = pred_series.loc[valid_mask]
             home_probs = home_probs.loc[valid_mask]
@@ -9935,8 +10386,23 @@ class ModelTrainer:
                     home_df["_threshold"] = threshold
                     home_df["_side"] = "home"
                     home_df["_is_push"] = False
+                    if "start_time" in out_df.columns:
+                        home_df["_start_time"] = pd.to_datetime(
+                            out_df.loc[home_index, "start_time"], errors="coerce"
+                        )
+                    home_columns = [
+                        "p_model",
+                        "side_win",
+                        "payout",
+                        "_edge",
+                        "_threshold",
+                        "_side",
+                        "_is_push",
+                    ]
+                    if "_start_time" in home_df.columns:
+                        home_columns.append("_start_time")
                     picks.append(
-                        home_df[["p_model", "side_win", "payout", "_edge", "_threshold", "_side", "_is_push"]]
+                        home_df[home_columns]
                     )
 
                 pick_away = away_valid & (choose_away > threshold)
@@ -9952,8 +10418,23 @@ class ModelTrainer:
                     away_df["_threshold"] = threshold
                     away_df["_side"] = "away"
                     away_df["_is_push"] = False
+                    if "start_time" in out_df.columns:
+                        away_df["_start_time"] = pd.to_datetime(
+                            out_df.loc[away_index, "start_time"], errors="coerce"
+                        )
+                    away_columns = [
+                        "p_model",
+                        "side_win",
+                        "payout",
+                        "_edge",
+                        "_threshold",
+                        "_side",
+                        "_is_push",
+                    ]
+                    if "_start_time" in away_df.columns:
+                        away_columns.append("_start_time")
                     picks.append(
-                        away_df[["p_model", "side_win", "payout", "_edge", "_threshold", "_side", "_is_push"]]
+                        away_df[away_columns]
                     )
 
                 if not picks:
@@ -10000,8 +10481,6 @@ class ModelTrainer:
                     label_suffix = f"{label}|forced_top_edges"
                 elif selected_threshold != min_edge:
                     label_suffix = f"{label}|thr={selected_threshold:+.3f}"
-            if synthetic_odds_used:
-                label_suffix = f"{label_suffix}|synthetic_odds"
 
             bet_count = len(picks_df)
             returns = np.where(
@@ -10020,6 +10499,50 @@ class ModelTrainer:
                 hit_val = float(np.mean(picks_df.loc[non_push_mask, "side_win"]))
             else:
                 hit_val = float("nan")
+
+            recent_summary: Optional[Dict[str, Any]] = None
+            if "_start_time" in picks_df.columns and picks_df["_start_time"].notna().any():
+                valid_times = picks_df.loc[picks_df["_start_time"].notna(), "_start_time"]
+                latest_time = valid_times.max()
+                if isinstance(latest_time, dt.datetime):
+                    recent_cutoff = latest_time - dt.timedelta(weeks=8)
+                    recent_df = picks_df.loc[picks_df["_start_time"] >= recent_cutoff]
+                    if len(recent_df) >= 10:
+                        recent_returns = np.where(
+                            recent_df["_is_push"],
+                            0.0,
+                            np.where(
+                                recent_df["side_win"] == 1,
+                                recent_df["payout"].values,
+                                -1.0,
+                            ),
+                        )
+                        recent_roi = float(np.mean(recent_returns))
+                        r_mean = recent_returns.mean()
+                        r_std = (
+                            recent_returns.std(ddof=1)
+                            if len(recent_returns) > 1
+                            else 0.0
+                        )
+                        r_se = r_std / math.sqrt(max(len(recent_returns), 1))
+                        r_lo, r_hi = float(r_mean - z * r_se), float(r_mean + z * r_se)
+                        non_push_recent = ~recent_df["_is_push"].astype(bool)
+                        if non_push_recent.any():
+                            recent_hit = float(
+                                np.mean(recent_df.loc[non_push_recent, "side_win"])
+                            )
+                        else:
+                            recent_hit = float("nan")
+                        recent_summary = {
+                            "roi": recent_roi,
+                            "roi_lo": r_lo,
+                            "roi_hi": r_hi,
+                            "hit_rate": recent_hit,
+                            "n_bets": int(len(recent_df)),
+                            "window_start": recent_cutoff,
+                            "window_end": latest_time,
+                        }
+
             return {
                 "roi": roi_val,
                 "roi_lo": roi_lo_val,
@@ -10027,7 +10550,10 @@ class ModelTrainer:
                 "hit_rate": hit_val,
                 "n_bets": bet_count,
                 "label": label_suffix,
+                "recent": recent_summary,
             }
+
+        recent_metrics: Optional[Dict[str, Any]] = None
 
         if target.endswith("_win_prob") and {"home_moneyline", "away_moneyline"}.issubset(out_df.columns):
             prediction_candidates: List[Tuple[str, np.ndarray]] = []
@@ -10056,6 +10582,9 @@ class ModelTrainer:
                 hit_rate = best_option["hit_rate"]
                 n_bets = best_option["n_bets"]
                 edge_source = best_option["label"]
+                recent_metrics = best_option.get("recent")
+            else:
+                recent_metrics = None
         elif baseline_reference is not None and baseline_reference.notna().any():
             def _evaluate_numeric_edges(
                 preds_array: np.ndarray, label: str
@@ -10202,8 +10731,7 @@ class ModelTrainer:
                         label_suffix = f"{label_suffix}|forced_top_edges"
                     elif selected_threshold != min_edge:
                         label_suffix = f"{label_suffix}|thr={selected_threshold:+.3f}"
-                label_suffix = f"{label_suffix}|priors_baseline|synthetic_odds"
-
+                label_suffix = f"{label_suffix}|priors_baseline"
                 bet_count = len(picks_df)
                 returns = []
                 for _, row in picks_df.iterrows():
@@ -10261,6 +10789,7 @@ class ModelTrainer:
                 hit_rate = best_option["hit_rate"]
                 n_bets = best_option["n_bets"]
                 edge_source = best_option["label"]
+                recent_metrics = best_option.get("recent")
 
         # Persist backtest metrics per fold + overall
         for row in per_fold:
@@ -10281,6 +10810,7 @@ class ModelTrainer:
                 "bets": n_bets,
                 "edge_source": edge_source,
                 "mode": evaluation_mode,
+                "recent": recent_metrics,
             }
         else:
             summary = {
@@ -10295,11 +10825,40 @@ class ModelTrainer:
                 "bets": n_bets,
                 "edge_source": edge_source,
                 "mode": evaluation_mode,
+                "recent": recent_metrics,
             }
         self.db.record_backtest_metrics(self.run_id, target, summary, sample_size=int(len(out_df)))
 
+        recent_log = ""
+        if summary.get("recent"):
+            recent = summary["recent"]
+            recent_roi = recent.get("roi")
+            recent_ci = None
+            if "roi_lo" in recent and "roi_hi" in recent:
+                recent_ci = (recent["roi_lo"], recent["roi_hi"])
+            recent_hit = recent.get("hit_rate")
+            recent_n = recent.get("n_bets")
+            recent_window_start = recent.get("window_start")
+            recent_window_end = recent.get("window_end")
+            recent_log = " | recent_roi="
+            if recent_roi is not None and math.isfinite(recent_roi):
+                recent_log += f"{recent_roi:.3f}"
+            else:
+                recent_log += "n/a"
+            if recent_ci and all(math.isfinite(x) for x in recent_ci):
+                recent_log += f" (CI=({recent_ci[0]:.3f},{recent_ci[1]:.3f}))"
+            if recent_hit is not None and math.isfinite(recent_hit):
+                recent_log += f" | recent_hit={recent_hit:.3f}"
+            if recent_n is not None:
+                recent_log += f" | recent_bets={recent_n}"
+            if recent_window_start is not None and recent_window_end is not None:
+                recent_log += (
+                    " | window="
+                    f"{recent_window_start:%Y-%m-%d}->{recent_window_end:%Y-%m-%d}"
+                )
+
         logging.info(
-            "%s %s | folds=%d | MAE=%.3f | RMSE=%.3f | MAE_vs_close=%s | ROI=%s (CI=%s) | bets=%d | edge_source=%s",
+            "%s %s | folds=%d | MAE=%.3f | RMSE=%.3f | MAE_vs_close=%s | ROI=%s (CI=%s) | bets=%d | edge_source=%s%s",
             target,
             evaluation_mode,
             summary["folds"],
@@ -10310,6 +10869,7 @@ class ModelTrainer:
             f"({summary['roi_ci'][0]:.3f},{summary['roi_ci'][1]:.3f})" if summary["roi_ci"] else "n/a",
             summary["bets"],
             summary.get("edge_source") or "n/a",
+            recent_log,
         )
 
         # ---- Deployment guard: beat the vig with lower CI bound ----
@@ -10521,9 +11081,28 @@ class ModelTrainer:
             )
             return {}
 
+        train_df, test_df, sorted_df = self._chronological_split(df)
+
+        if available_numeric:
+            train_numeric = [
+                col for col in available_numeric if train_df[col].notna().any()
+            ]
+            dropped_train_numeric = sorted(set(available_numeric) - set(train_numeric))
+            if dropped_train_numeric:
+                logging.debug(
+                    "Dropping numeric game features with no observed training values: %s",
+                    ", ".join(dropped_train_numeric),
+                )
+            available_numeric = train_numeric
+
+        if not available_numeric and not available_categorical:
+            logging.warning(
+                "No usable features with observed training values available to train game-level models.",
+            )
+            return {}
+
         feature_columns = available_numeric + available_categorical
 
-        train_df, test_df, sorted_df = self._chronological_split(df)
         X_train = train_df[feature_columns]
         X_test = test_df[feature_columns]
 
@@ -11409,7 +11988,15 @@ def predict_upcoming_games(
         def _build_player_index(frame: pd.DataFrame) -> pd.DataFrame:
             cols = [
                 col
-                for col in ["player_id", "player_name", "team", "opponent", "position"]
+                for col in [
+                    "player_id",
+                    "player_name",
+                    "team",
+                    "opponent",
+                    "position",
+                    "game_id",
+                    "event_id",
+                ]
                 if col in frame.columns
             ]
             return frame[cols].copy()
