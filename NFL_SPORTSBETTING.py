@@ -3455,6 +3455,11 @@ class NFLConfig:
     weather_forecast_path: Optional[str] = os.getenv("NFL_FORECAST_PATH")
     respect_lineups: bool = True
     odds_allow_insecure_ssl: bool = env_flag("ODDS_ALLOW_INSECURE_SSL", False)
+    enable_paper_trading: bool = env_flag("NFL_PAPER_TRADE", False)
+    paper_trade_lookback_days: int = 21
+    paper_trade_edge_threshold: float = 0.02
+    paper_trade_bankroll: float = 1_000.0
+    paper_trade_max_fraction: float = 0.05
 
     @property
     def pg_url(self) -> str:
@@ -3779,6 +3784,11 @@ class NFLDatabase:
             self.games.c.home_team,
             self.games.c.away_team,
             self.games.c.odds_event_id,
+            self.games.c.home_moneyline,
+            self.games.c.away_moneyline,
+            self.games.c.home_implied_prob,
+            self.games.c.away_implied_prob,
+            self.games.c.odds_updated,
         ]
         with self.engine.begin() as conn:
             rows = conn.execute(select(*columns)).fetchall()
@@ -3793,6 +3803,11 @@ class NFLDatabase:
                     "home_team": row[4],
                     "away_team": row[5],
                     "odds_event_id": row[6],
+                    "home_moneyline": row[7],
+                    "away_moneyline": row[8],
+                    "home_implied_prob": row[9],
+                    "away_implied_prob": row[10],
+                    "odds_updated": row[11],
                 }
             )
         return results
@@ -6164,6 +6179,7 @@ class FeatureBuilder:
         self.latest_odds_lookup: Optional[pd.DataFrame] = None
         self.game_totals_frame: Optional[pd.DataFrame] = None
         self.player_prop_lines_frame: Optional[pd.DataFrame] = None
+        self.team_game_lookup: Optional[pd.DataFrame] = None
 
     @staticmethod
     def _american_to_prob_series(series: pd.Series) -> pd.Series:
@@ -6267,6 +6283,118 @@ class FeatureBuilder:
 
         working.drop(columns=["_start_date"], inplace=True, errors="ignore")
         return working
+
+    def _build_team_game_lookup(self, games: pd.DataFrame) -> pd.DataFrame:
+        if games is None or games.empty:
+            return pd.DataFrame(columns=["team", "opponent", "is_home", "start_time", "game_id"])
+
+        working = games.copy()
+        working["start_time"] = pd.to_datetime(working["start_time"], utc=True, errors="coerce")
+
+        home = working[["game_id", "start_time", "home_team", "away_team"]].rename(
+            columns={"home_team": "team", "away_team": "opponent"}
+        )
+        home["is_home"] = True
+
+        away = working[["game_id", "start_time", "away_team", "home_team"]].rename(
+            columns={"away_team": "team", "home_team": "opponent"}
+        )
+        away["is_home"] = False
+
+        combined = safe_concat([home, away], ignore_index=True)
+        if combined.empty:
+            return pd.DataFrame(columns=["team", "opponent", "is_home", "start_time", "game_id"])
+
+        combined["team"] = combined["team"].apply(normalize_team_abbr)
+        combined["opponent"] = combined["opponent"].apply(normalize_team_abbr)
+        combined = combined.dropna(subset=["team", "opponent", "start_time"])
+        combined = combined.sort_values(["team", "start_time", "game_id"]).reset_index(drop=True)
+        return combined
+
+    def _lookup_previous_game(
+        self, team: Optional[str], reference_time: Optional[pd.Timestamp]
+    ) -> Optional[pd.Series]:
+        if not team:
+            return None
+        lookup = self.team_game_lookup
+        if lookup is None or lookup.empty:
+            return None
+
+        try:
+            ref = pd.to_datetime(reference_time, utc=True, errors="coerce")
+        except Exception:
+            ref = pd.NaT
+
+        team_rows = lookup[lookup["team"] == normalize_team_abbr(team)]
+        if team_rows.empty:
+            return None
+
+        if pd.notna(ref):
+            team_rows = team_rows[team_rows["start_time"] < ref]
+            if team_rows.empty:
+                return None
+        return team_rows.iloc[-1]
+
+    @staticmethod
+    def _tz_offset_hours(ts: Optional[pd.Timestamp], team: Optional[str]) -> float:
+        if ts is None or pd.isna(ts):
+            return 0.0
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(dt.timezone.utc)
+        tz_name = TEAM_TIMEZONES.get(team or "", "UTC")
+        try:
+            zone = ZoneInfo(tz_name)
+        except Exception:
+            zone = ZoneInfo("UTC")
+        offset = ts.astimezone(zone).utcoffset()
+        if offset is None:
+            return 0.0
+        return float(offset.total_seconds() / 3600.0)
+
+    def _fallback_team_context(
+        self,
+        team: Optional[str],
+        opponent: Optional[str],
+        start_time: Optional[pd.Timestamp],
+        *,
+        is_home: bool,
+    ) -> Dict[str, float]:
+        defaults: Dict[str, float] = {
+            "rest_days": np.nan,
+            "rest_penalty": np.nan,
+            "travel_penalty": np.nan,
+            "timezone_diff_hours": np.nan,
+            "avg_timezone_diff_hours": np.nan,
+        }
+
+        if not team:
+            return defaults
+
+        try:
+            start_ts = pd.to_datetime(start_time, utc=True, errors="coerce")
+        except Exception:
+            start_ts = pd.NaT
+
+        if pd.isna(start_ts):
+            return defaults
+
+        previous = self._lookup_previous_game(team, start_ts)
+        if previous is not None:
+            prev_start = pd.to_datetime(previous.get("start_time"), utc=True, errors="coerce")
+            if pd.notna(prev_start):
+                rest_days = float((start_ts - prev_start).total_seconds() / 86400.0)
+                if rest_days >= 0:
+                    defaults["rest_days"] = rest_days
+                    defaults["rest_penalty"] = max(0.0, 6.0 - rest_days)
+
+        venue_team = team if is_home else opponent
+        tz_team = self._tz_offset_hours(start_ts, team)
+        tz_venue = self._tz_offset_hours(start_ts, venue_team)
+        tz_diff = abs(tz_team - tz_venue)
+        defaults["timezone_diff_hours"] = tz_diff
+        defaults["avg_timezone_diff_hours"] = tz_diff
+        defaults["travel_penalty"] = 0.0 if is_home else tz_diff / 3.0
+        return defaults
 
     def load_dataframes(
         self,
@@ -6418,6 +6546,7 @@ class FeatureBuilder:
         self.advanced_metrics_frame = advanced_metrics
         self.game_totals_frame = game_totals
         self.player_prop_lines_frame = player_prop_lines
+        self.team_game_lookup = self._build_team_game_lookup(games)
 
         # Basic cleanup
         games["start_time"] = pd.to_datetime(games["start_time"])
@@ -7023,7 +7152,33 @@ class FeatureBuilder:
                 return match.iloc[0]
         return None
 
-    def _get_latest_team_history(self, team: str, season: Optional[str]) -> Optional[pd.Series]:
+    def _get_latest_team_history(
+        self,
+        team: Optional[str],
+        season: Optional[str],
+        reference_time: Optional[pd.Timestamp] = None,
+    ) -> Optional[pd.Series]:
+        if not team:
+            return None
+
+        history = self.team_history_frame
+        ref_ts: Optional[pd.Timestamp]
+        try:
+            ref_ts = pd.to_datetime(reference_time, utc=True, errors="coerce")
+        except Exception:
+            ref_ts = None
+
+        if history is not None and not history.empty:
+            subset = history[history["team"] == normalize_team_abbr(team)]
+            if ref_ts is not None and not pd.isna(ref_ts):
+                subset = subset[pd.to_datetime(subset["start_time"], utc=True, errors="coerce") < ref_ts]
+            if season:
+                season_subset = subset[subset["season"] == season]
+                if not season_subset.empty:
+                    return season_subset.sort_values("start_time").iloc[-1]
+            if not subset.empty:
+                return subset.sort_values("start_time").iloc[-1]
+
         if self.team_history_latest_by_season is not None and not self.team_history_latest_by_season.empty:
             if season:
                 match = self.team_history_latest_by_season[
@@ -7038,6 +7193,10 @@ class FeatureBuilder:
             ]
             if not match.empty:
                 return match.iloc[0]
+
+        fallback = self._fallback_team_context(team, None, ref_ts, is_home=True)
+        if any(not pd.isna(value) for value in fallback.values()):
+            return pd.Series(fallback)
         return None
 
     def prepare_upcoming_game_features(self, upcoming_games: pd.DataFrame) -> pd.DataFrame:
@@ -7045,7 +7204,7 @@ class FeatureBuilder:
             return upcoming_games.copy()
 
         features = upcoming_games.copy()
-        features["start_time"] = pd.to_datetime(features["start_time"])
+        features["start_time"] = pd.to_datetime(features["start_time"], utc=True, errors="coerce")
         if "day_of_week" not in features.columns or features["day_of_week"].isna().any():
             features["day_of_week"] = features["start_time"].dt.day_name()
 
@@ -7133,6 +7292,7 @@ class FeatureBuilder:
             season = row.get("season")
             home_team = row.get("home_team")
             away_team = row.get("away_team")
+            start_time = row.get("start_time")
 
             if home_team:
                 strength = self._get_latest_team_strength(home_team, season)
@@ -7150,7 +7310,7 @@ class FeatureBuilder:
                     features.at[idx, "home_rest_penalty"] = strength.get("rest_penalty")
                     features.at[idx, "home_weather_adjustment"] = strength.get("weather_adjustment")
                     features.at[idx, "home_timezone_diff_hours"] = strength.get("avg_timezone_diff_hours")
-                history = self._get_latest_team_history(home_team, season)
+                history = self._get_latest_team_history(home_team, season, start_time)
                 if history is not None:
                     features.at[idx, "home_points_for_avg"] = history.get("rolling_points_for")
                     features.at[idx, "home_points_against_avg"] = history.get("rolling_points_against")
@@ -7166,6 +7326,22 @@ class FeatureBuilder:
                         features.at[idx, "home_travel_penalty"] = history.get("travel_penalty")
                     if pd.isna(features.at[idx, "home_timezone_diff_hours"]):
                         features.at[idx, "home_timezone_diff_hours"] = history.get("timezone_diff_hours")
+
+                fallback_home = self._fallback_team_context(
+                    home_team,
+                    away_team,
+                    start_time,
+                    is_home=True,
+                )
+                for key, value in fallback_home.items():
+                    if pd.isna(value):
+                        continue
+                    if key == "avg_timezone_diff_hours":
+                        target_col = "home_timezone_diff_hours"
+                    else:
+                        target_col = f"home_{key}"
+                    if target_col in features.columns and pd.isna(features.at[idx, target_col]):
+                        features.at[idx, target_col] = value
 
             if away_team:
                 strength = self._get_latest_team_strength(away_team, season)
@@ -7183,7 +7359,7 @@ class FeatureBuilder:
                     features.at[idx, "away_rest_penalty"] = strength.get("rest_penalty")
                     features.at[idx, "away_weather_adjustment"] = strength.get("weather_adjustment")
                     features.at[idx, "away_timezone_diff_hours"] = strength.get("avg_timezone_diff_hours")
-                history = self._get_latest_team_history(away_team, season)
+                history = self._get_latest_team_history(away_team, season, start_time)
                 if history is not None:
                     features.at[idx, "away_points_for_avg"] = history.get("rolling_points_for")
                     features.at[idx, "away_points_against_avg"] = history.get("rolling_points_against")
@@ -7199,6 +7375,22 @@ class FeatureBuilder:
                         features.at[idx, "away_travel_penalty"] = history.get("travel_penalty")
                     if pd.isna(features.at[idx, "away_timezone_diff_hours"]):
                         features.at[idx, "away_timezone_diff_hours"] = history.get("timezone_diff_hours")
+
+                fallback_away = self._fallback_team_context(
+                    away_team,
+                    home_team,
+                    start_time,
+                    is_home=False,
+                )
+                for key, value in fallback_away.items():
+                    if pd.isna(value):
+                        continue
+                    if key == "avg_timezone_diff_hours":
+                        target_col = "away_timezone_diff_hours"
+                    else:
+                        target_col = f"away_{key}"
+                    if target_col in features.columns and pd.isna(features.at[idx, target_col]):
+                        features.at[idx, target_col] = value
 
         fill_defaults = {col: 0.0 for col in numeric_placeholders.keys()}
         features[list(fill_defaults.keys())] = features[list(fill_defaults.keys())].fillna(fill_defaults)
@@ -8019,7 +8211,7 @@ class FeatureBuilder:
                         row_copy["weather_adjustment"] = strength.get("weather_adjustment")
                         row_copy["avg_timezone_diff_hours"] = strength.get("avg_timezone_diff_hours")
 
-                    history = self._get_latest_team_history(team, season)
+                    history = self._get_latest_team_history(team, season, start_time)
                     if history is not None:
                         if pd.isna(row_copy.get("rest_penalty")):
                             row_copy["rest_penalty"] = history.get("rest_penalty")
@@ -8027,6 +8219,19 @@ class FeatureBuilder:
                             row_copy["travel_penalty"] = history.get("travel_penalty")
                         if pd.isna(row_copy.get("avg_timezone_diff_hours")):
                             row_copy["avg_timezone_diff_hours"] = history.get("timezone_diff_hours")
+
+                    fallback_team = self._fallback_team_context(
+                        team,
+                        opponent,
+                        start_time,
+                        is_home=(team == home_team),
+                    )
+                    for key, value in fallback_team.items():
+                        if pd.isna(value):
+                            continue
+                        target_key = key if key != "avg_timezone_diff_hours" else "avg_timezone_diff_hours"
+                        if target_key in row_copy and pd.isna(row_copy.get(target_key)):
+                            row_copy[target_key] = value
 
                     opp_strength = self._get_latest_team_strength(opponent, season)
                     if opp_strength is not None:
@@ -8044,7 +8249,7 @@ class FeatureBuilder:
                         row_copy["opp_weather_adjustment"] = opp_strength.get("weather_adjustment")
                         row_copy["opp_timezone_diff_hours"] = opp_strength.get("avg_timezone_diff_hours")
 
-                    opp_history = self._get_latest_team_history(opponent, season)
+                    opp_history = self._get_latest_team_history(opponent, season, start_time)
                     if opp_history is not None:
                         if pd.isna(row_copy.get("opp_rest_penalty")):
                             row_copy["opp_rest_penalty"] = opp_history.get("rest_penalty")
@@ -8052,6 +8257,23 @@ class FeatureBuilder:
                             row_copy["opp_travel_penalty"] = opp_history.get("travel_penalty")
                         if pd.isna(row_copy.get("opp_timezone_diff_hours")):
                             row_copy["opp_timezone_diff_hours"] = opp_history.get("timezone_diff_hours")
+
+                    opp_fallback = self._fallback_team_context(
+                        opponent,
+                        team,
+                        start_time,
+                        is_home=(opponent == home_team),
+                    )
+                    for key, value in opp_fallback.items():
+                        if pd.isna(value):
+                            continue
+                        target_key = (
+                            f"opp_{key}"
+                            if key != "avg_timezone_diff_hours"
+                            else "opp_timezone_diff_hours"
+                        )
+                        if target_key in row_copy and pd.isna(row_copy.get(target_key)):
+                            row_copy[target_key] = value
 
                     selected_rows.append(row_copy)
 
@@ -12181,6 +12403,209 @@ def predict_upcoming_games(
     return result_payload
 
 
+def paper_trade_recent_slates(
+    models: Dict[str, Pipeline],
+    trainer: Optional["ModelTrainer"],
+    config: NFLConfig,
+) -> Optional[pd.DataFrame]:
+    if not config.enable_paper_trading:
+        return None
+
+    if trainer is None or trainer.feature_builder is None:
+        logging.warning("Paper trading skipped: training context unavailable.")
+        return None
+
+    feature_builder = trainer.feature_builder
+    games = feature_builder.games_frame
+    if games is None or games.empty:
+        logging.warning("Paper trading skipped: no games ingested for simulation.")
+        return None
+
+    if "game_winner" not in models:
+        logging.warning("Paper trading skipped: game_winner model not available.")
+        return None
+
+    completed = games.copy()
+    completed["start_time"] = pd.to_datetime(completed["start_time"], utc=True, errors="coerce")
+    completed = completed[
+        completed["start_time"].notna()
+        & completed["home_score"].notna()
+        & completed["away_score"].notna()
+    ]
+    completed = completed.dropna(subset=["home_moneyline", "away_moneyline"], how="any")
+
+    lookback_days = max(int(config.paper_trade_lookback_days), 0)
+    if lookback_days > 0:
+        cutoff = default_now_utc() - dt.timedelta(days=lookback_days)
+        completed = completed[completed["start_time"] >= cutoff]
+
+    if completed.empty:
+        logging.warning(
+            "Paper trading skipped: no completed games with sportsbook odds in the lookback window.")
+        return None
+
+    completed = completed.sort_values("start_time").reset_index(drop=True)
+    game_features = feature_builder.prepare_upcoming_game_features(completed)
+    game_features = game_features.reset_index(drop=True)
+
+    def _ensure_model_features(frame: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
+        columns: Optional[Iterable[str]] = getattr(model, "feature_columns", None)
+        if not columns:
+            target_key = getattr(model, "target_name", None)
+            if trainer is not None and target_key:
+                columns = trainer.feature_column_map.get(target_key)
+        if not columns:
+            columns = getattr(model, "feature_names_in_", None)
+        if not columns:
+            numeric_cols = frame.select_dtypes(include=[np.number, bool]).columns.tolist()
+            if not numeric_cols:
+                return frame
+            return frame.loc[:, numeric_cols]
+        frame = frame.copy()
+        for col in columns:
+            if col not in frame.columns:
+                frame[col] = np.nan
+        return frame.loc[:, list(columns)]
+
+    winner_model = models["game_winner"]
+    winner_features = _ensure_model_features(game_features, winner_model)
+    try:
+        winner_probs = winner_model.predict_proba(winner_features)[:, 1]
+    except Exception:
+        logging.exception("Paper trading skipped: unable to score win probabilities for simulation.")
+        return None
+
+    if trainer is not None:
+        try:
+            specials = getattr(trainer, "special_models", {}) or {}
+        except Exception:
+            specials = {}
+        calibration_info = specials.get("game_winner", {}).get("calibration") if isinstance(specials, dict) else None
+        if calibration_info and calibration_info.get("method") == "logistic":
+            model = calibration_info.get("model")
+            if model is not None:
+                try:
+                    winner_probs = model.predict_proba(winner_probs.reshape(-1, 1))[:, 1]
+                except Exception:
+                    logging.debug(
+                        "Paper trading: unable to apply stored calibration for game_winner", exc_info=True
+                    )
+
+    bankroll = float(max(config.paper_trade_bankroll, 0.0))
+    max_fraction = float(max(config.paper_trade_max_fraction, 0.0))
+    min_edge = float(max(config.paper_trade_edge_threshold, 0.0))
+
+    trades: List[Dict[str, Any]] = []
+    total_staked = 0.0
+    total_profit = 0.0
+    wins = 0
+    graded_count = 0
+
+    def _american_prob(value: float) -> float:
+        try:
+            odds_val = float(value)
+        except (TypeError, ValueError):
+            return np.nan
+        if odds_val >= 0:
+            return 100.0 / (odds_val + 100.0)
+        return -odds_val / (-odds_val + 100.0)
+
+    for idx, row in completed.iterrows():
+        home_odds = row.get("home_moneyline")
+        away_odds = row.get("away_moneyline")
+        if pd.isna(home_odds) and pd.isna(away_odds):
+            continue
+
+        model_home = float(winner_probs[idx])
+        model_home = float(np.clip(model_home, 1e-6, 1 - 1e-6))
+        model_away = 1.0 - model_home
+
+        implied_home = _american_prob(home_odds)
+        implied_away = _american_prob(away_odds)
+
+        edge_home = model_home - implied_home if not pd.isna(implied_home) else -np.inf
+        edge_away = model_away - implied_away if not pd.isna(implied_away) else -np.inf
+
+        options = [
+            ("home", model_home, home_odds, implied_home, edge_home),
+            ("away", model_away, away_odds, implied_away, edge_away),
+        ]
+        best_side, model_prob, american_odds, implied_prob, edge_value = max(
+            options, key=lambda item: item[4]
+        )
+
+        if pd.isna(american_odds) or edge_value < min_edge:
+            continue
+
+        stake_fraction = kelly_fraction(model_prob, american_odds, max_fraction)
+        if stake_fraction <= 0.0:
+            continue
+
+        stake = bankroll * stake_fraction if bankroll > 0 else stake_fraction
+        expected_val = ev_of_bet(model_prob, american_odds, stake)
+        decimal_price = american_to_decimal(american_odds)
+
+        home_score = float(row.get("home_score", np.nan))
+        away_score = float(row.get("away_score", np.nan))
+        if pd.isna(home_score) or pd.isna(away_score):
+            result = "pending"
+            profit = 0.0
+        elif home_score == away_score:
+            result = "push"
+            profit = 0.0
+            graded_count += 1
+        else:
+            home_won = home_score > away_score
+            bet_won = home_won if best_side == "home" else not home_won
+            profit = stake * (decimal_price - 1.0) if bet_won else -stake
+            result = "win" if bet_won else "loss"
+            graded_count += 1
+            if bet_won:
+                wins += 1
+
+        total_staked += stake
+        total_profit += profit
+
+        trades.append(
+            {
+                "game_id": row.get("game_id"),
+                "season": row.get("season"),
+                "week": row.get("week"),
+                "start_time": row.get("start_time"),
+                "team_side": best_side,
+                "american_odds": american_odds,
+                "implied_prob": implied_prob,
+                "model_prob": model_prob,
+                "edge": edge_value,
+                "stake": stake,
+                "stake_fraction": stake_fraction,
+                "expected_value": expected_val,
+                "result": result,
+                "profit": profit,
+            }
+        )
+
+    if not trades or total_staked <= 0.0:
+        logging.warning("Paper trading produced no actionable bets in the configured window.")
+        return None
+
+    roi = total_profit / total_staked if total_staked else 0.0
+    hit_rate = (wins / graded_count) if graded_count else float("nan")
+
+    logging.info(
+        "Paper trading summary: %d bets | staked %.2f units | profit %.2f | ROI %.2f%% | hit rate %s%%",
+        len(trades),
+        total_staked,
+        total_profit,
+        roi * 100.0,
+        f"{hit_rate * 100.0:.1f}" if not math.isnan(hit_rate) else "NA",
+    )
+
+    trades_df = pd.DataFrame(trades)
+    trades_df.sort_values("start_time", inplace=True)
+    return trades_df
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -12204,6 +12629,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Filter modeling and props to starters from MSF lineup.json when available",
     )
+    parser.add_argument(
+        "--paper-trade",
+        action="store_true",
+        help="Simulate recent slates with recorded sportsbook odds to validate ROI",
+    )
     return parser.parse_args()
 
 
@@ -12225,6 +12655,8 @@ def main() -> None:
     config = load_config(args.config)
     if getattr(args, "respect_lineups", None) is not None:
         config.respect_lineups = bool(args.respect_lineups)
+    if getattr(args, "paper_trade", False):
+        config.enable_paper_trading = True
     setup_logging(config.log_level)
 
     logging.info("Connecting to PostgreSQL at %s", config.pg_url)
@@ -12264,6 +12696,19 @@ def main() -> None:
         if args.predict:
             logging.error("Prediction generation skipped because no models were available.")
         return
+
+    paper_trades = None
+    if config.enable_paper_trading:
+        try:
+            paper_trades = paper_trade_recent_slates(models, trainer, config)
+            if paper_trades is not None and not paper_trades.empty:
+                sample = paper_trades.tail(min(5, len(paper_trades)))
+                logging.info("Most recent paper trades:\n%s", sample.to_string(index=False))
+                out_path = Path("paper_trades.csv")
+                paper_trades.to_csv(out_path, index=False)
+                logging.info("Saved paper trading ledger to %s", out_path.resolve())
+        except Exception:
+            logging.exception("Paper trading simulation failed.")
 
     predict_upcoming_games(
         models,
