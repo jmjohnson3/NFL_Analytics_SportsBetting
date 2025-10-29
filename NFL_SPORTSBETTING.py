@@ -875,15 +875,41 @@ def build_player_prop_candidates(
         | odds_df["_player_name_key"].astype(bool)
     ].copy()
 
-    key_columns = [
-        "_event_key",
-        "_player_id_key",
-        "_player_name_key",
-        "_player_team_key",
+    pred_df["_pred_index"] = np.arange(len(pred_df))
+    odds_df["_odds_index"] = np.arange(len(odds_df))
+    pred_df = pred_df.set_index("_pred_index", drop=False)
+    odds_df = odds_df.set_index("_odds_index", drop=False)
+
+    merged_frames: List[pd.DataFrame] = []
+    remaining_pred = pred_df
+    remaining_odds = odds_df
+
+    for key_col in (
         "_player_id_event_key",
-        "_player_name_event_key",
         "_player_team_event_key",
-    ]
+        "_player_name_event_key",
+        "_player_id_key",
+        "_player_team_key",
+        "_player_name_key",
+    ):
+        preds_slice = remaining_pred[remaining_pred[key_col].astype(bool)].copy()
+        offers_slice = remaining_odds[remaining_odds[key_col].astype(bool)].copy()
+        merged_slice = _merge_player_prop_on_key(
+            preds_slice, offers_slice, key_col
+        )
+        if merged_slice.empty:
+            continue
+        merged_frames.append(merged_slice)
+        matched_pred_idx = merged_slice["_pred_index"].unique().tolist()
+        matched_odds_idx = (
+            merged_slice["_odds_index_book"].unique().tolist()
+            if "_odds_index_book" in merged_slice.columns
+            else []
+        )
+        if matched_pred_idx:
+            remaining_pred = remaining_pred.drop(index=matched_pred_idx, errors="ignore")
+        if matched_odds_idx:
+            remaining_odds = remaining_odds.drop(index=matched_odds_idx, errors="ignore")
 
     pred_df["_pred_index"] = np.arange(len(pred_df))
     odds_df["_odds_index"] = np.arange(len(odds_df))
@@ -10357,6 +10383,8 @@ class ModelTrainer:
                 "recent": recent_summary,
             }
 
+        recent_metrics: Optional[Dict[str, Any]] = None
+
         if target.endswith("_win_prob") and {"home_moneyline", "away_moneyline"}.issubset(out_df.columns):
             prediction_candidates: List[Tuple[str, np.ndarray]] = []
             if len(out_df):
@@ -10591,6 +10619,7 @@ class ModelTrainer:
                 hit_rate = best_option["hit_rate"]
                 n_bets = best_option["n_bets"]
                 edge_source = best_option["label"]
+                recent_metrics = best_option.get("recent")
 
         # Persist backtest metrics per fold + overall
         for row in per_fold:
