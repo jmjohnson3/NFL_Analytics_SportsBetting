@@ -875,8 +875,15 @@ def build_player_prop_candidates(
         | odds_df["_player_name_key"].astype(bool)
     ].copy()
 
-    if pred_df.empty or odds_df.empty:
-        return pd.DataFrame()
+    key_columns = [
+        "_event_key",
+        "_player_id_key",
+        "_player_name_key",
+        "_player_team_key",
+        "_player_id_event_key",
+        "_player_name_event_key",
+        "_player_team_event_key",
+    ]
 
     pred_df["_pred_index"] = np.arange(len(pred_df))
     odds_df["_odds_index"] = np.arange(len(odds_df))
