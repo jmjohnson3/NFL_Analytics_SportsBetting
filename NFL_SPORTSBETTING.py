@@ -3664,6 +3664,30 @@ class NFLDatabase:
             statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS injury_summary TEXT")
         if "odds_event_id" not in game_columns:
             statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS odds_event_id TEXT")
+        if "home_closing_moneyline" not in game_columns:
+            statements.append(
+                "ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS home_closing_moneyline DOUBLE PRECISION"
+            )
+        if "away_closing_moneyline" not in game_columns:
+            statements.append(
+                "ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS away_closing_moneyline DOUBLE PRECISION"
+            )
+        if "home_closing_implied_prob" not in game_columns:
+            statements.append(
+                "ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS home_closing_implied_prob DOUBLE PRECISION"
+            )
+        if "away_closing_implied_prob" not in game_columns:
+            statements.append(
+                "ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS away_closing_implied_prob DOUBLE PRECISION"
+            )
+        if "closing_bookmaker" not in game_columns:
+            statements.append(
+                "ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS closing_bookmaker TEXT"
+            )
+        if "closing_line_time" not in game_columns:
+            statements.append(
+                "ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS closing_line_time TIMESTAMPTZ"
+            )
 
         if "nfl_depth_charts" in table_names:
             try:
@@ -3721,6 +3745,12 @@ class NFLDatabase:
             Column("away_moneyline", Float),
             Column("home_implied_prob", Float),
             Column("away_implied_prob", Float),
+            Column("home_closing_moneyline", Float),
+            Column("away_closing_moneyline", Float),
+            Column("home_closing_implied_prob", Float),
+            Column("away_closing_implied_prob", Float),
+            Column("closing_bookmaker", String),
+            Column("closing_line_time", DateTime(timezone=True)),
             Column("odds_updated", DateTime(timezone=True)),
             Column("ingested_at", DateTime(timezone=True), default=default_now_utc),
         )
@@ -3945,6 +3975,12 @@ class NFLDatabase:
             self.games.c.away_moneyline,
             self.games.c.home_implied_prob,
             self.games.c.away_implied_prob,
+            self.games.c.home_closing_moneyline,
+            self.games.c.away_closing_moneyline,
+            self.games.c.home_closing_implied_prob,
+            self.games.c.away_closing_implied_prob,
+            self.games.c.closing_bookmaker,
+            self.games.c.closing_line_time,
             self.games.c.odds_updated,
         ]
         with self.engine.begin() as conn:
@@ -3964,7 +4000,13 @@ class NFLDatabase:
                     "away_moneyline": row[8],
                     "home_implied_prob": row[9],
                     "away_implied_prob": row[10],
-                    "odds_updated": row[11],
+                    "home_closing_moneyline": row[11],
+                    "away_closing_moneyline": row[12],
+                    "home_closing_implied_prob": row[13],
+                    "away_closing_implied_prob": row[14],
+                    "closing_bookmaker": row[15],
+                    "closing_line_time": row[16],
+                    "odds_updated": row[17],
                 }
             )
         return results
@@ -5297,7 +5339,40 @@ class NFLIngestor:
         totals_rows: List[Dict[str, Any]] = []
         prop_rows: List[Dict[str, Any]] = []
 
-        seen_events: Set[str] = set()
+        def _select_closing_bookmaker(
+            bookmakers: Sequence[Dict[str, Any]],
+            game_start: Optional[dt.datetime],
+        ) -> Tuple[Optional[Dict[str, Any]], Optional[dt.datetime]]:
+            if not bookmakers:
+                return None, None
+
+            ranked: List[Tuple[int, float, dt.datetime, Dict[str, Any]]] = []
+            for bookmaker in bookmakers:
+                update_raw = parse_dt(bookmaker.get("last_update"))
+                update_ts = update_raw or default_now_utc()
+                if game_start is not None:
+                    if update_ts <= game_start:
+                        priority = 0
+                        delta = abs((game_start - update_ts).total_seconds())
+                    elif update_ts <= game_start + dt.timedelta(minutes=15):
+                        priority = 1
+                        delta = abs((update_ts - game_start).total_seconds())
+                    else:
+                        priority = 2
+                        delta = abs((update_ts - game_start).total_seconds())
+                else:
+                    priority = 2
+                    delta = 0.0
+                ranked.append((priority, float(delta), update_ts, bookmaker))
+
+            ranked.sort(key=lambda item: (item[0], item[1], -item[2].timestamp()))
+            best_priority, _, best_update, best_book = ranked[0]
+            if best_priority >= 2 and bookmakers:
+                # If everything is post-kickoff, still return the freshest quote.
+                freshest = max(ranked, key=lambda item: item[2])
+                best_update, best_book = freshest[2], freshest[3]
+            return best_book, best_update
+
         for event in odds_data:
             event_id = str(event.get("id") or "")
             if not event_id or event_id in seen_events:
@@ -5353,12 +5428,21 @@ class NFLIngestor:
             )
 
             primary_book = sorted_books[0]
-            last_update = parse_dt(primary_book.get("last_update"))
+            last_update = parse_dt(primary_book.get("last_update")) or default_now_utc()
             moneyline_market = None
             for market in primary_book.get("markets", []) or []:
                 if (market.get("key") or "").lower() == "h2h":
                     moneyline_market = market
                     break
+
+            game_start = commence_time or _ensure_datetime(matched_game.get("start_time"))
+            closing_book, closing_time = _select_closing_bookmaker(sorted_books, game_start)
+            closing_market = None
+            if closing_book is not None:
+                for market in closing_book.get("markets", []) or []:
+                    if (market.get("key") or "").lower() == "h2h":
+                        closing_market = market
+                        break
 
             def _extract_team_price(outcomes: Iterable[Dict[str, Any]], team_abbr: str) -> Optional[float]:
                 for outcome in outcomes:
@@ -5379,12 +5463,23 @@ class NFLIngestor:
                 home_price = _extract_team_price(outcomes, home_team)
                 away_price = _extract_team_price(outcomes, away_team)
 
+            closing_home = None
+            closing_away = None
+            if closing_market:
+                outcomes = closing_market.get("outcomes", []) or []
+                closing_home = _extract_team_price(outcomes, home_team)
+                closing_away = _extract_team_price(outcomes, away_team)
+
+            closing_book_name = None
+            if closing_book is not None:
+                closing_book_name = closing_book.get("key") or closing_book.get("title") or "unknown"
+
             odds_rows.append(
                 {
                     "game_id": game_id,
                     "season": season,
                     "week": week,
-                    "start_time": commence_time or _ensure_datetime(matched_game.get("start_time")),
+                    "start_time": game_start,
                     "home_team": home_team,
                     "away_team": away_team,
                     "status": matched_game.get("status") or "scheduled",
@@ -5392,6 +5487,12 @@ class NFLIngestor:
                     "away_moneyline": away_price,
                     "home_implied_prob": _american_to_prob(home_price),
                     "away_implied_prob": _american_to_prob(away_price),
+                    "home_closing_moneyline": closing_home,
+                    "away_closing_moneyline": closing_away,
+                    "home_closing_implied_prob": _american_to_prob(closing_home),
+                    "away_closing_implied_prob": _american_to_prob(closing_away),
+                    "closing_bookmaker": closing_book_name,
+                    "closing_line_time": closing_time,
                     "odds_updated": last_update,
                     "odds_event_id": event_id,
                 }
@@ -5556,6 +5657,12 @@ class NFLIngestor:
                     "away_moneyline",
                     "home_implied_prob",
                     "away_implied_prob",
+                    "home_closing_moneyline",
+                    "away_closing_moneyline",
+                    "home_closing_implied_prob",
+                    "away_closing_implied_prob",
+                    "closing_bookmaker",
+                    "closing_line_time",
                     "odds_updated",
                     "home_team",
                     "away_team",
@@ -6517,6 +6624,12 @@ class FeatureBuilder:
             "away_moneyline",
             "home_implied_prob",
             "away_implied_prob",
+            "home_closing_moneyline",
+            "away_closing_moneyline",
+            "home_closing_implied_prob",
+            "away_closing_implied_prob",
+            "closing_bookmaker",
+            "closing_line_time",
             "odds_updated",
         ]
 
@@ -6551,6 +6664,17 @@ class FeatureBuilder:
                     working[prob_col] = working[prob_col].combine_first(derived)
                 else:
                     working[prob_col] = derived
+
+            closing_money_col = f"{side}_closing_moneyline"
+            closing_prob_col = f"{side}_closing_implied_prob"
+            if closing_money_col in working.columns:
+                derived_closing = self._american_to_prob_series(working[closing_money_col])
+                if closing_prob_col in working.columns:
+                    working[closing_prob_col] = working[closing_prob_col].combine_first(
+                        derived_closing
+                    )
+                else:
+                    working[closing_prob_col] = derived_closing
 
         working.drop(columns=["_start_date"], inplace=True, errors="ignore")
         return working
@@ -6868,6 +6992,7 @@ class FeatureBuilder:
         # Derive rolling scoring, rest, and win-rate indicators from historical games.
         team_game_history = self._compute_team_game_rolling_stats(games)
         self.team_history_frame = team_game_history
+        self.team_game_lookup = team_game_history
         penalties_by_week = pd.DataFrame()
         if not team_game_history.empty:
             penalties_by_week = (
@@ -10313,6 +10438,8 @@ class ModelTrainer:
                 moneyline_col = f"{side}_moneyline"
                 implied_col = f"{side}_implied_prob"
                 fair_col = f"{side}_fair_prob"
+                closing_money_col = f"{side}_closing_moneyline"
+                closing_prob_col = f"{side}_closing_implied_prob"
 
                 if moneyline_col not in working.columns:
                     working[moneyline_col] = np.nan
@@ -10320,11 +10447,27 @@ class ModelTrainer:
                     working.get(moneyline_col), errors="coerce"
                 )
 
+                if closing_money_col in working.columns:
+                    closing_series = pd.to_numeric(
+                        working.get(closing_money_col), errors="coerce"
+                    )
+                    working[moneyline_col] = closing_series.combine_first(
+                        working[moneyline_col]
+                    )
+
                 if implied_col not in working.columns:
                     working[implied_col] = np.nan
                 working[implied_col] = pd.to_numeric(
                     working.get(implied_col), errors="coerce"
                 )
+
+                if closing_prob_col in working.columns:
+                    closing_prob_series = pd.to_numeric(
+                        working.get(closing_prob_col), errors="coerce"
+                    )
+                    working[implied_col] = closing_prob_series.combine_first(
+                        working[implied_col]
+                    )
 
                 derived_probs = _american_to_prob(working[moneyline_col])
                 working[implied_col] = working[implied_col].fillna(derived_probs)
@@ -10569,7 +10712,12 @@ class ModelTrainer:
 
         # ---- Betting diagnostics ----
         # 1) MAE vs "closing lines" (if present)
-        closing_cols = [c for c in out_df.columns if c.startswith("line_") or c.endswith("_implied_prob")]
+        closing_cols = [
+            c
+            for c in out_df.columns
+            if c.startswith("line_") or c.endswith("_implied_prob")
+        ]
+        closing_cols.sort(key=lambda col: (0 if "closing" in col else 1, col))
         mae_vs_closing = None
         baseline_reference: Optional[pd.Series] = None
         if not target.endswith("_win_prob") and not out_df.empty:
@@ -10593,12 +10741,27 @@ class ModelTrainer:
                 out_df["_baseline_reference"] = baseline_reference
 
         if target.endswith("_win_prob"):
-            # join to implied probs derived from moneylines already in games table
-            # Expect columns like 'home_implied_prob'/'away_implied_prob' from ingest (see _ingest_odds)
             side = out_df.get("team_side")  # optional column you may carry ("home"/"away")
-            if side is not None and "home_implied_prob" in out_df and "away_implied_prob" in out_df:
-                cl = np.where(side == "home", out_df["home_implied_prob"], out_df["away_implied_prob"])
-                mae_vs_closing = float(np.nanmean(np.abs(out_df["_y_pred"] - cl)))
+            if side is not None:
+                home_ref = pd.Series(np.nan, index=out_df.index, dtype=float)
+                away_ref = pd.Series(np.nan, index=out_df.index, dtype=float)
+                if "home_closing_implied_prob" in out_df:
+                    home_ref = pd.to_numeric(out_df["home_closing_implied_prob"], errors="coerce")
+                if "away_closing_implied_prob" in out_df:
+                    away_ref = pd.to_numeric(out_df["away_closing_implied_prob"], errors="coerce")
+                if "home_implied_prob" in out_df:
+                    home_ref = home_ref.combine_first(
+                        pd.to_numeric(out_df["home_implied_prob"], errors="coerce")
+                    )
+                if "away_implied_prob" in out_df:
+                    away_ref = away_ref.combine_first(
+                        pd.to_numeric(out_df["away_implied_prob"], errors="coerce")
+                    )
+                if home_ref.notna().any() or away_ref.notna().any():
+                    cl = np.where(side == "home", home_ref, away_ref)
+                    mae_vs_closing = float(
+                        np.nanmean(np.abs(out_df["_y_pred"] - pd.to_numeric(cl, errors="coerce")))
+                    )
         elif closing_cols:
             # e.g., player props with 'line_receiving_yards', etc.
             # Choose the first matching line as a reference
@@ -10626,22 +10789,39 @@ class ModelTrainer:
             if preds_array.size != len(out_df) or not len(out_df):
                 return None
 
-            required_cols = {"home_moneyline", "away_moneyline", "home_score", "away_score"}
-            missing_required = required_cols - set(out_df.columns)
-            if missing_required:
+            pred_series = pd.Series(preds_array, index=out_df.index, dtype=float)
+
+            required_score_cols = {"home_score", "away_score"}
+            missing_scores = required_score_cols - set(out_df.columns)
+            if missing_scores:
                 logging.debug(
-                    "%s: skipping edge evaluation (%s missing)",
+                    "%s: skipping edge evaluation (score columns missing: %s)",
                     target,
-                    ", ".join(sorted(missing_required)),
+                    ", ".join(sorted(missing_scores)),
                 )
                 return None
 
-            price_cols = ["home_moneyline", "away_moneyline"]
-            market_frame = out_df.loc[:, price_cols].apply(pd.to_numeric, errors="coerce")
-            pred_series = pd.Series(preds_array, index=out_df.index, dtype=float)
+            def _merge_price(side: str) -> pd.Series:
+                candidates: List[pd.Series] = []
+                for col in (f"{side}_closing_moneyline", f"{side}_moneyline"):
+                    if col in out_df.columns:
+                        candidates.append(pd.to_numeric(out_df[col], errors="coerce"))
+                if not candidates:
+                    return pd.Series(np.nan, index=out_df.index, dtype=float)
+                series = candidates[0]
+                for extra in candidates[1:]:
+                    series = series.combine_first(extra)
+                return series
 
-            home_prices = market_frame["home_moneyline"].astype(float)
-            away_prices = market_frame["away_moneyline"].astype(float)
+            home_prices = _merge_price("home")
+            away_prices = _merge_price("away")
+
+            if home_prices.notna().sum() == 0 and away_prices.notna().sum() == 0:
+                logging.debug(
+                    "%s: skipping edge evaluation (no recorded sportsbook moneylines)",
+                    target,
+                )
+                return None
 
             home_probs = _american_to_prob(home_prices)
             away_probs = _american_to_prob(away_prices)
@@ -12725,7 +12905,21 @@ def paper_trade_recent_slates(
         & completed["home_score"].notna()
         & completed["away_score"].notna()
     ]
-    completed = completed.dropna(subset=["home_moneyline", "away_moneyline"], how="any")
+    def _resolve_price_series(frame: pd.DataFrame, side: str) -> pd.Series:
+        candidates: List[pd.Series] = []
+        for col in (f"{side}_closing_moneyline", f"{side}_moneyline"):
+            if col in frame.columns:
+                candidates.append(pd.to_numeric(frame[col], errors="coerce"))
+        if not candidates:
+            return pd.Series(np.nan, index=frame.index, dtype=float)
+        series = candidates[0]
+        for extra in candidates[1:]:
+            series = series.combine_first(extra)
+        return series
+
+    completed["_home_price"] = _resolve_price_series(completed, "home")
+    completed["_away_price"] = _resolve_price_series(completed, "away")
+    completed = completed.dropna(subset=["_home_price", "_away_price"], how="all")
 
     lookback_days = max(int(config.paper_trade_lookback_days), 0)
     if lookback_days > 0:
@@ -12804,8 +12998,16 @@ def paper_trade_recent_slates(
         return -odds_val / (-odds_val + 100.0)
 
     for idx, row in completed.iterrows():
-        home_odds = row.get("home_moneyline")
-        away_odds = row.get("away_moneyline")
+        home_odds = row.get("home_closing_moneyline")
+        away_odds = row.get("away_closing_moneyline")
+        if pd.isna(home_odds):
+            home_odds = row.get("home_moneyline")
+        if pd.isna(away_odds):
+            away_odds = row.get("away_moneyline")
+        if pd.isna(home_odds):
+            home_odds = row.get("_home_price")
+        if pd.isna(away_odds):
+            away_odds = row.get("_away_price")
         if pd.isna(home_odds) and pd.isna(away_odds):
             continue
 
@@ -12875,6 +13077,7 @@ def paper_trade_recent_slates(
                 "expected_value": expected_val,
                 "result": result,
                 "profit": profit,
+                "closing_bookmaker": row.get("closing_bookmaker"),
             }
         )
 
@@ -12896,7 +13099,74 @@ def paper_trade_recent_slates(
 
     trades_df = pd.DataFrame(trades)
     trades_df.sort_values("start_time", inplace=True)
-    return trades_df
+
+    ledger_path = Path("paper_trades.csv")
+    combined_df = trades_df.copy()
+    if ledger_path.exists():
+        try:
+            existing = pd.read_csv(ledger_path)
+        except Exception:
+            logging.warning("Paper trading: unable to read existing ledger at %s; recreating it.", ledger_path)
+        else:
+            if not existing.empty:
+                if "start_time" in existing.columns:
+                    existing["start_time"] = pd.to_datetime(existing["start_time"], errors="coerce")
+                combined_df = safe_concat([existing, trades_df], ignore_index=True, sort=False)
+                dedupe_keys = ["game_id", "team_side"]
+                if "start_time" in combined_df.columns:
+                    dedupe_keys.append("start_time")
+                dedupe_keys = [col for col in dedupe_keys if col in combined_df.columns]
+                if dedupe_keys:
+                    combined_df = (
+                        combined_df.sort_values("start_time")
+                        .drop_duplicates(subset=dedupe_keys, keep="last")
+                    )
+
+    combined_df.to_csv(ledger_path, index=False)
+    logging.info(
+        "Saved paper trading ledger to %s (%d total rows)",
+        ledger_path.resolve(),
+        len(combined_df),
+    )
+
+    settled = combined_df[combined_df["result"].isin(["win", "loss", "push"])]
+    if not settled.empty:
+        settled = settled.copy()
+        settled["stake"] = pd.to_numeric(settled.get("stake"), errors="coerce")
+        settled["profit"] = pd.to_numeric(settled.get("profit"), errors="coerce")
+        total_staked_all = settled["stake"].fillna(0.0).sum()
+        total_profit_all = settled["profit"].fillna(0.0).sum()
+        graded = settled[settled["result"].isin(["win", "loss"])]
+        graded_count = len(graded)
+        if total_staked_all > 0 and graded_count:
+            cumulative_roi = total_profit_all / total_staked_all
+            logging.info(
+                "Paper trading cumulative ROI: %.2f%% across %d graded bets",
+                cumulative_roi * 100.0,
+                graded_count,
+            )
+
+        if "start_time" in settled.columns:
+            settled["start_time"] = pd.to_datetime(settled["start_time"], errors="coerce")
+            if lookback_days > 0:
+                recent_cutoff = default_now_utc() - dt.timedelta(days=lookback_days)
+                recent = settled[settled["start_time"] >= recent_cutoff]
+            else:
+                recent = settled
+            recent = recent[recent["result"].isin(["win", "loss"])]
+            if not recent.empty:
+                recent_staked = recent["stake"].fillna(0.0).sum()
+                recent_profit = recent["profit"].fillna(0.0).sum()
+                if recent_staked > 0:
+                    recent_roi = recent_profit / recent_staked
+                    logging.info(
+                        "Paper trading %d-day ROI: %.2f%% across %d graded bets",
+                        lookback_days,
+                        recent_roi * 100.0,
+                        len(recent),
+                    )
+
+    return combined_df
 
 
 # ---------------------------------------------------------------------------
@@ -12997,9 +13267,10 @@ def main() -> None:
             if paper_trades is not None and not paper_trades.empty:
                 sample = paper_trades.tail(min(5, len(paper_trades)))
                 logging.info("Most recent paper trades:\n%s", sample.to_string(index=False))
-                out_path = Path("paper_trades.csv")
-                paper_trades.to_csv(out_path, index=False)
-                logging.info("Saved paper trading ledger to %s", out_path.resolve())
+                logging.info(
+                    "Paper trading ledger now contains %d recorded wagers.",
+                    len(paper_trades),
+                )
         except Exception:
             logging.exception("Paper trading simulation failed.")
 
