@@ -875,131 +875,15 @@ def build_player_prop_candidates(
         | odds_df["_player_name_key"].astype(bool)
     ].copy()
 
-    def _as_series(df: pd.DataFrame, column: str) -> pd.Series:
-        """Return the named column as a Series even if duplicates created a DataFrame."""
-
-        values = df[column]
-        if isinstance(values, pd.DataFrame):
-            # Retain the first occurrence – duplicate columns are equivalent for our keys.
-            values = values.iloc[:, 0]
-        return values
-
-    def _annotate_keys(frame: pd.DataFrame) -> pd.DataFrame:
-        base = frame.copy()
-        base = base.loc[:, ~base.columns.duplicated(keep="first")]
-        base = base.drop(columns=key_columns, errors="ignore")
-
-        if base.empty:
-            result = base
-            for col in key_columns:
-                result[col] = pd.Series(dtype=str)
-            return result
-
-        keys = frame.apply(_extract_keys, axis=1)
-        result = base
-        for col in key_columns:
-            result[col] = keys[col]
-
-        team_values = _as_series(result, "_player_team_key")
-        mask = team_values.astype(bool)
-        if not mask.all():
-            name_values = _as_series(result, "_player_name_key")
-            replacement = name_values.loc[~mask]
-            result.loc[~mask, "_player_team_key"] = replacement
-
-        team_event_values = _as_series(result, "_player_team_event_key")
-        mask_event = team_event_values.astype(bool)
-        if not mask_event.all():
-            name_event_values = _as_series(result, "_player_name_event_key")
-            replacement_event = name_event_values.loc[~mask_event]
-            result.loc[~mask_event, "_player_team_event_key"] = replacement_event
-        return result
-
-    pred_df = _annotate_keys(pred_df)
-    odds_df = _annotate_keys(odds_df)
-
-    pred_df = pred_df[
-        pred_df["_player_id_key"].astype(bool)
-        | pred_df["_player_team_key"].astype(bool)
-        | pred_df["_player_name_key"].astype(bool)
-    ].copy()
-    odds_df = odds_df[
-        odds_df["_player_id_key"].astype(bool)
-        | odds_df["_player_team_key"].astype(bool)
-        | odds_df["_player_name_key"].astype(bool)
-    ].copy()
-
-    pred_df["_pred_index"] = np.arange(len(pred_df))
-    odds_df["_odds_index"] = np.arange(len(odds_df))
-    pred_df = pred_df.set_index("_pred_index", drop=False)
-    odds_df = odds_df.set_index("_odds_index", drop=False)
-
-    merged_frames: List[pd.DataFrame] = []
-    remaining_pred = pred_df
-    remaining_odds = odds_df
-
-    for key_col in (
-        "_player_id_event_key",
-        "_player_team_event_key",
-        "_player_name_event_key",
+    key_columns = [
+        "_event_key",
         "_player_id_key",
-        "_player_team_key",
         "_player_name_key",
-    ):
-        preds_slice = remaining_pred[remaining_pred[key_col].astype(bool)].copy()
-        offers_slice = remaining_odds[remaining_odds[key_col].astype(bool)].copy()
-        merged_slice = _merge_player_prop_on_key(
-            preds_slice, offers_slice, key_col
-        )
-        if merged_slice.empty:
-            continue
-        merged_frames.append(merged_slice)
-        matched_pred_idx = merged_slice["_pred_index"].unique().tolist()
-        matched_odds_idx = (
-            merged_slice["_odds_index_book"].unique().tolist()
-            if "_odds_index_book" in merged_slice.columns
-            else []
-        )
-        if matched_pred_idx:
-            remaining_pred = remaining_pred.drop(index=matched_pred_idx, errors="ignore")
-        if matched_odds_idx:
-            remaining_odds = remaining_odds.drop(index=matched_odds_idx, errors="ignore")
-
-    pred_df["_pred_index"] = np.arange(len(pred_df))
-    odds_df["_odds_index"] = np.arange(len(odds_df))
-    pred_df = pred_df.set_index("_pred_index", drop=False)
-    odds_df = odds_df.set_index("_odds_index", drop=False)
-
-    merged_frames: List[pd.DataFrame] = []
-    remaining_pred = pred_df
-    remaining_odds = odds_df
-
-    for key_col in (
+        "_player_team_key",
         "_player_id_event_key",
-        "_player_team_event_key",
         "_player_name_event_key",
-        "_player_id_key",
-        "_player_team_key",
-        "_player_name_key",
-    ):
-        preds_slice = remaining_pred[remaining_pred[key_col].astype(bool)].copy()
-        offers_slice = remaining_odds[remaining_odds[key_col].astype(bool)].copy()
-        merged_slice = _merge_player_prop_on_key(
-            preds_slice, offers_slice, key_col
-        )
-        if merged_slice.empty:
-            continue
-        merged_frames.append(merged_slice)
-        matched_pred_idx = merged_slice["_pred_index"].unique().tolist()
-        matched_odds_idx = (
-            merged_slice["_odds_index_book"].unique().tolist()
-            if "_odds_index_book" in merged_slice.columns
-            else []
-        )
-        if matched_pred_idx:
-            remaining_pred = remaining_pred.drop(index=matched_pred_idx, errors="ignore")
-        if matched_odds_idx:
-            remaining_odds = remaining_odds.drop(index=matched_odds_idx, errors="ignore")
+        "_player_team_event_key",
+    ]
 
     pred_df["_pred_index"] = np.arange(len(pred_df))
     odds_df["_odds_index"] = np.arange(len(odds_df))
@@ -4940,16 +4824,39 @@ class NFLIngestor:
 
         games_by_event: Dict[str, Dict[str, Any]] = {}
         games_by_key: Dict[Tuple[str, str, Optional[dt.date]], List[Dict[str, Any]]] = defaultdict(list)
-        min_start: Optional[dt.datetime] = None
-        max_start: Optional[dt.datetime] = None
+        refresh_candidates: Dict[str, Dict[str, Any]] = {}
+        missing_count = 0
+        stale_count = 0
+        now_utc = default_now_utc()
+        stale_cutoff = now_utc - dt.timedelta(hours=6)
+        upcoming_window_end = now_utc + dt.timedelta(days=7)
+        recent_window_start = now_utc - dt.timedelta(days=14)
+
+        def _needs_refresh(row: Dict[str, Any], start_time: Optional[dt.datetime]) -> bool:
+            nonlocal missing_count, stale_count
+            home_price = row.get("home_moneyline")
+            away_price = row.get("away_moneyline")
+            odds_updated = _ensure_datetime(row.get("odds_updated"))
+
+            missing_prices = pd.isna(home_price) or pd.isna(away_price)
+            if missing_prices:
+                missing_count += 1
+                return True
+
+            if start_time is None:
+                return False
+
+            is_recent_game = recent_window_start <= start_time <= upcoming_window_end
+            if not is_recent_game:
+                return False
+
+            stale = odds_updated is None or odds_updated < stale_cutoff
+            if stale:
+                stale_count += 1
+            return stale
 
         for row in game_lookup_rows:
             start_time = _ensure_datetime(row.get("start_time"))
-            if start_time is not None:
-                if min_start is None or start_time < min_start:
-                    min_start = start_time
-                if max_start is None or start_time > max_start:
-                    max_start = start_time
             home = normalize_team_abbr(row.get("home_team"))
             away = normalize_team_abbr(row.get("away_team"))
             if home and away:
@@ -4958,6 +4865,46 @@ class NFLIngestor:
             event_id = row.get("odds_event_id")
             if event_id:
                 games_by_event[str(event_id)] = row
+
+            game_id = str(row.get("game_id")) if row.get("game_id") is not None else None
+            if game_id:
+                if _needs_refresh(row, start_time):
+                    refresh_candidates[game_id] = row
+                elif (
+                    start_time is not None
+                    and recent_window_start <= start_time <= upcoming_window_end
+                ):
+                    # Always refresh the upcoming slate to capture line movement and props
+                    refresh_candidates.setdefault(game_id, row)
+
+        rows_needing_refresh = list(refresh_candidates.values())
+
+        if rows_needing_refresh:
+            start_candidates = [
+                _ensure_datetime(row.get("start_time"))
+                for row in rows_needing_refresh
+                if _ensure_datetime(row.get("start_time")) is not None
+            ]
+            if start_candidates:
+                min_start = min(start_candidates)
+                max_start = max(start_candidates)
+            else:
+                min_start = now_utc - dt.timedelta(days=7)
+                max_start = now_utc + dt.timedelta(days=7)
+        else:
+            min_start = now_utc - dt.timedelta(days=7)
+            max_start = now_utc + dt.timedelta(days=7)
+
+        if not rows_needing_refresh:
+            logging.info("All tracked games already have up-to-date sportsbook odds.")
+            return
+
+        logging.info(
+            "Refreshing odds for %d games (missing=%d, stale=%d)",
+            len(rows_needing_refresh),
+            missing_count,
+            stale_count,
+        )
 
         if min_start is None:
             min_start = default_now_utc() - dt.timedelta(days=7)
@@ -10176,30 +10123,33 @@ class ModelTrainer:
             away_valid = away_prices.notna() & away_probs.notna()
             valid_mask = (home_valid | away_valid) & results_mask
 
-            synthetic_odds_used = False
-            # TODO: Ensure historical odds are persisted prior to evaluation so that
-            # live ROI metrics no longer rely on this synthetic -110 moneyline
-            # fallback. Once genuine prices are available, this branch should become
-            # an explicit opt-in emergency path.
             if not valid_mask.any():
-                logging.debug(
-                    "%s: no rows with market odds; using synthetic -110 moneylines for diagnostics",
-                    target,
-                )
-                synthetic_odds_used = True
-                fallback_prices = pd.Series(-110.0, index=out_df.index, dtype=float)
-                implied = _american_to_prob(fallback_prices)
-                home_prices = fallback_prices.copy()
-                away_prices = fallback_prices.copy()
-                home_probs = implied.copy()
-                away_probs = implied.copy()
-                valid_mask = results_mask.copy()
-                home_valid = valid_mask.copy()
-                away_valid = valid_mask.copy()
-
-            if not valid_mask.any():
-                logging.debug("%s: no rows with complete market data for edge check", target)
+                missing_without_odds = results_mask & ~(home_valid | away_valid)
+                subset_cols = [
+                    col for col in ["game_id", "season", "week"] if col in out_df.columns
+                ]
+                if subset_cols:
+                    missing_rows = out_df.loc[missing_without_odds, subset_cols].drop_duplicates()
+                else:
+                    missing_rows = pd.DataFrame(index=out_df.index[missing_without_odds])
+                if not missing_rows.empty:
+                    logging.warning(
+                        "%s: skipping ROI evaluation because %d games lack recorded moneylines. "
+                        "Run the odds ingestion backfill to capture historical prices before betting decisions.",
+                        target,
+                        len(missing_rows),
+                    )
+                else:
+                    logging.warning("%s: no rows with complete market data for edge check", target)
                 return None
+
+            missing_without_odds = results_mask & ~(home_valid | away_valid)
+            if missing_without_odds.any():
+                logging.info(
+                    "%s: dropping %d completed games without stored moneylines from ROI calculation",
+                    target,
+                    int(missing_without_odds.sum()),
+                )
 
             pred_series = pred_series.loc[valid_mask]
             home_probs = home_probs.loc[valid_mask]
@@ -10240,8 +10190,23 @@ class ModelTrainer:
                     home_df["_threshold"] = threshold
                     home_df["_side"] = "home"
                     home_df["_is_push"] = False
+                    if "start_time" in out_df.columns:
+                        home_df["_start_time"] = pd.to_datetime(
+                            out_df.loc[home_index, "start_time"], errors="coerce"
+                        )
+                    home_columns = [
+                        "p_model",
+                        "side_win",
+                        "payout",
+                        "_edge",
+                        "_threshold",
+                        "_side",
+                        "_is_push",
+                    ]
+                    if "_start_time" in home_df.columns:
+                        home_columns.append("_start_time")
                     picks.append(
-                        home_df[["p_model", "side_win", "payout", "_edge", "_threshold", "_side", "_is_push"]]
+                        home_df[home_columns]
                     )
 
                 pick_away = away_valid & (choose_away > threshold)
@@ -10257,8 +10222,23 @@ class ModelTrainer:
                     away_df["_threshold"] = threshold
                     away_df["_side"] = "away"
                     away_df["_is_push"] = False
+                    if "start_time" in out_df.columns:
+                        away_df["_start_time"] = pd.to_datetime(
+                            out_df.loc[away_index, "start_time"], errors="coerce"
+                        )
+                    away_columns = [
+                        "p_model",
+                        "side_win",
+                        "payout",
+                        "_edge",
+                        "_threshold",
+                        "_side",
+                        "_is_push",
+                    ]
+                    if "_start_time" in away_df.columns:
+                        away_columns.append("_start_time")
                     picks.append(
-                        away_df[["p_model", "side_win", "payout", "_edge", "_threshold", "_side", "_is_push"]]
+                        away_df[away_columns]
                     )
 
                 if not picks:
@@ -10305,8 +10285,6 @@ class ModelTrainer:
                     label_suffix = f"{label}|forced_top_edges"
                 elif selected_threshold != min_edge:
                     label_suffix = f"{label}|thr={selected_threshold:+.3f}"
-            if synthetic_odds_used:
-                label_suffix = f"{label_suffix}|synthetic_odds"
 
             bet_count = len(picks_df)
             returns = np.where(
@@ -10325,6 +10303,50 @@ class ModelTrainer:
                 hit_val = float(np.mean(picks_df.loc[non_push_mask, "side_win"]))
             else:
                 hit_val = float("nan")
+
+            recent_summary: Optional[Dict[str, Any]] = None
+            if "_start_time" in picks_df.columns and picks_df["_start_time"].notna().any():
+                valid_times = picks_df.loc[picks_df["_start_time"].notna(), "_start_time"]
+                latest_time = valid_times.max()
+                if isinstance(latest_time, dt.datetime):
+                    recent_cutoff = latest_time - dt.timedelta(weeks=8)
+                    recent_df = picks_df.loc[picks_df["_start_time"] >= recent_cutoff]
+                    if len(recent_df) >= 10:
+                        recent_returns = np.where(
+                            recent_df["_is_push"],
+                            0.0,
+                            np.where(
+                                recent_df["side_win"] == 1,
+                                recent_df["payout"].values,
+                                -1.0,
+                            ),
+                        )
+                        recent_roi = float(np.mean(recent_returns))
+                        r_mean = recent_returns.mean()
+                        r_std = (
+                            recent_returns.std(ddof=1)
+                            if len(recent_returns) > 1
+                            else 0.0
+                        )
+                        r_se = r_std / math.sqrt(max(len(recent_returns), 1))
+                        r_lo, r_hi = float(r_mean - z * r_se), float(r_mean + z * r_se)
+                        non_push_recent = ~recent_df["_is_push"].astype(bool)
+                        if non_push_recent.any():
+                            recent_hit = float(
+                                np.mean(recent_df.loc[non_push_recent, "side_win"])
+                            )
+                        else:
+                            recent_hit = float("nan")
+                        recent_summary = {
+                            "roi": recent_roi,
+                            "roi_lo": r_lo,
+                            "roi_hi": r_hi,
+                            "hit_rate": recent_hit,
+                            "n_bets": int(len(recent_df)),
+                            "window_start": recent_cutoff,
+                            "window_end": latest_time,
+                        }
+
             return {
                 "roi": roi_val,
                 "roi_lo": roi_lo_val,
@@ -10332,6 +10354,7 @@ class ModelTrainer:
                 "hit_rate": hit_val,
                 "n_bets": bet_count,
                 "label": label_suffix,
+                "recent": recent_summary,
             }
 
         if target.endswith("_win_prob") and {"home_moneyline", "away_moneyline"}.issubset(out_df.columns):
@@ -10361,6 +10384,9 @@ class ModelTrainer:
                 hit_rate = best_option["hit_rate"]
                 n_bets = best_option["n_bets"]
                 edge_source = best_option["label"]
+                recent_metrics = best_option.get("recent")
+            else:
+                recent_metrics = None
         elif baseline_reference is not None and baseline_reference.notna().any():
             def _evaluate_numeric_edges(
                 preds_array: np.ndarray, label: str
@@ -10507,8 +10533,7 @@ class ModelTrainer:
                         label_suffix = f"{label_suffix}|forced_top_edges"
                     elif selected_threshold != min_edge:
                         label_suffix = f"{label_suffix}|thr={selected_threshold:+.3f}"
-                label_suffix = f"{label_suffix}|priors_baseline|synthetic_odds"
-
+                label_suffix = f"{label_suffix}|priors_baseline"
                 bet_count = len(picks_df)
                 returns = []
                 for _, row in picks_df.iterrows():
@@ -10586,6 +10611,7 @@ class ModelTrainer:
                 "bets": n_bets,
                 "edge_source": edge_source,
                 "mode": evaluation_mode,
+                "recent": recent_metrics,
             }
         else:
             summary = {
@@ -10600,11 +10626,40 @@ class ModelTrainer:
                 "bets": n_bets,
                 "edge_source": edge_source,
                 "mode": evaluation_mode,
+                "recent": recent_metrics,
             }
         self.db.record_backtest_metrics(self.run_id, target, summary, sample_size=int(len(out_df)))
 
+        recent_log = ""
+        if summary.get("recent"):
+            recent = summary["recent"]
+            recent_roi = recent.get("roi")
+            recent_ci = None
+            if "roi_lo" in recent and "roi_hi" in recent:
+                recent_ci = (recent["roi_lo"], recent["roi_hi"])
+            recent_hit = recent.get("hit_rate")
+            recent_n = recent.get("n_bets")
+            recent_window_start = recent.get("window_start")
+            recent_window_end = recent.get("window_end")
+            recent_log = " | recent_roi="
+            if recent_roi is not None and math.isfinite(recent_roi):
+                recent_log += f"{recent_roi:.3f}"
+            else:
+                recent_log += "n/a"
+            if recent_ci and all(math.isfinite(x) for x in recent_ci):
+                recent_log += f" (CI=({recent_ci[0]:.3f},{recent_ci[1]:.3f}))"
+            if recent_hit is not None and math.isfinite(recent_hit):
+                recent_log += f" | recent_hit={recent_hit:.3f}"
+            if recent_n is not None:
+                recent_log += f" | recent_bets={recent_n}"
+            if recent_window_start is not None and recent_window_end is not None:
+                recent_log += (
+                    " | window="
+                    f"{recent_window_start:%Y-%m-%d}->{recent_window_end:%Y-%m-%d}"
+                )
+
         logging.info(
-            "%s %s | folds=%d | MAE=%.3f | RMSE=%.3f | MAE_vs_close=%s | ROI=%s (CI=%s) | bets=%d | edge_source=%s",
+            "%s %s | folds=%d | MAE=%.3f | RMSE=%.3f | MAE_vs_close=%s | ROI=%s (CI=%s) | bets=%d | edge_source=%s%s",
             target,
             evaluation_mode,
             summary["folds"],
@@ -10615,6 +10670,7 @@ class ModelTrainer:
             f"({summary['roi_ci'][0]:.3f},{summary['roi_ci'][1]:.3f})" if summary["roi_ci"] else "n/a",
             summary["bets"],
             summary.get("edge_source") or "n/a",
+            recent_log,
         )
 
         # ---- Deployment guard: beat the vig with lower CI bound ----
