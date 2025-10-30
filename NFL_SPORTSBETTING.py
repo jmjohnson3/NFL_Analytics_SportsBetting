@@ -99,6 +99,20 @@ from sqlalchemy.exc import SQLAlchemyError
 from urllib.parse import urlencode
 
 
+SCRIPT_ROOT = Path(__file__).resolve().parent
+
+
+def _default_data_file(name: str) -> Optional[str]:
+    candidate = SCRIPT_ROOT / "data" / name
+    if candidate.exists():
+        return str(candidate)
+    return None
+
+
+DEFAULT_CLOSING_ODDS_PATH = _default_data_file("closing_odds_history.csv")
+DEFAULT_TRAVEL_CONTEXT_PATH = _default_data_file("team_travel_context.csv")
+
+
 # ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
 def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
     if df is None:
@@ -3708,8 +3722,8 @@ class NFLConfig:
     depth_chart_path: Optional[str] = os.getenv("NFL_DEPTH_PATH")
     advanced_metrics_path: Optional[str] = os.getenv("NFL_ADVANCED_PATH")
     weather_forecast_path: Optional[str] = os.getenv("NFL_FORECAST_PATH")
-    closing_odds_history_path: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PATH")
-    rest_travel_context_path: Optional[str] = os.getenv("NFL_TRAVEL_CONTEXT_PATH")
+    closing_odds_history_path: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PATH") or DEFAULT_CLOSING_ODDS_PATH
+    rest_travel_context_path: Optional[str] = os.getenv("NFL_TRAVEL_CONTEXT_PATH") or DEFAULT_TRAVEL_CONTEXT_PATH
     respect_lineups: bool = True
     odds_allow_insecure_ssl: bool = env_flag("ODDS_ALLOW_INSECURE_SSL", False)
     enable_paper_trading: bool = env_flag("NFL_PAPER_TRADE", False)
@@ -6997,9 +7011,9 @@ class FeatureBuilder:
                     lambda x: int(x) if pd.notna(x) else None
                 )
 
-            def _merge_travel(prefix: str, team_col: str) -> None:
+            def _merge_travel(prefix: str, team_col: str) -> Optional[pd.DataFrame]:
                 if not {"season", "week", team_col}.issubset(games.columns):
-                    return
+                    return None
                 context_cols = [
                     "rest_days",
                     "rest_penalty",
@@ -7009,7 +7023,7 @@ class FeatureBuilder:
                 ]
                 available = [col for col in context_cols if col in travel_df.columns]
                 if not available:
-                    return
+                    return None
                 rename_map = {col: f"{prefix}_{col}" for col in available}
                 merge_frame = travel_df[["season", "week", "team", *available]].rename(
                     columns=rename_map | {"team": team_col}
@@ -11015,8 +11029,11 @@ class ModelTrainer:
         elif closing_cols:
             # e.g., player props with 'line_receiving_yards', etc.
             # Choose the first matching line as a reference
-            ref = out_df[closing_cols[0]].astype(float)
-            mae_vs_closing = float(np.nanmean(np.abs(out_df["_y_pred"] - ref)))
+            ref = pd.to_numeric(out_df[closing_cols[0]], errors="coerce")
+            if ref.notna().any():
+                mae_vs_closing = float(
+                    np.nanmean(np.abs(out_df["_y_pred"] - ref.astype(float)))
+                )
 
         if mae_vs_closing is None and baseline_reference is not None:
             if baseline_reference.notna().any():
@@ -13527,7 +13544,9 @@ def main() -> None:
             logging.error("Prediction generation skipped because no models were available.")
         return
 
-    games_frame = trainer.feature_builder.games_frame or pd.DataFrame()
+    games_frame = getattr(trainer.feature_builder, "games_frame", None)
+    if games_frame is None:
+        games_frame = pd.DataFrame()
 
     def _coverage(frame: pd.DataFrame, columns: Sequence[str]) -> float:
         available_cols = [col for col in columns if col in frame.columns]
