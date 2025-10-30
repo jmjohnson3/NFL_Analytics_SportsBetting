@@ -6660,6 +6660,7 @@ class FeatureBuilder:
     ):
         self.engine = engine
         self.games_frame: Optional[pd.DataFrame] = None
+        self.games_frame_raw: Optional[pd.DataFrame] = None
         self.player_feature_frame: Optional[pd.DataFrame] = None
         self.team_strength_frame: Optional[pd.DataFrame] = None
         self.team_strength_latest_by_season: Optional[pd.DataFrame] = None
@@ -6856,6 +6857,45 @@ class FeatureBuilder:
                     supplemental.drop(columns=[temporary_game_id_key], inplace=True, errors="ignore")
 
         working.drop(columns=["_start_date"], inplace=True, errors="ignore")
+
+        inferred_mask = pd.Series(False, index=working.index)
+        for side in ("home", "away"):
+            closing_col = f"{side}_closing_moneyline"
+            fallback_col = f"{side}_moneyline"
+            closing_prob_col = f"{side}_closing_implied_prob"
+
+            if closing_col not in working.columns or fallback_col not in working.columns:
+                continue
+
+            missing = working[closing_col].isna() & working[fallback_col].notna()
+            if not missing.any():
+                continue
+
+            working.loc[missing, closing_col] = working.loc[missing, fallback_col]
+
+            fallback_probs = self._american_to_prob_series(working.loc[missing, fallback_col])
+            if closing_prob_col in working.columns:
+                combined = working.loc[missing, closing_prob_col]
+                combined = combined.fillna(fallback_probs)
+                working.loc[missing, closing_prob_col] = combined
+            else:
+                working.loc[missing, closing_prob_col] = fallback_probs
+
+            inferred_mask = inferred_mask | missing
+
+        if inferred_mask.any():
+            if "closing_bookmaker" in working.columns:
+                working.loc[inferred_mask, "closing_bookmaker"] = working.loc[
+                    inferred_mask, "closing_bookmaker"
+                ].fillna("inferred_last_snapshot")
+            if "closing_line_time" in working.columns:
+                inferred_times = working.loc[inferred_mask, "closing_line_time"]
+                if "odds_updated" in working.columns:
+                    inferred_times = inferred_times.fillna(working.loc[inferred_mask, "odds_updated"])
+                if "start_time" in working.columns:
+                    inferred_times = inferred_times.fillna(working.loc[inferred_mask, "start_time"])
+                working.loc[inferred_mask, "closing_line_time"] = inferred_times
+
         return working
 
     def _build_team_game_lookup(self, games: pd.DataFrame) -> pd.DataFrame:
@@ -7105,6 +7145,7 @@ class FeatureBuilder:
             return {}
 
         games = games.copy()
+        self.games_frame_raw = games.copy()
         games = self._backfill_game_odds(games)
         if "home_moneyline" in games.columns and "away_moneyline" in games.columns:
             odds_lookup = games.dropna(subset=["home_moneyline", "away_moneyline"], how="any").copy()
@@ -7767,6 +7808,7 @@ class FeatureBuilder:
         )
 
         games_context["point_diff"] = games_context["home_score"] - games_context["away_score"]
+        self.games_frame = games_context.copy()
         games_labeled = games_context.dropna(subset=["home_score", "away_score"])
         if games_labeled.empty:
             logging.warning(

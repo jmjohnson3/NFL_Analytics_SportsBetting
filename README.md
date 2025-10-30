@@ -31,6 +31,23 @@ should you.
 Only after these gaps are addressed should you consider deploying the model in a live
 betting environment.
 
+### Interpreting the new coverage warnings
+
+When you run `python NFL_SPORTSBETTING.py`, the driver inspects the assembled games
+frame and measures how many rows have authentic closing moneylines, rest metrics, and
+timezone adjustments. If any of those coverage ratios fall below 90%, the script
+automatically forces paper-trade mode, prints the exact percentages, and refuses to
+surface a live-deployment summary. A log entry such as:
+
+```
+WARNING | root | Enabling paper trading because data coverage is incomplete (closing=3.1%, rest=0.0%, timezone=0.0%).
+WARNING | root | Paper trading results unavailable; keep the strategy in simulation until closing odds and situational data are complete.
+```
+
+means the supplemental CSVs are still mostly empty. Until those warnings disappear and
+the historical paper-trading ledger shows a sustained, odds-aware edge, the project is
+not ready for real-money wagering.
+
 ## New data hooks
 
 The application now exposes two CSV-driven overrides to make the gaps above explicit
