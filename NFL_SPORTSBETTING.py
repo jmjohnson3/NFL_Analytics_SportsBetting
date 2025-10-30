@@ -7039,8 +7039,12 @@ class FeatureBuilder:
                     merged.drop(columns=[col], inplace=True, errors="ignore")
                 return merged
 
-            games = _merge_travel("home", "home_team") or games
-            games = _merge_travel("away", "away_team") or games
+            merged_home = _merge_travel("home", "home_team")
+            if merged_home is not None:
+                games = merged_home
+            merged_away = _merge_travel("away", "away_team")
+            if merged_away is not None:
+                games = merged_away
         if "position" in player_stats.columns:
             player_stats["position"] = player_stats["position"].apply(normalize_position)
         if "practice_status" in player_stats.columns:
