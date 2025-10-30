@@ -7724,6 +7724,11 @@ class FeatureBuilder:
             .merge(away_history, on="game_id", how="left")
         )
 
+        if "home_travel_penalty" not in games_context.columns:
+            games_context["home_travel_penalty"] = np.nan
+        if "away_travel_penalty" not in games_context.columns:
+            games_context["away_travel_penalty"] = np.nan
+
         if "home_travel_penalty_hist" in games_context.columns:
             games_context["home_travel_penalty"] = games_context["home_travel_penalty"].combine_first(
                 games_context["home_travel_penalty_hist"]
