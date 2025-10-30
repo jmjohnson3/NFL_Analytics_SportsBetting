@@ -6805,8 +6805,14 @@ class FeatureBuilder:
                 if col in supplemental.columns:
                     supplemental[col] = supplemental[col].apply(normalize_team_abbr)
             merge_keys: List[str] = []
+            temporary_game_id_key = None
             if "game_id" in supplemental.columns and "game_id" in working.columns:
-                merge_keys = ["game_id"]
+                # Avoid dtype mismatches (object vs. int64) when merging on game_id by
+                # materializing a temporary, normalized key in both frames.
+                temporary_game_id_key = "_merge_game_id"
+                working[temporary_game_id_key] = working["game_id"].astype(str)
+                supplemental[temporary_game_id_key] = supplemental["game_id"].astype(str)
+                merge_keys = [temporary_game_id_key]
             elif {
                 "season",
                 "week",
@@ -6844,6 +6850,10 @@ class FeatureBuilder:
                                 working[supplemental_col]
                             )
                             working.drop(columns=[supplemental_col], inplace=True)
+
+                if temporary_game_id_key is not None:
+                    working.drop(columns=[temporary_game_id_key], inplace=True, errors="ignore")
+                    supplemental.drop(columns=[temporary_game_id_key], inplace=True, errors="ignore")
 
         working.drop(columns=["_start_date"], inplace=True, errors="ignore")
         return working
