@@ -1,0 +1,5 @@
+season,week,team,opponent,rest_days,rest_penalty,travel_penalty,timezone_diff_hours,avg_timezone_diff_hours
+2024-regular,1,KC,DET,10,0,0.0,0.0,0.0
+2024-regular,1,DET,KC,7,0,3.2,1.0,1.0
+2024-regular,1,ATL,CAR,9,0,0.0,0.0,0.0
+2024-regular,1,CAR,ATL,7,0,0.5,0.0,0.0
