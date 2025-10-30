@@ -5117,6 +5117,7 @@ class NFLIngestor:
             return parse_dt(value)
 
         games_by_event: Dict[str, Dict[str, Any]] = {}
+        seen_events: Set[str] = set()
         games_by_key: Dict[Tuple[str, str, Optional[dt.date]], List[Dict[str, Any]]] = defaultdict(list)
         refresh_candidates: Dict[str, Dict[str, Any]] = {}
         missing_count = 0
