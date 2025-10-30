@@ -278,6 +278,15 @@ class HurdleTDModel:
         return p_any * mu
 
 
+@dataclass
+class PaperTradeSummary:
+    ledger: pd.DataFrame
+    window_roi: float
+    cumulative_roi: Optional[float]
+    graded_bets: int
+    closing_coverage: float
+
+
 class QuantileYards:
     def __init__(self, quantiles: Iterable[float] = (0.1, 0.5, 0.9)):
         self.quantiles = tuple(quantiles)
@@ -3184,6 +3193,8 @@ class SupplementalDataLoader:
         self.depth_chart_records = self._load_records(config.depth_chart_path)
         self.advanced_records = self._load_records(config.advanced_metrics_path)
         self.weather_records = self._load_records(config.weather_forecast_path)
+        self.closing_odds_records = self._load_records(config.closing_odds_history_path)
+        self.travel_context_records = self._load_records(config.rest_travel_context_path)
 
         self.injuries_by_game = self._index_records(self.injury_records, "game_id")
         self.injuries_by_team = self._index_records(self.injury_records, "team")
@@ -3196,6 +3207,9 @@ class SupplementalDataLoader:
             team = normalize_team_abbr(record.get("team"))
             if season and week is not None and team:
                 self.advanced_by_key[(str(season), int(week), team)] = record
+
+        self.closing_odds_frame = self._build_closing_odds_frame(self.closing_odds_records)
+        self.travel_context_frame = self._build_travel_context_frame(self.travel_context_records)
 
     @staticmethod
     def _load_records(path: Optional[str]) -> List[Dict[str, Any]]:
@@ -3224,6 +3238,90 @@ class SupplementalDataLoader:
         except Exception:  # pragma: no cover - defensive logging
             logging.exception("Unable to load supplemental data from %s", file_path)
             return []
+
+    def _build_closing_odds_frame(
+        self, records: List[Dict[str, Any]]
+    ) -> pd.DataFrame:
+        if not records:
+            return pd.DataFrame(
+                columns=[
+                    "game_id",
+                    "season",
+                    "week",
+                    "home_team",
+                    "away_team",
+                    "home_closing_moneyline",
+                    "away_closing_moneyline",
+                    "home_closing_implied_prob",
+                    "away_closing_implied_prob",
+                    "closing_bookmaker",
+                    "closing_line_time",
+                ]
+            )
+
+        frame = pd.DataFrame(records)
+        for col in ["game_id", "season", "week"]:
+            if col not in frame.columns:
+                frame[col] = None
+        frame["home_team"] = frame["home_team"].apply(normalize_team_abbr)
+        frame["away_team"] = frame["away_team"].apply(normalize_team_abbr)
+        frame["season"] = frame["season"].astype(str)
+        if "week" in frame.columns:
+            frame["week"] = frame["week"].apply(lambda x: int(x) if pd.notna(x) else None)
+        numeric_cols = [
+            "home_closing_moneyline",
+            "away_closing_moneyline",
+            "home_closing_implied_prob",
+            "away_closing_implied_prob",
+        ]
+        for col in numeric_cols:
+            if col in frame.columns:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        if "closing_line_time" in frame.columns:
+            frame["closing_line_time"] = pd.to_datetime(
+                frame["closing_line_time"], errors="coerce", utc=True
+            )
+        else:
+            frame["closing_line_time"] = pd.NaT
+        frame["closing_bookmaker"] = frame.get("closing_bookmaker", "").fillna("")
+        return frame
+
+    def _build_travel_context_frame(
+        self, records: List[Dict[str, Any]]
+    ) -> pd.DataFrame:
+        if not records:
+            return pd.DataFrame(
+                columns=[
+                    "season",
+                    "week",
+                    "team",
+                    "opponent",
+                    "rest_days",
+                    "rest_penalty",
+                    "travel_penalty",
+                    "timezone_diff_hours",
+                    "avg_timezone_diff_hours",
+                ]
+            )
+
+        frame = pd.DataFrame(records)
+        frame["team"] = frame["team"].apply(normalize_team_abbr)
+        if "opponent" in frame.columns:
+            frame["opponent"] = frame["opponent"].apply(normalize_team_abbr)
+        frame["season"] = frame["season"].astype(str)
+        if "week" in frame.columns:
+            frame["week"] = frame["week"].apply(lambda x: int(x) if pd.notna(x) else None)
+        numeric_cols = [
+            "rest_days",
+            "rest_penalty",
+            "travel_penalty",
+            "timezone_diff_hours",
+            "avg_timezone_diff_hours",
+        ]
+        for col in numeric_cols:
+            if col in frame.columns:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        return frame
 
     @staticmethod
     def _index_records(records: List[Dict[str, Any]], key: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -3610,6 +3708,8 @@ class NFLConfig:
     depth_chart_path: Optional[str] = os.getenv("NFL_DEPTH_PATH")
     advanced_metrics_path: Optional[str] = os.getenv("NFL_ADVANCED_PATH")
     weather_forecast_path: Optional[str] = os.getenv("NFL_FORECAST_PATH")
+    closing_odds_history_path: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PATH")
+    rest_travel_context_path: Optional[str] = os.getenv("NFL_TRAVEL_CONTEXT_PATH")
     respect_lineups: bool = True
     odds_allow_insecure_ssl: bool = env_flag("ODDS_ALLOW_INSECURE_SSL", False)
     enable_paper_trading: bool = env_flag("NFL_PAPER_TRADE", False)
@@ -6541,7 +6641,9 @@ class NFLIngestor:
 class FeatureBuilder:
     """Transforms raw database tables into model-ready feature sets."""
 
-    def __init__(self, engine: Engine):
+    def __init__(
+        self, engine: Engine, supplemental_loader: Optional[SupplementalDataLoader] = None
+    ):
         self.engine = engine
         self.games_frame: Optional[pd.DataFrame] = None
         self.player_feature_frame: Optional[pd.DataFrame] = None
@@ -6559,6 +6661,7 @@ class FeatureBuilder:
         self.game_totals_frame: Optional[pd.DataFrame] = None
         self.player_prop_lines_frame: Optional[pd.DataFrame] = None
         self.team_game_lookup: Optional[pd.DataFrame] = None
+        self.supplemental_loader = supplemental_loader
 
     @staticmethod
     def _american_to_prob_series(series: pd.Series) -> pd.Series:
@@ -6676,6 +6779,57 @@ class FeatureBuilder:
                     )
                 else:
                     working[closing_prob_col] = derived_closing
+
+        loader = getattr(self, "supplemental_loader", None)
+        supplemental_closing = None
+        if loader is not None:
+            supplemental_closing = getattr(loader, "closing_odds_frame", None)
+        if supplemental_closing is not None and not supplemental_closing.empty:
+            supplemental = supplemental_closing.copy()
+            supplemental["season"] = supplemental["season"].astype(str)
+            for col in ["home_team", "away_team"]:
+                if col in supplemental.columns:
+                    supplemental[col] = supplemental[col].apply(normalize_team_abbr)
+            merge_keys: List[str] = []
+            if "game_id" in supplemental.columns and "game_id" in working.columns:
+                merge_keys = ["game_id"]
+            elif {
+                "season",
+                "week",
+                "home_team",
+                "away_team",
+            }.issubset(supplemental.columns) and {
+                "season",
+                "week",
+                "home_team",
+                "away_team",
+            }.issubset(working.columns):
+                merge_keys = ["season", "week", "home_team", "away_team"]
+            if merge_keys:
+                supplement_cols = [
+                    "home_closing_moneyline",
+                    "away_closing_moneyline",
+                    "home_closing_implied_prob",
+                    "away_closing_implied_prob",
+                    "closing_bookmaker",
+                    "closing_line_time",
+                ]
+                available_cols = [
+                    col for col in supplement_cols if col in supplemental.columns
+                ]
+                if available_cols:
+                    rename_map = {col: f"{col}_supp" for col in available_cols}
+                    supplemental = supplemental[merge_keys + available_cols].rename(
+                        columns=rename_map
+                    )
+                    working = working.merge(supplemental, on=merge_keys, how="left")
+                    for col in available_cols:
+                        supplemental_col = f"{col}_supp"
+                        if supplemental_col in working.columns:
+                            working[col] = working[col].combine_first(
+                                working[supplemental_col]
+                            )
+                            working.drop(columns=[supplemental_col], inplace=True)
 
         working.drop(columns=["_start_date"], inplace=True, errors="ignore")
         return working
@@ -6829,6 +6983,50 @@ class FeatureBuilder:
         advanced_metrics = advanced_metrics.rename(columns=lambda col: str(col))
         game_totals = game_totals.rename(columns=lambda col: str(col))
         player_prop_lines = player_prop_lines.rename(columns=lambda col: str(col))
+
+        loader = getattr(self, "supplemental_loader", None)
+        travel_context = None
+        if loader is not None:
+            travel_context = getattr(loader, "travel_context_frame", None)
+        if travel_context is not None and not travel_context.empty:
+            travel_df = travel_context.copy()
+            travel_df["team"] = travel_df["team"].apply(normalize_team_abbr)
+            travel_df["season"] = travel_df["season"].astype(str)
+            if "week" in travel_df.columns:
+                travel_df["week"] = travel_df["week"].apply(
+                    lambda x: int(x) if pd.notna(x) else None
+                )
+
+            def _merge_travel(prefix: str, team_col: str) -> None:
+                if not {"season", "week", team_col}.issubset(games.columns):
+                    return
+                context_cols = [
+                    "rest_days",
+                    "rest_penalty",
+                    "travel_penalty",
+                    "timezone_diff_hours",
+                    "avg_timezone_diff_hours",
+                ]
+                available = [col for col in context_cols if col in travel_df.columns]
+                if not available:
+                    return
+                rename_map = {col: f"{prefix}_{col}" for col in available}
+                merge_frame = travel_df[["season", "week", "team", *available]].rename(
+                    columns=rename_map | {"team": team_col}
+                )
+                key_cols = ["season", "week", team_col]
+                merged = games.merge(merge_frame, on=key_cols, how="left")
+
+                for col in available:
+                    target_col = f"{prefix}_{col}"
+                    if target_col in merged.columns and col in merged.columns:
+                        merged[target_col] = merged[target_col].combine_first(merged[col])
+                for col in available:
+                    merged.drop(columns=[col], inplace=True, errors="ignore")
+                return merged
+
+            games = _merge_travel("home", "home_team") or games
+            games = _merge_travel("away", "away_team") or games
         if "position" in player_stats.columns:
             player_stats["position"] = player_stats["position"].apply(normalize_position)
         if "practice_status" in player_stats.columns:
@@ -7702,6 +7900,50 @@ class FeatureBuilder:
         for col, default in numeric_placeholders.items():
             if col not in features.columns:
                 features[col] = default
+
+        loader = getattr(self, "supplemental_loader", None)
+        travel_context = None
+        if loader is not None:
+            travel_context = getattr(loader, "travel_context_frame", None)
+        if travel_context is not None and not travel_context.empty:
+            travel_df = travel_context.copy()
+            travel_df["team"] = travel_df["team"].apply(normalize_team_abbr)
+            travel_df["season"] = travel_df["season"].astype(str)
+            if "week" in travel_df.columns:
+                travel_df["week"] = travel_df["week"].apply(
+                    lambda x: int(x) if pd.notna(x) else None
+                )
+
+            def _merge_upcoming(prefix: str, team_col: str) -> None:
+                if not {"season", "week", team_col}.issubset(features.columns):
+                    return
+                context_cols = [
+                    "rest_days",
+                    "rest_penalty",
+                    "travel_penalty",
+                    "timezone_diff_hours",
+                    "avg_timezone_diff_hours",
+                ]
+                available = [col for col in context_cols if col in travel_df.columns]
+                if not available:
+                    return
+                rename_map = {col: f"{prefix}_{col}" for col in available}
+                merge_frame = travel_df[["season", "week", "team", *available]].rename(
+                    columns=rename_map | {"team": team_col}
+                )
+                merged = features.merge(merge_frame, on=["season", "week", team_col], how="left")
+                for col in available:
+                    target_col = f"{prefix}_{col}"
+                    if target_col in merged.columns and target_col in features.columns:
+                        merged[target_col] = merged[target_col].combine_first(features[target_col])
+                return merged
+
+            merged_home = _merge_upcoming("home", "home_team")
+            if merged_home is not None:
+                features = merged_home
+            merged_away = _merge_upcoming("away", "away_team")
+            if merged_away is not None:
+                features = merged_away
 
         for idx, row in features.iterrows():
             season = row.get("season")
@@ -9200,16 +9442,23 @@ class FeatureBuilder:
 
 
 class ModelTrainer:
-    def __init__(self, engine: Engine, db: NFLDatabase, run_id: Optional[str] = None):
+    def __init__(
+        self,
+        engine: Engine,
+        db: NFLDatabase,
+        supplemental_loader: Optional[SupplementalDataLoader] = None,
+        run_id: Optional[str] = None,
+    ):
         self.engine = engine
         self.db = db
-        self.feature_builder = FeatureBuilder(engine)
+        self.feature_builder = FeatureBuilder(engine, supplemental_loader)
         self.run_id = run_id or uuid.uuid4().hex
         self.model_uncertainty: Dict[str, Dict[str, float]] = {}
         self.target_priors: Dict[str, Dict[str, Any]] = {}
         self.prior_engines: Dict[str, Optional[Dict[str, Any]]] = {}
         self.special_models: Dict[str, Dict[str, Any]] = {}
         self.feature_column_map: Dict[str, List[str]] = {}
+        self.supplemental_loader = supplemental_loader
 
     @staticmethod
     def _is_lineup_starter(position: str, rank: Optional[int]) -> bool:
@@ -12056,8 +12305,16 @@ def predict_upcoming_games(
     trainer: Optional["ModelTrainer"] = None,
     config: Optional[NFLConfig] = None,
 ) -> Dict[str, pd.DataFrame]:
-    feature_builder = FeatureBuilder(engine)
-    feature_builder.build_features()
+    if trainer is not None and getattr(trainer, "feature_builder", None) is not None:
+        feature_builder = trainer.feature_builder
+    else:
+        supplemental_loader = None
+        if trainer is not None:
+            supplemental_loader = getattr(trainer, "supplemental_loader", None)
+        feature_builder = FeatureBuilder(engine, supplemental_loader)
+        feature_builder.build_features()
+    if feature_builder.games_frame is None:
+        feature_builder.build_features()
     model_uncertainty = model_uncertainty or {}
 
     base_games = pd.read_sql_table("nfl_games", engine).rename(columns=lambda col: str(col))
@@ -12881,7 +13138,7 @@ def paper_trade_recent_slates(
     models: Dict[str, Pipeline],
     trainer: Optional["ModelTrainer"],
     config: NFLConfig,
-) -> Optional[pd.DataFrame]:
+) -> Optional[PaperTradeSummary]:
     if not config.enable_paper_trading:
         return None
 
@@ -12920,7 +13177,9 @@ def paper_trade_recent_slates(
 
     completed["_home_price"] = _resolve_price_series(completed, "home")
     completed["_away_price"] = _resolve_price_series(completed, "away")
-    completed = completed.dropna(subset=["_home_price", "_away_price"], how="all")
+    price_mask = completed[["_home_price", "_away_price"]].notna().any(axis=1)
+    closing_coverage = float(price_mask.mean()) if len(completed) else 0.0
+    completed = completed[price_mask]
 
     lookback_days = max(int(config.paper_trade_lookback_days), 0)
     if lookback_days > 0:
@@ -13131,6 +13390,7 @@ def paper_trade_recent_slates(
     )
 
     settled = combined_df[combined_df["result"].isin(["win", "loss", "push"])]
+    cumulative_roi: Optional[float] = None
     if not settled.empty:
         settled = settled.copy()
         settled["stake"] = pd.to_numeric(settled.get("stake"), errors="coerce")
@@ -13167,7 +13427,13 @@ def paper_trade_recent_slates(
                         len(recent),
                     )
 
-    return combined_df
+    return PaperTradeSummary(
+        ledger=combined_df,
+        window_roi=roi,
+        cumulative_roi=cumulative_roi,
+        graded_bets=graded_count,
+        closing_coverage=closing_coverage,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -13240,7 +13506,7 @@ def main() -> None:
     ingestor = NFLIngestor(db, msf_client, odds_client, supplemental_loader)
     ingestor.ingest(config.seasons)
 
-    trainer = ModelTrainer(engine, db)
+    trainer = ModelTrainer(engine, db, supplemental_loader)
     try:
         models = trainer.train()
     except RuntimeError as exc:
@@ -13261,19 +13527,83 @@ def main() -> None:
             logging.error("Prediction generation skipped because no models were available.")
         return
 
-    paper_trades = None
+    games_frame = trainer.feature_builder.games_frame or pd.DataFrame()
+
+    def _coverage(frame: pd.DataFrame, columns: Sequence[str]) -> float:
+        available_cols = [col for col in columns if col in frame.columns]
+        if not available_cols or frame.empty:
+            return 0.0
+        mask = frame[available_cols].notna()
+        return float(mask.all(axis=1).mean())
+
+    closing_coverage = _coverage(games_frame, ["home_closing_moneyline", "away_closing_moneyline"])
+    rest_coverage = _coverage(games_frame, ["home_rest_days", "away_rest_days"])
+    timezone_coverage = _coverage(
+        games_frame, ["home_timezone_diff_hours", "away_timezone_diff_hours"]
+    )
+
+    if (
+        closing_coverage < 0.9
+        or rest_coverage < 0.9
+        or timezone_coverage < 0.9
+    ):
+        if not config.enable_paper_trading:
+            logging.warning(
+                "Enabling paper trading because data coverage is incomplete (closing=%.1f%%, rest=%.1f%%, timezone=%.1f%%).",
+                closing_coverage * 100.0,
+                rest_coverage * 100.0,
+                timezone_coverage * 100.0,
+            )
+            config.enable_paper_trading = True
+        else:
+            logging.warning(
+                "Data coverage is incomplete (closing=%.1f%%, rest=%.1f%%, timezone=%.1f%%); remain in paper trading mode.",
+                closing_coverage * 100.0,
+                rest_coverage * 100.0,
+                timezone_coverage * 100.0,
+            )
+
+    paper_summary: Optional[PaperTradeSummary] = None
     if config.enable_paper_trading:
         try:
-            paper_trades = paper_trade_recent_slates(models, trainer, config)
-            if paper_trades is not None and not paper_trades.empty:
-                sample = paper_trades.tail(min(5, len(paper_trades)))
+            paper_summary = paper_trade_recent_slates(models, trainer, config)
+            if paper_summary is not None and not paper_summary.ledger.empty:
+                sample = paper_summary.ledger.tail(
+                    min(5, len(paper_summary.ledger))
+                )
                 logging.info("Most recent paper trades:\n%s", sample.to_string(index=False))
                 logging.info(
                     "Paper trading ledger now contains %d recorded wagers.",
-                    len(paper_trades),
+                    len(paper_summary.ledger),
                 )
         except Exception:
             logging.exception("Paper trading simulation failed.")
+
+    if paper_summary is None or paper_summary.ledger.empty:
+        logging.warning(
+            "Paper trading results unavailable; keep the strategy in simulation until closing odds and situational data are complete."
+        )
+    else:
+        graded = paper_summary.graded_bets
+        cumulative_roi = paper_summary.cumulative_roi or 0.0
+        if (
+            paper_summary.closing_coverage < 0.9
+            or graded < 50
+            or cumulative_roi <= 0.0
+        ):
+            logging.warning(
+                "Live betting disabled: closing coverage=%.1f%%, graded bets=%d, cumulative ROI=%.2f%%. Continue paper trading until odds-aware performance sustains a positive edge.",
+                paper_summary.closing_coverage * 100.0,
+                graded,
+                cumulative_roi * 100.0,
+            )
+        else:
+            logging.info(
+                "Paper trading shows %.2f%% cumulative ROI across %d graded bets with %.1f%% odds coverage. Review manually before considering live deployment.",
+                cumulative_roi * 100.0,
+                graded,
+                paper_summary.closing_coverage * 100.0,
+            )
 
     predict_upcoming_games(
         models,

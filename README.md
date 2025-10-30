@@ -30,3 +30,20 @@ should you.
 
 Only after these gaps are addressed should you consider deploying the model in a live
 betting environment.
+
+## New data hooks
+
+The application now exposes two CSV-driven overrides to make the gaps above explicit
+and auditable:
+
+- `data/closing_odds_history.csv` &mdash; populate this with bookmaker closing prices
+  (moneylines and implied probabilities) for every historical matchup you train on.
+  The ingestion pipeline will merge these values into the `nfl_games` table and the
+  evaluation routines will refuse to leave paper-trading mode until closing coverage
+  exceeds 90%.
+- `data/team_travel_context.csv` &mdash; record verified rest days, travel penalties,
+  and timezone adjustments for each team/week. These values flow directly into the
+  situational feature set so the models stop learning on `NaN` placeholders.
+
+Both files ship with example rows to illustrate the required schema. Replace the
+samples with real, validated records before relying on any model output.
