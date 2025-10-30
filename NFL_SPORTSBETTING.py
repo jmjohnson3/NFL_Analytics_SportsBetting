@@ -509,6 +509,23 @@ def write_csv_safely(df: pd.DataFrame, path: str) -> None:
         logging.exception("Failed to write %s", path)
 
 
+def append_csv_safely(df: pd.DataFrame, path: str) -> None:
+    """Append rows to a CSV, creating it if necessary."""
+
+    if df is None or df.empty:
+        logging.info("No rows to append for %s", path)
+        return
+
+    try:
+        path_obj = Path(path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        exists = path_obj.exists()
+        df.to_csv(path_obj, mode="a" if exists else "w", header=not exists, index=False)
+        logging.info("Appended %d rows -> %s", len(df), path)
+    except Exception:
+        logging.exception("Failed to append %s", path)
+
+
 def extract_pricing_odds(
     odds_payload: Iterable[Dict[str, Any]],
     valid_game_ids: Optional[Iterable[Any]] = None,
@@ -898,6 +915,96 @@ def build_player_prop_candidates(
         | odds_df["_player_name_key"].astype(bool)
     ].copy()
 
+    def _as_series(df: pd.DataFrame, column: str) -> pd.Series:
+        """Return the named column as a Series even if duplicates created a DataFrame."""
+
+        values = df[column]
+        if isinstance(values, pd.DataFrame):
+            # Retain the first occurrence – duplicate columns are equivalent for our keys.
+            values = values.iloc[:, 0]
+        return values
+
+    def _annotate_keys(frame: pd.DataFrame) -> pd.DataFrame:
+        base = frame.copy()
+        base = base.loc[:, ~base.columns.duplicated(keep="first")]
+        base = base.drop(columns=key_columns, errors="ignore")
+
+        if base.empty:
+            result = base
+            for col in key_columns:
+                result[col] = pd.Series(dtype=str)
+            return result
+
+        keys = frame.apply(_extract_keys, axis=1)
+        result = base
+        for col in key_columns:
+            result[col] = keys[col]
+
+        team_values = _as_series(result, "_player_team_key")
+        mask = team_values.astype(bool)
+        if not mask.all():
+            name_values = _as_series(result, "_player_name_key")
+            replacement = name_values.loc[~mask]
+            result.loc[~mask, "_player_team_key"] = replacement
+
+        team_event_values = _as_series(result, "_player_team_event_key")
+        mask_event = team_event_values.astype(bool)
+        if not mask_event.all():
+            name_event_values = _as_series(result, "_player_name_event_key")
+            replacement_event = name_event_values.loc[~mask_event]
+            result.loc[~mask_event, "_player_team_event_key"] = replacement_event
+        return result
+
+    pred_df = _annotate_keys(pred_df)
+    odds_df = _annotate_keys(odds_df)
+
+    pred_df = pred_df[
+        pred_df["_player_id_key"].astype(bool)
+        | pred_df["_player_team_key"].astype(bool)
+        | pred_df["_player_name_key"].astype(bool)
+    ].copy()
+    odds_df = odds_df[
+        odds_df["_player_id_key"].astype(bool)
+        | odds_df["_player_team_key"].astype(bool)
+        | odds_df["_player_name_key"].astype(bool)
+    ].copy()
+
+    pred_df["_pred_index"] = np.arange(len(pred_df))
+    odds_df["_odds_index"] = np.arange(len(odds_df))
+    pred_df = pred_df.set_index("_pred_index", drop=False)
+    odds_df = odds_df.set_index("_odds_index", drop=False)
+
+    merged_frames: List[pd.DataFrame] = []
+    remaining_pred = pred_df
+    remaining_odds = odds_df
+
+    for key_col in (
+        "_player_id_event_key",
+        "_player_team_event_key",
+        "_player_name_event_key",
+        "_player_id_key",
+        "_player_team_key",
+        "_player_name_key",
+    ):
+        preds_slice = remaining_pred[remaining_pred[key_col].astype(bool)].copy()
+        offers_slice = remaining_odds[remaining_odds[key_col].astype(bool)].copy()
+        merged_slice = _merge_player_prop_on_key(
+            preds_slice, offers_slice, key_col
+        )
+        if merged_slice.empty:
+            continue
+        merged_frames.append(merged_slice)
+        matched_pred_idx = merged_slice["_pred_index"].unique().tolist()
+        matched_odds_idx = (
+            merged_slice["_odds_index_book"].unique().tolist()
+            if "_odds_index_book" in merged_slice.columns
+            else []
+        )
+        if matched_pred_idx:
+            remaining_pred = remaining_pred.drop(index=matched_pred_idx, errors="ignore")
+        if matched_odds_idx:
+            remaining_odds = remaining_odds.drop(index=matched_odds_idx, errors="ignore")
+
     pred_df["_pred_index"] = np.arange(len(pred_df))
     odds_df["_odds_index"] = np.arange(len(odds_df))
     pred_df = pred_df.set_index("_pred_index", drop=False)
@@ -1209,6 +1316,56 @@ def emit_priced_picks(
                 len(model_totals),
                 model_totals_path,
             )
+
+    paper_rows: List[Dict[str, Any]] = []
+    run_timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+    if props_filtered is not None and not props_filtered.empty:
+        for row in props_filtered.to_dict("records"):
+            paper_rows.append(
+                {
+                    "timestamp_utc": run_timestamp,
+                    "week_key": week_key,
+                    "bet_type": "player_prop",
+                    "market": row.get("market"),
+                    "player": row.get("player"),
+                    "team": row.get("team"),
+                    "opponent": row.get("opp"),
+                    "side": row.get("side"),
+                    "line": row.get("line"),
+                    "best_american": row.get("best_american"),
+                    "fair_american": row.get("fair_american"),
+                    "ev": row.get("ev"),
+                    "confidence": row.get("confidence"),
+                    "kelly_quarter": row.get("kelly_quarter"),
+                    "event_id": row.get("event_id") or row.get("game_id"),
+                }
+            )
+
+    if totals_filtered is not None and not totals_filtered.empty:
+        for row in totals_filtered.to_dict("records"):
+            paper_rows.append(
+                {
+                    "timestamp_utc": run_timestamp,
+                    "week_key": week_key,
+                    "bet_type": "game_total",
+                    "market": "total",
+                    "away_team": row.get("away"),
+                    "home_team": row.get("home"),
+                    "side": row.get("side"),
+                    "line": row.get("line"),
+                    "best_american": row.get("best_american"),
+                    "fair_american": row.get("fair_american"),
+                    "ev": row.get("ev"),
+                    "confidence": row.get("confidence"),
+                    "kelly_quarter": row.get("kelly_quarter"),
+                    "model_total": row.get("model_total"),
+                    "event_id": row.get("event_id") or row.get("game_id"),
+                }
+            )
+
+    if paper_rows:
+        paper_log_path = out_dir / "paper_trading_log.csv"
+        append_csv_safely(pd.DataFrame(paper_rows), str(paper_log_path))
 
     try:
         if props_filtered is not None and not props_filtered.empty:
@@ -3968,6 +4125,60 @@ class NFLDatabase:
             )
         return results
 
+    def fetch_games_with_odds_for_seasons(self, seasons: Iterable[str]) -> pd.DataFrame:
+        season_list = [str(season) for season in seasons if season is not None]
+        if not season_list:
+            return pd.DataFrame(
+                columns=[
+                    "game_id",
+                    "season",
+                    "week",
+                    "start_time",
+                    "home_team",
+                    "away_team",
+                    "home_moneyline",
+                    "away_moneyline",
+                    "odds_updated",
+                    "odds_event_id",
+                ]
+            )
+
+        columns = [
+            self.games.c.game_id,
+            self.games.c.season,
+            self.games.c.week,
+            self.games.c.start_time,
+            self.games.c.home_team,
+            self.games.c.away_team,
+            self.games.c.home_moneyline,
+            self.games.c.away_moneyline,
+            self.games.c.odds_updated,
+            self.games.c.odds_event_id,
+        ]
+
+        with self.engine.begin() as conn:
+            stmt = select(*columns).where(self.games.c.season.in_(season_list))
+            rows = conn.execute(stmt).fetchall()
+
+        frame = pd.DataFrame(
+            rows,
+            columns=[
+                "game_id",
+                "season",
+                "week",
+                "start_time",
+                "home_team",
+                "away_team",
+                "home_moneyline",
+                "away_moneyline",
+                "odds_updated",
+                "odds_event_id",
+            ],
+        )
+        if not frame.empty:
+            frame["start_time"] = pd.to_datetime(frame["start_time"], errors="coerce")
+        return frame
+
     def fetch_games_with_player_stats(self) -> set[str]:
         """Return the set of game IDs that already have player statistics stored."""
 
@@ -5117,6 +5328,64 @@ class NFLIngestor:
             include_historical=True,
         )
         logging.info("Fetched %d odds entries", len(odds_data))
+
+        historical_rows = [
+            row
+            for row in rows_needing_refresh
+            if (
+                _ensure_datetime(row.get("start_time")) is not None
+                and _ensure_datetime(row.get("start_time")) < recent_window_start
+            )
+        ]
+        if historical_rows:
+            grouped_hist: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            for hist_row in historical_rows:
+                start_dt = _ensure_datetime(hist_row.get("start_time"))
+                season_key = str(hist_row.get("season") or (start_dt.year if start_dt else "unknown"))
+                grouped_hist[season_key].append(hist_row)
+
+            history_buffer = dt.timedelta(days=10)
+            chunk_span = dt.timedelta(days=45)
+            for season_key, season_rows in grouped_hist.items():
+                times = [
+                    _ensure_datetime(row.get("start_time"))
+                    for row in season_rows
+                    if _ensure_datetime(row.get("start_time")) is not None
+                ]
+                if not times:
+                    continue
+                season_start = min(times) - history_buffer
+                season_end = max(times) + history_buffer
+                logging.info(
+                    "Backfilling odds history for season %s (%d games)",
+                    season_key,
+                    len(season_rows),
+                )
+                current_start = season_start
+                while current_start <= season_end:
+                    current_end = min(current_start + chunk_span, season_end)
+                    logging.debug(
+                        "Historical odds window %s -> %s for season %s",
+                        current_start.isoformat(),
+                        current_end.isoformat(),
+                        season_key,
+                    )
+                    extra_data = self.odds_client.fetch_odds(
+                        start=current_start,
+                        end=current_end,
+                        include_player_props=True,
+                        include_historical=True,
+                    )
+                    if extra_data:
+                        logging.info(
+                            "Fetched %d additional odds entries for season %s window %s -> %s",
+                            len(extra_data),
+                            season_key,
+                            current_start.date(),
+                            current_end.date(),
+                        )
+                        odds_data.extend(extra_data)
+                    current_start = current_end + dt.timedelta(days=1)
 
         def _match_game(
             event_id: str,
@@ -6980,12 +7249,25 @@ class FeatureBuilder:
                     merged_strength.drop(columns=[hist_col], inplace=True)
             return merged_strength
 
+        def _ensure_penalty_columns(strength: pd.DataFrame) -> pd.DataFrame:
+            if strength is None or strength.empty:
+                return strength
+            for penalty_col in ("travel_penalty", "rest_penalty", "avg_timezone_diff_hours"):
+                if penalty_col not in strength.columns:
+                    strength[penalty_col] = 0.0
+                else:
+                    strength[penalty_col] = pd.to_numeric(
+                        strength[penalty_col], errors="coerce"
+                    ).fillna(0.0)
+            return strength
+
         if player_stats.empty:
             logging.warning(
                 "Player statistics table is empty. Player-level models will not be trained."
             )
             team_strength = self._compute_team_unit_strength(player_stats, advanced_metrics)
             team_strength = _merge_penalties_into_strength(team_strength)
+            team_strength = _ensure_penalty_columns(team_strength)
             self.team_strength_frame = team_strength
         else:
             enrichment_columns = [
@@ -7011,6 +7293,7 @@ class FeatureBuilder:
 
             team_strength = self._compute_team_unit_strength(player_stats, advanced_metrics)
             team_strength = _merge_penalties_into_strength(team_strength)
+            team_strength = _ensure_penalty_columns(team_strength)
 
             player_stats = player_stats.merge(
                 team_strength,
@@ -7449,8 +7732,12 @@ class FeatureBuilder:
             "away_rest_days",
         ]
         for col in penalty_fill_cols:
-            if col in games_context.columns:
-                games_context[col] = games_context[col].fillna(0.0)
+            if col not in games_context.columns:
+                games_context[col] = 0.0
+            else:
+                games_context[col] = pd.to_numeric(
+                    games_context[col], errors="coerce"
+                ).fillna(0.0)
 
         games_context["moneyline_diff"] = games_context["home_moneyline"] - games_context["away_moneyline"]
         games_context["implied_prob_diff"] = (
@@ -8704,8 +8991,12 @@ class FeatureBuilder:
             "opp_timezone_diff_hours",
         ]
         for col in penalty_cols:
-            if col in player_features.columns:
-                player_features[col] = player_features[col].fillna(0.0)
+            if col not in player_features.columns:
+                player_features[col] = 0.0
+            else:
+                player_features[col] = pd.to_numeric(
+                    player_features[col], errors="coerce"
+                ).fillna(0.0)
 
         player_features = player_features.drop(columns=["player_name_norm"], errors="ignore")
 
