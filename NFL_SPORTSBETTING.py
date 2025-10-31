@@ -7938,6 +7938,7 @@ class FeatureBuilder:
             "home_rest_penalty": np.nan,
             "home_weather_adjustment": np.nan,
             "home_timezone_diff_hours": np.nan,
+            "home_avg_timezone_diff_hours": np.nan,
             "away_offense_pass_rating": np.nan,
             "away_offense_rush_rating": np.nan,
             "away_defense_pass_rating": np.nan,
@@ -7951,6 +7952,7 @@ class FeatureBuilder:
             "away_rest_penalty": np.nan,
             "away_weather_adjustment": np.nan,
             "away_timezone_diff_hours": np.nan,
+            "away_avg_timezone_diff_hours": np.nan,
             "home_points_for_avg": np.nan,
             "home_points_against_avg": np.nan,
             "home_point_diff_avg": np.nan,
@@ -8002,15 +8004,25 @@ class FeatureBuilder:
                 available = [col for col in context_cols if col in travel_df.columns]
                 if not available:
                     return
-                rename_map = {col: f"{prefix}_{col}" for col in available}
+                rename_map = {col: f"{prefix}_{col}_supp" for col in available}
                 merge_frame = travel_df[["season", "week", "team", *available]].rename(
                     columns=rename_map | {"team": team_col}
                 )
-                merged = features.merge(merge_frame, on=["season", "week", team_col], how="left")
+                merged = features.merge(
+                    merge_frame,
+                    on=["season", "week", team_col],
+                    how="left",
+                )
                 for col in available:
                     target_col = f"{prefix}_{col}"
-                    if target_col in merged.columns and target_col in features.columns:
-                        merged[target_col] = merged[target_col].combine_first(features[target_col])
+                    supp_col = f"{prefix}_{col}_supp"
+                    if supp_col not in merged.columns:
+                        continue
+                    if target_col in merged.columns:
+                        merged[target_col] = merged[target_col].combine_first(merged[supp_col])
+                    else:
+                        merged[target_col] = merged[supp_col]
+                    merged.drop(columns=[supp_col], inplace=True)
                 return merged
 
             merged_home = _merge_upcoming("home", "home_team")
