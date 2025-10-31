@@ -13575,10 +13575,11 @@ def main() -> None:
     )
 
     if not config.enable_paper_trading and closing_coverage < 0.9:
-        raise RuntimeError(
-            "Closing odds coverage is %.1f%%. Load verified sportsbook closings before disabling paper trading."
-            % (closing_coverage * 100.0)
+        logging.warning(
+            "Closing odds coverage is %.1f%%. Falling back to paper trading until verified sportsbook closings are loaded.",
+            closing_coverage * 100.0,
         )
+        config.enable_paper_trading = True
 
     if (
         closing_coverage < 0.9
