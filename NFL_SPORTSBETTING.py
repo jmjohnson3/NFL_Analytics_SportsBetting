@@ -99,6 +99,20 @@ from sqlalchemy.exc import SQLAlchemyError
 from urllib.parse import urlencode
 
 
+SCRIPT_ROOT = Path(__file__).resolve().parent
+
+
+def _default_data_file(name: str) -> Optional[str]:
+    candidate = SCRIPT_ROOT / "data" / name
+    if candidate.exists():
+        return str(candidate)
+    return None
+
+
+DEFAULT_CLOSING_ODDS_PATH = _default_data_file("closing_odds_history.csv")
+DEFAULT_TRAVEL_CONTEXT_PATH = _default_data_file("team_travel_context.csv")
+
+
 # ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
 def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
     if df is None:
@@ -276,6 +290,15 @@ class HurdleTDModel:
         p_any = self.pr_anytime(X)
         mu = self.conditional_mean(X)
         return p_any * mu
+
+
+@dataclass
+class PaperTradeSummary:
+    ledger: pd.DataFrame
+    window_roi: float
+    cumulative_roi: Optional[float]
+    graded_bets: int
+    closing_coverage: float
 
 
 class QuantileYards:
@@ -3027,6 +3050,8 @@ class SupplementalDataLoader:
         self.depth_chart_records = self._load_records(config.depth_chart_path)
         self.advanced_records = self._load_records(config.advanced_metrics_path)
         self.weather_records = self._load_records(config.weather_forecast_path)
+        self.closing_odds_records = self._load_records(config.closing_odds_history_path)
+        self.travel_context_records = self._load_records(config.rest_travel_context_path)
 
         self.injuries_by_game = self._index_records(self.injury_records, "game_id")
         self.injuries_by_team = self._index_records(self.injury_records, "team")
@@ -3039,6 +3064,9 @@ class SupplementalDataLoader:
             team = normalize_team_abbr(record.get("team"))
             if season and week is not None and team:
                 self.advanced_by_key[(str(season), int(week), team)] = record
+
+        self.closing_odds_frame = self._build_closing_odds_frame(self.closing_odds_records)
+        self.travel_context_frame = self._build_travel_context_frame(self.travel_context_records)
 
     @staticmethod
     def _load_records(path: Optional[str]) -> List[Dict[str, Any]]:
@@ -3067,6 +3095,90 @@ class SupplementalDataLoader:
         except Exception:  # pragma: no cover - defensive logging
             logging.exception("Unable to load supplemental data from %s", file_path)
             return []
+
+    def _build_closing_odds_frame(
+        self, records: List[Dict[str, Any]]
+    ) -> pd.DataFrame:
+        if not records:
+            return pd.DataFrame(
+                columns=[
+                    "game_id",
+                    "season",
+                    "week",
+                    "home_team",
+                    "away_team",
+                    "home_closing_moneyline",
+                    "away_closing_moneyline",
+                    "home_closing_implied_prob",
+                    "away_closing_implied_prob",
+                    "closing_bookmaker",
+                    "closing_line_time",
+                ]
+            )
+
+        frame = pd.DataFrame(records)
+        for col in ["game_id", "season", "week"]:
+            if col not in frame.columns:
+                frame[col] = None
+        frame["home_team"] = frame["home_team"].apply(normalize_team_abbr)
+        frame["away_team"] = frame["away_team"].apply(normalize_team_abbr)
+        frame["season"] = frame["season"].astype(str)
+        if "week" in frame.columns:
+            frame["week"] = frame["week"].apply(lambda x: int(x) if pd.notna(x) else None)
+        numeric_cols = [
+            "home_closing_moneyline",
+            "away_closing_moneyline",
+            "home_closing_implied_prob",
+            "away_closing_implied_prob",
+        ]
+        for col in numeric_cols:
+            if col in frame.columns:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        if "closing_line_time" in frame.columns:
+            frame["closing_line_time"] = pd.to_datetime(
+                frame["closing_line_time"], errors="coerce", utc=True
+            )
+        else:
+            frame["closing_line_time"] = pd.NaT
+        frame["closing_bookmaker"] = frame.get("closing_bookmaker", "").fillna("")
+        return frame
+
+    def _build_travel_context_frame(
+        self, records: List[Dict[str, Any]]
+    ) -> pd.DataFrame:
+        if not records:
+            return pd.DataFrame(
+                columns=[
+                    "season",
+                    "week",
+                    "team",
+                    "opponent",
+                    "rest_days",
+                    "rest_penalty",
+                    "travel_penalty",
+                    "timezone_diff_hours",
+                    "avg_timezone_diff_hours",
+                ]
+            )
+
+        frame = pd.DataFrame(records)
+        frame["team"] = frame["team"].apply(normalize_team_abbr)
+        if "opponent" in frame.columns:
+            frame["opponent"] = frame["opponent"].apply(normalize_team_abbr)
+        frame["season"] = frame["season"].astype(str)
+        if "week" in frame.columns:
+            frame["week"] = frame["week"].apply(lambda x: int(x) if pd.notna(x) else None)
+        numeric_cols = [
+            "rest_days",
+            "rest_penalty",
+            "travel_penalty",
+            "timezone_diff_hours",
+            "avg_timezone_diff_hours",
+        ]
+        for col in numeric_cols:
+            if col in frame.columns:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        return frame
 
     @staticmethod
     def _index_records(records: List[Dict[str, Any]], key: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -3453,8 +3565,15 @@ class NFLConfig:
     depth_chart_path: Optional[str] = os.getenv("NFL_DEPTH_PATH")
     advanced_metrics_path: Optional[str] = os.getenv("NFL_ADVANCED_PATH")
     weather_forecast_path: Optional[str] = os.getenv("NFL_FORECAST_PATH")
+    closing_odds_history_path: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PATH") or DEFAULT_CLOSING_ODDS_PATH
+    rest_travel_context_path: Optional[str] = os.getenv("NFL_TRAVEL_CONTEXT_PATH") or DEFAULT_TRAVEL_CONTEXT_PATH
     respect_lineups: bool = True
     odds_allow_insecure_ssl: bool = env_flag("ODDS_ALLOW_INSECURE_SSL", False)
+    enable_paper_trading: bool = env_flag("NFL_PAPER_TRADE", False)
+    paper_trade_lookback_days: int = 21
+    paper_trade_edge_threshold: float = 0.02
+    paper_trade_bankroll: float = 1_000.0
+    paper_trade_max_fraction: float = 0.05
 
     @property
     def pg_url(self) -> str:
@@ -3502,6 +3621,30 @@ class NFLDatabase:
             statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS injury_summary TEXT")
         if "odds_event_id" not in game_columns:
             statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS odds_event_id TEXT")
+        if "home_closing_moneyline" not in game_columns:
+            statements.append(
+                "ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS home_closing_moneyline DOUBLE PRECISION"
+            )
+        if "away_closing_moneyline" not in game_columns:
+            statements.append(
+                "ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS away_closing_moneyline DOUBLE PRECISION"
+            )
+        if "home_closing_implied_prob" not in game_columns:
+            statements.append(
+                "ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS home_closing_implied_prob DOUBLE PRECISION"
+            )
+        if "away_closing_implied_prob" not in game_columns:
+            statements.append(
+                "ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS away_closing_implied_prob DOUBLE PRECISION"
+            )
+        if "closing_bookmaker" not in game_columns:
+            statements.append(
+                "ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS closing_bookmaker TEXT"
+            )
+        if "closing_line_time" not in game_columns:
+            statements.append(
+                "ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS closing_line_time TIMESTAMPTZ"
+            )
 
         if "nfl_depth_charts" in table_names:
             try:
@@ -3559,6 +3702,12 @@ class NFLDatabase:
             Column("away_moneyline", Float),
             Column("home_implied_prob", Float),
             Column("away_implied_prob", Float),
+            Column("home_closing_moneyline", Float),
+            Column("away_closing_moneyline", Float),
+            Column("home_closing_implied_prob", Float),
+            Column("away_closing_implied_prob", Float),
+            Column("closing_bookmaker", String),
+            Column("closing_line_time", DateTime(timezone=True)),
             Column("odds_updated", DateTime(timezone=True)),
             Column("ingested_at", DateTime(timezone=True), default=default_now_utc),
         )
@@ -3779,6 +3928,17 @@ class NFLDatabase:
             self.games.c.home_team,
             self.games.c.away_team,
             self.games.c.odds_event_id,
+            self.games.c.home_moneyline,
+            self.games.c.away_moneyline,
+            self.games.c.home_implied_prob,
+            self.games.c.away_implied_prob,
+            self.games.c.home_closing_moneyline,
+            self.games.c.away_closing_moneyline,
+            self.games.c.home_closing_implied_prob,
+            self.games.c.away_closing_implied_prob,
+            self.games.c.closing_bookmaker,
+            self.games.c.closing_line_time,
+            self.games.c.odds_updated,
         ]
         with self.engine.begin() as conn:
             rows = conn.execute(select(*columns)).fetchall()
@@ -3793,6 +3953,17 @@ class NFLDatabase:
                     "home_team": row[4],
                     "away_team": row[5],
                     "odds_event_id": row[6],
+                    "home_moneyline": row[7],
+                    "away_moneyline": row[8],
+                    "home_implied_prob": row[9],
+                    "away_implied_prob": row[10],
+                    "home_closing_moneyline": row[11],
+                    "away_closing_moneyline": row[12],
+                    "home_closing_implied_prob": row[13],
+                    "away_closing_implied_prob": row[14],
+                    "closing_bookmaker": row[15],
+                    "closing_line_time": row[16],
+                    "odds_updated": row[17],
                 }
             )
         return results
@@ -4849,6 +5020,7 @@ class NFLIngestor:
             return parse_dt(value)
 
         games_by_event: Dict[str, Dict[str, Any]] = {}
+        seen_events: Set[str] = set()
         games_by_key: Dict[Tuple[str, str, Optional[dt.date]], List[Dict[str, Any]]] = defaultdict(list)
         refresh_candidates: Dict[str, Dict[str, Any]] = {}
         missing_count = 0
@@ -5013,10 +5185,45 @@ class NFLIngestor:
         totals_rows: List[Dict[str, Any]] = []
         prop_rows: List[Dict[str, Any]] = []
 
+        def _select_closing_bookmaker(
+            bookmakers: Sequence[Dict[str, Any]],
+            game_start: Optional[dt.datetime],
+        ) -> Tuple[Optional[Dict[str, Any]], Optional[dt.datetime]]:
+            if not bookmakers:
+                return None, None
+
+            ranked: List[Tuple[int, float, dt.datetime, Dict[str, Any]]] = []
+            for bookmaker in bookmakers:
+                update_raw = parse_dt(bookmaker.get("last_update"))
+                update_ts = update_raw or default_now_utc()
+                if game_start is not None:
+                    if update_ts <= game_start:
+                        priority = 0
+                        delta = abs((game_start - update_ts).total_seconds())
+                    elif update_ts <= game_start + dt.timedelta(minutes=15):
+                        priority = 1
+                        delta = abs((update_ts - game_start).total_seconds())
+                    else:
+                        priority = 2
+                        delta = abs((update_ts - game_start).total_seconds())
+                else:
+                    priority = 2
+                    delta = 0.0
+                ranked.append((priority, float(delta), update_ts, bookmaker))
+
+            ranked.sort(key=lambda item: (item[0], item[1], -item[2].timestamp()))
+            best_priority, _, best_update, best_book = ranked[0]
+            if best_priority >= 2 and bookmakers:
+                # If everything is post-kickoff, still return the freshest quote.
+                freshest = max(ranked, key=lambda item: item[2])
+                best_update, best_book = freshest[2], freshest[3]
+            return best_book, best_update
+
         for event in odds_data:
             event_id = str(event.get("id") or "")
-            if not event_id:
+            if not event_id or event_id in seen_events:
                 continue
+            seen_events.add(event_id)
 
             commence_time = parse_dt(event.get("commence_time"))
             teams_list = [team for team in (event.get("teams") or []) if team]
@@ -5067,12 +5274,21 @@ class NFLIngestor:
             )
 
             primary_book = sorted_books[0]
-            last_update = parse_dt(primary_book.get("last_update"))
+            last_update = parse_dt(primary_book.get("last_update")) or default_now_utc()
             moneyline_market = None
             for market in primary_book.get("markets", []) or []:
                 if (market.get("key") or "").lower() == "h2h":
                     moneyline_market = market
                     break
+
+            game_start = commence_time or _ensure_datetime(matched_game.get("start_time"))
+            closing_book, closing_time = _select_closing_bookmaker(sorted_books, game_start)
+            closing_market = None
+            if closing_book is not None:
+                for market in closing_book.get("markets", []) or []:
+                    if (market.get("key") or "").lower() == "h2h":
+                        closing_market = market
+                        break
 
             def _extract_team_price(outcomes: Iterable[Dict[str, Any]], team_abbr: str) -> Optional[float]:
                 for outcome in outcomes:
@@ -5093,12 +5309,23 @@ class NFLIngestor:
                 home_price = _extract_team_price(outcomes, home_team)
                 away_price = _extract_team_price(outcomes, away_team)
 
+            closing_home = None
+            closing_away = None
+            if closing_market:
+                outcomes = closing_market.get("outcomes", []) or []
+                closing_home = _extract_team_price(outcomes, home_team)
+                closing_away = _extract_team_price(outcomes, away_team)
+
+            closing_book_name = None
+            if closing_book is not None:
+                closing_book_name = closing_book.get("key") or closing_book.get("title") or "unknown"
+
             odds_rows.append(
                 {
                     "game_id": game_id,
                     "season": season,
                     "week": week,
-                    "start_time": commence_time or _ensure_datetime(matched_game.get("start_time")),
+                    "start_time": game_start,
                     "home_team": home_team,
                     "away_team": away_team,
                     "status": matched_game.get("status") or "scheduled",
@@ -5106,6 +5333,12 @@ class NFLIngestor:
                     "away_moneyline": away_price,
                     "home_implied_prob": _american_to_prob(home_price),
                     "away_implied_prob": _american_to_prob(away_price),
+                    "home_closing_moneyline": closing_home,
+                    "away_closing_moneyline": closing_away,
+                    "home_closing_implied_prob": _american_to_prob(closing_home),
+                    "away_closing_implied_prob": _american_to_prob(closing_away),
+                    "closing_bookmaker": closing_book_name,
+                    "closing_line_time": closing_time,
                     "odds_updated": last_update,
                     "odds_event_id": event_id,
                 }
@@ -5270,6 +5503,12 @@ class NFLIngestor:
                     "away_moneyline",
                     "home_implied_prob",
                     "away_implied_prob",
+                    "home_closing_moneyline",
+                    "away_closing_moneyline",
+                    "home_closing_implied_prob",
+                    "away_closing_implied_prob",
+                    "closing_bookmaker",
+                    "closing_line_time",
                     "odds_updated",
                     "home_team",
                     "away_team",
@@ -6147,9 +6386,12 @@ class NFLIngestor:
 class FeatureBuilder:
     """Transforms raw database tables into model-ready feature sets."""
 
-    def __init__(self, engine: Engine):
+    def __init__(
+        self, engine: Engine, supplemental_loader: Optional[SupplementalDataLoader] = None
+    ):
         self.engine = engine
         self.games_frame: Optional[pd.DataFrame] = None
+        self.games_frame_raw: Optional[pd.DataFrame] = None
         self.player_feature_frame: Optional[pd.DataFrame] = None
         self.team_strength_frame: Optional[pd.DataFrame] = None
         self.team_strength_latest_by_season: Optional[pd.DataFrame] = None
@@ -6164,6 +6406,8 @@ class FeatureBuilder:
         self.latest_odds_lookup: Optional[pd.DataFrame] = None
         self.game_totals_frame: Optional[pd.DataFrame] = None
         self.player_prop_lines_frame: Optional[pd.DataFrame] = None
+        self.team_game_lookup: Optional[pd.DataFrame] = None
+        self.supplemental_loader = supplemental_loader
 
     @staticmethod
     def _american_to_prob_series(series: pd.Series) -> pd.Series:
@@ -6230,6 +6474,12 @@ class FeatureBuilder:
             "away_moneyline",
             "home_implied_prob",
             "away_implied_prob",
+            "home_closing_moneyline",
+            "away_closing_moneyline",
+            "home_closing_implied_prob",
+            "away_closing_implied_prob",
+            "closing_bookmaker",
+            "closing_line_time",
             "odds_updated",
         ]
 
@@ -6265,8 +6515,231 @@ class FeatureBuilder:
                 else:
                     working[prob_col] = derived
 
+            closing_money_col = f"{side}_closing_moneyline"
+            closing_prob_col = f"{side}_closing_implied_prob"
+            if closing_money_col in working.columns:
+                derived_closing = self._american_to_prob_series(working[closing_money_col])
+                if closing_prob_col in working.columns:
+                    working[closing_prob_col] = working[closing_prob_col].combine_first(
+                        derived_closing
+                    )
+                else:
+                    working[closing_prob_col] = derived_closing
+
+        loader = getattr(self, "supplemental_loader", None)
+        supplemental_closing = None
+        if loader is not None:
+            supplemental_closing = getattr(loader, "closing_odds_frame", None)
+        if supplemental_closing is not None and not supplemental_closing.empty:
+            supplemental = supplemental_closing.copy()
+            supplemental["season"] = supplemental["season"].astype(str)
+            for col in ["home_team", "away_team"]:
+                if col in supplemental.columns:
+                    supplemental[col] = supplemental[col].apply(normalize_team_abbr)
+            merge_keys: List[str] = []
+            temporary_game_id_key = None
+            if "game_id" in supplemental.columns and "game_id" in working.columns:
+                # Avoid dtype mismatches (object vs. int64) when merging on game_id by
+                # materializing a temporary, normalized key in both frames.
+                temporary_game_id_key = "_merge_game_id"
+                working[temporary_game_id_key] = working["game_id"].astype(str)
+                supplemental[temporary_game_id_key] = supplemental["game_id"].astype(str)
+                merge_keys = [temporary_game_id_key]
+            elif {
+                "season",
+                "week",
+                "home_team",
+                "away_team",
+            }.issubset(supplemental.columns) and {
+                "season",
+                "week",
+                "home_team",
+                "away_team",
+            }.issubset(working.columns):
+                merge_keys = ["season", "week", "home_team", "away_team"]
+            if merge_keys:
+                supplement_cols = [
+                    "home_closing_moneyline",
+                    "away_closing_moneyline",
+                    "home_closing_implied_prob",
+                    "away_closing_implied_prob",
+                    "closing_bookmaker",
+                    "closing_line_time",
+                ]
+                available_cols = [
+                    col for col in supplement_cols if col in supplemental.columns
+                ]
+                if available_cols:
+                    rename_map = {col: f"{col}_supp" for col in available_cols}
+                    supplemental = supplemental[merge_keys + available_cols].rename(
+                        columns=rename_map
+                    )
+                    working = working.merge(supplemental, on=merge_keys, how="left")
+                    for col in available_cols:
+                        supplemental_col = f"{col}_supp"
+                        if supplemental_col in working.columns:
+                            working[col] = working[col].combine_first(
+                                working[supplemental_col]
+                            )
+                            working.drop(columns=[supplemental_col], inplace=True)
+
+                if temporary_game_id_key is not None:
+                    working.drop(columns=[temporary_game_id_key], inplace=True, errors="ignore")
+                    supplemental.drop(columns=[temporary_game_id_key], inplace=True, errors="ignore")
+
         working.drop(columns=["_start_date"], inplace=True, errors="ignore")
+
+        inferred_mask = pd.Series(False, index=working.index)
+        for side in ("home", "away"):
+            closing_col = f"{side}_closing_moneyline"
+            fallback_col = f"{side}_moneyline"
+            closing_prob_col = f"{side}_closing_implied_prob"
+
+            if closing_col not in working.columns or fallback_col not in working.columns:
+                continue
+
+            missing = working[closing_col].isna() & working[fallback_col].notna()
+            if not missing.any():
+                continue
+
+            working.loc[missing, closing_col] = working.loc[missing, fallback_col]
+
+            fallback_probs = self._american_to_prob_series(working.loc[missing, fallback_col])
+            if closing_prob_col in working.columns:
+                combined = working.loc[missing, closing_prob_col]
+                combined = combined.fillna(fallback_probs)
+                working.loc[missing, closing_prob_col] = combined
+            else:
+                working.loc[missing, closing_prob_col] = fallback_probs
+
+            inferred_mask = inferred_mask | missing
+
+        if inferred_mask.any():
+            if "closing_bookmaker" in working.columns:
+                working.loc[inferred_mask, "closing_bookmaker"] = working.loc[
+                    inferred_mask, "closing_bookmaker"
+                ].fillna("inferred_last_snapshot")
+            if "closing_line_time" in working.columns:
+                inferred_times = working.loc[inferred_mask, "closing_line_time"]
+                if "odds_updated" in working.columns:
+                    inferred_times = inferred_times.fillna(working.loc[inferred_mask, "odds_updated"])
+                if "start_time" in working.columns:
+                    inferred_times = inferred_times.fillna(working.loc[inferred_mask, "start_time"])
+                working.loc[inferred_mask, "closing_line_time"] = inferred_times
+
         return working
+
+    def _build_team_game_lookup(self, games: pd.DataFrame) -> pd.DataFrame:
+        if games is None or games.empty:
+            return pd.DataFrame(columns=["team", "opponent", "is_home", "start_time", "game_id"])
+
+        working = games.copy()
+        working["start_time"] = pd.to_datetime(working["start_time"], utc=True, errors="coerce")
+
+        home = working[["game_id", "start_time", "home_team", "away_team"]].rename(
+            columns={"home_team": "team", "away_team": "opponent"}
+        )
+        home["is_home"] = True
+
+        away = working[["game_id", "start_time", "away_team", "home_team"]].rename(
+            columns={"away_team": "team", "home_team": "opponent"}
+        )
+        away["is_home"] = False
+
+        combined = safe_concat([home, away], ignore_index=True)
+        if combined.empty:
+            return pd.DataFrame(columns=["team", "opponent", "is_home", "start_time", "game_id"])
+
+        combined["team"] = combined["team"].apply(normalize_team_abbr)
+        combined["opponent"] = combined["opponent"].apply(normalize_team_abbr)
+        combined = combined.dropna(subset=["team", "opponent", "start_time"])
+        combined = combined.sort_values(["team", "start_time", "game_id"]).reset_index(drop=True)
+        return combined
+
+    def _lookup_previous_game(
+        self, team: Optional[str], reference_time: Optional[pd.Timestamp]
+    ) -> Optional[pd.Series]:
+        if not team:
+            return None
+        lookup = self.team_game_lookup
+        if lookup is None or lookup.empty:
+            return None
+
+        try:
+            ref = pd.to_datetime(reference_time, utc=True, errors="coerce")
+        except Exception:
+            ref = pd.NaT
+
+        team_rows = lookup[lookup["team"] == normalize_team_abbr(team)]
+        if team_rows.empty:
+            return None
+
+        if pd.notna(ref):
+            team_rows = team_rows[team_rows["start_time"] < ref]
+            if team_rows.empty:
+                return None
+        return team_rows.iloc[-1]
+
+    @staticmethod
+    def _tz_offset_hours(ts: Optional[pd.Timestamp], team: Optional[str]) -> float:
+        if ts is None or pd.isna(ts):
+            return 0.0
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(dt.timezone.utc)
+        tz_name = TEAM_TIMEZONES.get(team or "", "UTC")
+        try:
+            zone = ZoneInfo(tz_name)
+        except Exception:
+            zone = ZoneInfo("UTC")
+        offset = ts.astimezone(zone).utcoffset()
+        if offset is None:
+            return 0.0
+        return float(offset.total_seconds() / 3600.0)
+
+    def _fallback_team_context(
+        self,
+        team: Optional[str],
+        opponent: Optional[str],
+        start_time: Optional[pd.Timestamp],
+        *,
+        is_home: bool,
+    ) -> Dict[str, float]:
+        defaults: Dict[str, float] = {
+            "rest_days": np.nan,
+            "rest_penalty": np.nan,
+            "travel_penalty": np.nan,
+            "timezone_diff_hours": np.nan,
+            "avg_timezone_diff_hours": np.nan,
+        }
+
+        if not team:
+            return defaults
+
+        try:
+            start_ts = pd.to_datetime(start_time, utc=True, errors="coerce")
+        except Exception:
+            start_ts = pd.NaT
+
+        if pd.isna(start_ts):
+            return defaults
+
+        previous = self._lookup_previous_game(team, start_ts)
+        if previous is not None:
+            prev_start = pd.to_datetime(previous.get("start_time"), utc=True, errors="coerce")
+            if pd.notna(prev_start):
+                rest_days = float((start_ts - prev_start).total_seconds() / 86400.0)
+                if rest_days >= 0:
+                    defaults["rest_days"] = rest_days
+                    defaults["rest_penalty"] = max(0.0, 6.0 - rest_days)
+
+        venue_team = team if is_home else opponent
+        tz_team = self._tz_offset_hours(start_ts, team)
+        tz_venue = self._tz_offset_hours(start_ts, venue_team)
+        tz_diff = abs(tz_team - tz_venue)
+        defaults["timezone_diff_hours"] = tz_diff
+        defaults["avg_timezone_diff_hours"] = tz_diff
+        defaults["travel_penalty"] = 0.0 if is_home else tz_diff / 3.0
+        return defaults
 
     def load_dataframes(
         self,
@@ -6305,6 +6778,54 @@ class FeatureBuilder:
         advanced_metrics = advanced_metrics.rename(columns=lambda col: str(col))
         game_totals = game_totals.rename(columns=lambda col: str(col))
         player_prop_lines = player_prop_lines.rename(columns=lambda col: str(col))
+
+        loader = getattr(self, "supplemental_loader", None)
+        travel_context = None
+        if loader is not None:
+            travel_context = getattr(loader, "travel_context_frame", None)
+        if travel_context is not None and not travel_context.empty:
+            travel_df = travel_context.copy()
+            travel_df["team"] = travel_df["team"].apply(normalize_team_abbr)
+            travel_df["season"] = travel_df["season"].astype(str)
+            if "week" in travel_df.columns:
+                travel_df["week"] = travel_df["week"].apply(
+                    lambda x: int(x) if pd.notna(x) else None
+                )
+
+            def _merge_travel(prefix: str, team_col: str) -> Optional[pd.DataFrame]:
+                if not {"season", "week", team_col}.issubset(games.columns):
+                    return None
+                context_cols = [
+                    "rest_days",
+                    "rest_penalty",
+                    "travel_penalty",
+                    "timezone_diff_hours",
+                    "avg_timezone_diff_hours",
+                ]
+                available = [col for col in context_cols if col in travel_df.columns]
+                if not available:
+                    return None
+                rename_map = {col: f"{prefix}_{col}" for col in available}
+                merge_frame = travel_df[["season", "week", "team", *available]].rename(
+                    columns=rename_map | {"team": team_col}
+                )
+                key_cols = ["season", "week", team_col]
+                merged = games.merge(merge_frame, on=key_cols, how="left")
+
+                for col in available:
+                    target_col = f"{prefix}_{col}"
+                    if target_col in merged.columns and col in merged.columns:
+                        merged[target_col] = merged[target_col].combine_first(merged[col])
+                for col in available:
+                    merged.drop(columns=[col], inplace=True, errors="ignore")
+                return merged
+
+            merged_home = _merge_travel("home", "home_team")
+            if merged_home is not None:
+                games = merged_home
+            merged_away = _merge_travel("away", "away_team")
+            if merged_away is not None:
+                games = merged_away
         if "position" in player_stats.columns:
             player_stats["position"] = player_stats["position"].apply(normalize_position)
         if "practice_status" in player_stats.columns:
@@ -6355,6 +6876,7 @@ class FeatureBuilder:
             return {}
 
         games = games.copy()
+        self.games_frame_raw = games.copy()
         games = self._backfill_game_odds(games)
         if "home_moneyline" in games.columns and "away_moneyline" in games.columns:
             odds_lookup = games.dropna(subset=["home_moneyline", "away_moneyline"], how="any").copy()
@@ -6418,6 +6940,7 @@ class FeatureBuilder:
         self.advanced_metrics_frame = advanced_metrics
         self.game_totals_frame = game_totals
         self.player_prop_lines_frame = player_prop_lines
+        self.team_game_lookup = self._build_team_game_lookup(games)
 
         # Basic cleanup
         games["start_time"] = pd.to_datetime(games["start_time"])
@@ -6468,6 +6991,7 @@ class FeatureBuilder:
         # Derive rolling scoring, rest, and win-rate indicators from historical games.
         team_game_history = self._compute_team_game_rolling_stats(games)
         self.team_history_frame = team_game_history
+        self.team_game_lookup = team_game_history
         penalties_by_week = pd.DataFrame()
         if not team_game_history.empty:
             penalties_by_week = (
@@ -6958,6 +7482,11 @@ class FeatureBuilder:
             .merge(away_history, on="game_id", how="left")
         )
 
+        if "home_travel_penalty" not in games_context.columns:
+            games_context["home_travel_penalty"] = np.nan
+        if "away_travel_penalty" not in games_context.columns:
+            games_context["away_travel_penalty"] = np.nan
+
         if "home_travel_penalty_hist" in games_context.columns:
             games_context["home_travel_penalty"] = games_context["home_travel_penalty"].combine_first(
                 games_context["home_travel_penalty_hist"]
@@ -6992,6 +7521,7 @@ class FeatureBuilder:
         )
 
         games_context["point_diff"] = games_context["home_score"] - games_context["away_score"]
+        self.games_frame = games_context.copy()
         games_labeled = games_context.dropna(subset=["home_score", "away_score"])
         if games_labeled.empty:
             logging.warning(
@@ -7023,7 +7553,33 @@ class FeatureBuilder:
                 return match.iloc[0]
         return None
 
-    def _get_latest_team_history(self, team: str, season: Optional[str]) -> Optional[pd.Series]:
+    def _get_latest_team_history(
+        self,
+        team: Optional[str],
+        season: Optional[str],
+        reference_time: Optional[pd.Timestamp] = None,
+    ) -> Optional[pd.Series]:
+        if not team:
+            return None
+
+        history = self.team_history_frame
+        ref_ts: Optional[pd.Timestamp]
+        try:
+            ref_ts = pd.to_datetime(reference_time, utc=True, errors="coerce")
+        except Exception:
+            ref_ts = None
+
+        if history is not None and not history.empty:
+            subset = history[history["team"] == normalize_team_abbr(team)]
+            if ref_ts is not None and not pd.isna(ref_ts):
+                subset = subset[pd.to_datetime(subset["start_time"], utc=True, errors="coerce") < ref_ts]
+            if season:
+                season_subset = subset[subset["season"] == season]
+                if not season_subset.empty:
+                    return season_subset.sort_values("start_time").iloc[-1]
+            if not subset.empty:
+                return subset.sort_values("start_time").iloc[-1]
+
         if self.team_history_latest_by_season is not None and not self.team_history_latest_by_season.empty:
             if season:
                 match = self.team_history_latest_by_season[
@@ -7038,6 +7594,10 @@ class FeatureBuilder:
             ]
             if not match.empty:
                 return match.iloc[0]
+
+        fallback = self._fallback_team_context(team, None, ref_ts, is_home=True)
+        if any(not pd.isna(value) for value in fallback.values()):
+            return pd.Series(fallback)
         return None
 
     def prepare_upcoming_game_features(self, upcoming_games: pd.DataFrame) -> pd.DataFrame:
@@ -7045,7 +7605,7 @@ class FeatureBuilder:
             return upcoming_games.copy()
 
         features = upcoming_games.copy()
-        features["start_time"] = pd.to_datetime(features["start_time"])
+        features["start_time"] = pd.to_datetime(features["start_time"], utc=True, errors="coerce")
         if "day_of_week" not in features.columns or features["day_of_week"].isna().any():
             features["day_of_week"] = features["start_time"].dt.day_name()
 
@@ -7091,6 +7651,7 @@ class FeatureBuilder:
             "home_rest_penalty": np.nan,
             "home_weather_adjustment": np.nan,
             "home_timezone_diff_hours": np.nan,
+            "home_avg_timezone_diff_hours": np.nan,
             "away_offense_pass_rating": np.nan,
             "away_offense_rush_rating": np.nan,
             "away_defense_pass_rating": np.nan,
@@ -7104,6 +7665,7 @@ class FeatureBuilder:
             "away_rest_penalty": np.nan,
             "away_weather_adjustment": np.nan,
             "away_timezone_diff_hours": np.nan,
+            "away_avg_timezone_diff_hours": np.nan,
             "home_points_for_avg": np.nan,
             "home_points_against_avg": np.nan,
             "home_point_diff_avg": np.nan,
@@ -7129,10 +7691,65 @@ class FeatureBuilder:
             if col not in features.columns:
                 features[col] = default
 
+        loader = getattr(self, "supplemental_loader", None)
+        travel_context = None
+        if loader is not None:
+            travel_context = getattr(loader, "travel_context_frame", None)
+        if travel_context is not None and not travel_context.empty:
+            travel_df = travel_context.copy()
+            travel_df["team"] = travel_df["team"].apply(normalize_team_abbr)
+            travel_df["season"] = travel_df["season"].astype(str)
+            if "week" in travel_df.columns:
+                travel_df["week"] = travel_df["week"].apply(
+                    lambda x: int(x) if pd.notna(x) else None
+                )
+
+            def _merge_upcoming(prefix: str, team_col: str) -> None:
+                if not {"season", "week", team_col}.issubset(features.columns):
+                    return
+                context_cols = [
+                    "rest_days",
+                    "rest_penalty",
+                    "travel_penalty",
+                    "timezone_diff_hours",
+                    "avg_timezone_diff_hours",
+                ]
+                available = [col for col in context_cols if col in travel_df.columns]
+                if not available:
+                    return
+                rename_map = {col: f"{prefix}_{col}_supp" for col in available}
+                merge_frame = travel_df[["season", "week", "team", *available]].rename(
+                    columns=rename_map | {"team": team_col}
+                )
+                merged = features.merge(
+                    merge_frame,
+                    on=["season", "week", team_col],
+                    how="left",
+                )
+                for col in available:
+                    target_col = f"{prefix}_{col}"
+                    supp_col = f"{prefix}_{col}_supp"
+                    if supp_col not in merged.columns:
+                        continue
+                    if target_col in merged.columns:
+                        merged[target_col] = merged[target_col].combine_first(merged[supp_col])
+                    else:
+                        merged[target_col] = merged[supp_col]
+                    merged.drop(columns=[supp_col], inplace=True)
+                return merged
+
+            merged_home = _merge_upcoming("home", "home_team")
+            if merged_home is not None:
+                features = merged_home
+            merged_away = _merge_upcoming("away", "away_team")
+            if merged_away is not None:
+                features = merged_away
+
         for idx, row in features.iterrows():
             season = row.get("season")
             home_team = row.get("home_team")
             away_team = row.get("away_team")
+            start_time = row.get("start_time")
 
             if home_team:
                 strength = self._get_latest_team_strength(home_team, season)
@@ -7150,7 +7767,7 @@ class FeatureBuilder:
                     features.at[idx, "home_rest_penalty"] = strength.get("rest_penalty")
                     features.at[idx, "home_weather_adjustment"] = strength.get("weather_adjustment")
                     features.at[idx, "home_timezone_diff_hours"] = strength.get("avg_timezone_diff_hours")
-                history = self._get_latest_team_history(home_team, season)
+                history = self._get_latest_team_history(home_team, season, start_time)
                 if history is not None:
                     features.at[idx, "home_points_for_avg"] = history.get("rolling_points_for")
                     features.at[idx, "home_points_against_avg"] = history.get("rolling_points_against")
@@ -7166,6 +7783,22 @@ class FeatureBuilder:
                         features.at[idx, "home_travel_penalty"] = history.get("travel_penalty")
                     if pd.isna(features.at[idx, "home_timezone_diff_hours"]):
                         features.at[idx, "home_timezone_diff_hours"] = history.get("timezone_diff_hours")
+
+                fallback_home = self._fallback_team_context(
+                    home_team,
+                    away_team,
+                    start_time,
+                    is_home=True,
+                )
+                for key, value in fallback_home.items():
+                    if pd.isna(value):
+                        continue
+                    if key == "avg_timezone_diff_hours":
+                        target_col = "home_timezone_diff_hours"
+                    else:
+                        target_col = f"home_{key}"
+                    if target_col in features.columns and pd.isna(features.at[idx, target_col]):
+                        features.at[idx, target_col] = value
 
             if away_team:
                 strength = self._get_latest_team_strength(away_team, season)
@@ -7183,7 +7816,7 @@ class FeatureBuilder:
                     features.at[idx, "away_rest_penalty"] = strength.get("rest_penalty")
                     features.at[idx, "away_weather_adjustment"] = strength.get("weather_adjustment")
                     features.at[idx, "away_timezone_diff_hours"] = strength.get("avg_timezone_diff_hours")
-                history = self._get_latest_team_history(away_team, season)
+                history = self._get_latest_team_history(away_team, season, start_time)
                 if history is not None:
                     features.at[idx, "away_points_for_avg"] = history.get("rolling_points_for")
                     features.at[idx, "away_points_against_avg"] = history.get("rolling_points_against")
@@ -7199,6 +7832,22 @@ class FeatureBuilder:
                         features.at[idx, "away_travel_penalty"] = history.get("travel_penalty")
                     if pd.isna(features.at[idx, "away_timezone_diff_hours"]):
                         features.at[idx, "away_timezone_diff_hours"] = history.get("timezone_diff_hours")
+
+                fallback_away = self._fallback_team_context(
+                    away_team,
+                    home_team,
+                    start_time,
+                    is_home=False,
+                )
+                for key, value in fallback_away.items():
+                    if pd.isna(value):
+                        continue
+                    if key == "avg_timezone_diff_hours":
+                        target_col = "away_timezone_diff_hours"
+                    else:
+                        target_col = f"away_{key}"
+                    if target_col in features.columns and pd.isna(features.at[idx, target_col]):
+                        features.at[idx, target_col] = value
 
         fill_defaults = {col: 0.0 for col in numeric_placeholders.keys()}
         features[list(fill_defaults.keys())] = features[list(fill_defaults.keys())].fillna(fill_defaults)
@@ -8019,7 +8668,7 @@ class FeatureBuilder:
                         row_copy["weather_adjustment"] = strength.get("weather_adjustment")
                         row_copy["avg_timezone_diff_hours"] = strength.get("avg_timezone_diff_hours")
 
-                    history = self._get_latest_team_history(team, season)
+                    history = self._get_latest_team_history(team, season, start_time)
                     if history is not None:
                         if pd.isna(row_copy.get("rest_penalty")):
                             row_copy["rest_penalty"] = history.get("rest_penalty")
@@ -8027,6 +8676,19 @@ class FeatureBuilder:
                             row_copy["travel_penalty"] = history.get("travel_penalty")
                         if pd.isna(row_copy.get("avg_timezone_diff_hours")):
                             row_copy["avg_timezone_diff_hours"] = history.get("timezone_diff_hours")
+
+                    fallback_team = self._fallback_team_context(
+                        team,
+                        opponent,
+                        start_time,
+                        is_home=(team == home_team),
+                    )
+                    for key, value in fallback_team.items():
+                        if pd.isna(value):
+                            continue
+                        target_key = key if key != "avg_timezone_diff_hours" else "avg_timezone_diff_hours"
+                        if target_key in row_copy and pd.isna(row_copy.get(target_key)):
+                            row_copy[target_key] = value
 
                     opp_strength = self._get_latest_team_strength(opponent, season)
                     if opp_strength is not None:
@@ -8044,7 +8706,7 @@ class FeatureBuilder:
                         row_copy["opp_weather_adjustment"] = opp_strength.get("weather_adjustment")
                         row_copy["opp_timezone_diff_hours"] = opp_strength.get("avg_timezone_diff_hours")
 
-                    opp_history = self._get_latest_team_history(opponent, season)
+                    opp_history = self._get_latest_team_history(opponent, season, start_time)
                     if opp_history is not None:
                         if pd.isna(row_copy.get("opp_rest_penalty")):
                             row_copy["opp_rest_penalty"] = opp_history.get("rest_penalty")
@@ -8052,6 +8714,23 @@ class FeatureBuilder:
                             row_copy["opp_travel_penalty"] = opp_history.get("travel_penalty")
                         if pd.isna(row_copy.get("opp_timezone_diff_hours")):
                             row_copy["opp_timezone_diff_hours"] = opp_history.get("timezone_diff_hours")
+
+                    opp_fallback = self._fallback_team_context(
+                        opponent,
+                        team,
+                        start_time,
+                        is_home=(opponent == home_team),
+                    )
+                    for key, value in opp_fallback.items():
+                        if pd.isna(value):
+                            continue
+                        target_key = (
+                            f"opp_{key}"
+                            if key != "avg_timezone_diff_hours"
+                            else "opp_timezone_diff_hours"
+                        )
+                        if target_key in row_copy and pd.isna(row_copy.get(target_key)):
+                            row_copy[target_key] = value
 
                     selected_rows.append(row_copy)
 
@@ -8559,16 +9238,23 @@ class FeatureBuilder:
 
 
 class ModelTrainer:
-    def __init__(self, engine: Engine, db: NFLDatabase, run_id: Optional[str] = None):
+    def __init__(
+        self,
+        engine: Engine,
+        db: NFLDatabase,
+        supplemental_loader: Optional[SupplementalDataLoader] = None,
+        run_id: Optional[str] = None,
+    ):
         self.engine = engine
         self.db = db
-        self.feature_builder = FeatureBuilder(engine)
+        self.feature_builder = FeatureBuilder(engine, supplemental_loader)
         self.run_id = run_id or uuid.uuid4().hex
         self.model_uncertainty: Dict[str, Dict[str, float]] = {}
         self.target_priors: Dict[str, Dict[str, Any]] = {}
         self.prior_engines: Dict[str, Optional[Dict[str, Any]]] = {}
         self.special_models: Dict[str, Dict[str, Any]] = {}
         self.feature_column_map: Dict[str, List[str]] = {}
+        self.supplemental_loader = supplemental_loader
 
     @staticmethod
     def _is_lineup_starter(position: str, rank: Optional[int]) -> bool:
@@ -9798,6 +10484,8 @@ class ModelTrainer:
                 moneyline_col = f"{side}_moneyline"
                 implied_col = f"{side}_implied_prob"
                 fair_col = f"{side}_fair_prob"
+                closing_money_col = f"{side}_closing_moneyline"
+                closing_prob_col = f"{side}_closing_implied_prob"
 
                 if moneyline_col not in working.columns:
                     working[moneyline_col] = np.nan
@@ -9805,11 +10493,27 @@ class ModelTrainer:
                     working.get(moneyline_col), errors="coerce"
                 )
 
+                if closing_money_col in working.columns:
+                    closing_series = pd.to_numeric(
+                        working.get(closing_money_col), errors="coerce"
+                    )
+                    working[moneyline_col] = closing_series.combine_first(
+                        working[moneyline_col]
+                    )
+
                 if implied_col not in working.columns:
                     working[implied_col] = np.nan
                 working[implied_col] = pd.to_numeric(
                     working.get(implied_col), errors="coerce"
                 )
+
+                if closing_prob_col in working.columns:
+                    closing_prob_series = pd.to_numeric(
+                        working.get(closing_prob_col), errors="coerce"
+                    )
+                    working[implied_col] = closing_prob_series.combine_first(
+                        working[implied_col]
+                    )
 
                 derived_probs = _american_to_prob(working[moneyline_col])
                 working[implied_col] = working[implied_col].fillna(derived_probs)
@@ -10054,7 +10758,12 @@ class ModelTrainer:
 
         # ---- Betting diagnostics ----
         # 1) MAE vs "closing lines" (if present)
-        closing_cols = [c for c in out_df.columns if c.startswith("line_") or c.endswith("_implied_prob")]
+        closing_cols = [
+            c
+            for c in out_df.columns
+            if c.startswith("line_") or c.endswith("_implied_prob")
+        ]
+        closing_cols.sort(key=lambda col: (0 if "closing" in col else 1, col))
         mae_vs_closing = None
         baseline_reference: Optional[pd.Series] = None
         if not target.endswith("_win_prob") and not out_df.empty:
@@ -10078,17 +10787,35 @@ class ModelTrainer:
                 out_df["_baseline_reference"] = baseline_reference
 
         if target.endswith("_win_prob"):
-            # join to implied probs derived from moneylines already in games table
-            # Expect columns like 'home_implied_prob'/'away_implied_prob' from ingest (see _ingest_odds)
             side = out_df.get("team_side")  # optional column you may carry ("home"/"away")
-            if side is not None and "home_implied_prob" in out_df and "away_implied_prob" in out_df:
-                cl = np.where(side == "home", out_df["home_implied_prob"], out_df["away_implied_prob"])
-                mae_vs_closing = float(np.nanmean(np.abs(out_df["_y_pred"] - cl)))
+            if side is not None:
+                home_ref = pd.Series(np.nan, index=out_df.index, dtype=float)
+                away_ref = pd.Series(np.nan, index=out_df.index, dtype=float)
+                if "home_closing_implied_prob" in out_df:
+                    home_ref = pd.to_numeric(out_df["home_closing_implied_prob"], errors="coerce")
+                if "away_closing_implied_prob" in out_df:
+                    away_ref = pd.to_numeric(out_df["away_closing_implied_prob"], errors="coerce")
+                if "home_implied_prob" in out_df:
+                    home_ref = home_ref.combine_first(
+                        pd.to_numeric(out_df["home_implied_prob"], errors="coerce")
+                    )
+                if "away_implied_prob" in out_df:
+                    away_ref = away_ref.combine_first(
+                        pd.to_numeric(out_df["away_implied_prob"], errors="coerce")
+                    )
+                if home_ref.notna().any() or away_ref.notna().any():
+                    cl = np.where(side == "home", home_ref, away_ref)
+                    mae_vs_closing = float(
+                        np.nanmean(np.abs(out_df["_y_pred"] - pd.to_numeric(cl, errors="coerce")))
+                    )
         elif closing_cols:
             # e.g., player props with 'line_receiving_yards', etc.
             # Choose the first matching line as a reference
-            ref = out_df[closing_cols[0]].astype(float)
-            mae_vs_closing = float(np.nanmean(np.abs(out_df["_y_pred"] - ref)))
+            ref = pd.to_numeric(out_df[closing_cols[0]], errors="coerce")
+            if ref.notna().any():
+                mae_vs_closing = float(
+                    np.nanmean(np.abs(out_df["_y_pred"] - ref.astype(float)))
+                )
 
         if mae_vs_closing is None and baseline_reference is not None:
             if baseline_reference.notna().any():
@@ -10111,22 +10838,39 @@ class ModelTrainer:
             if preds_array.size != len(out_df) or not len(out_df):
                 return None
 
-            required_cols = {"home_moneyline", "away_moneyline", "home_score", "away_score"}
-            missing_required = required_cols - set(out_df.columns)
-            if missing_required:
+            pred_series = pd.Series(preds_array, index=out_df.index, dtype=float)
+
+            required_score_cols = {"home_score", "away_score"}
+            missing_scores = required_score_cols - set(out_df.columns)
+            if missing_scores:
                 logging.debug(
-                    "%s: skipping edge evaluation (%s missing)",
+                    "%s: skipping edge evaluation (score columns missing: %s)",
                     target,
-                    ", ".join(sorted(missing_required)),
+                    ", ".join(sorted(missing_scores)),
                 )
                 return None
 
-            price_cols = ["home_moneyline", "away_moneyline"]
-            market_frame = out_df.loc[:, price_cols].apply(pd.to_numeric, errors="coerce")
-            pred_series = pd.Series(preds_array, index=out_df.index, dtype=float)
+            def _merge_price(side: str) -> pd.Series:
+                candidates: List[pd.Series] = []
+                for col in (f"{side}_closing_moneyline", f"{side}_moneyline"):
+                    if col in out_df.columns:
+                        candidates.append(pd.to_numeric(out_df[col], errors="coerce"))
+                if not candidates:
+                    return pd.Series(np.nan, index=out_df.index, dtype=float)
+                series = candidates[0]
+                for extra in candidates[1:]:
+                    series = series.combine_first(extra)
+                return series
 
-            home_prices = market_frame["home_moneyline"].astype(float)
-            away_prices = market_frame["away_moneyline"].astype(float)
+            home_prices = _merge_price("home")
+            away_prices = _merge_price("away")
+
+            if home_prices.notna().sum() == 0 and away_prices.notna().sum() == 0:
+                logging.debug(
+                    "%s: skipping edge evaluation (no recorded sportsbook moneylines)",
+                    target,
+                )
+                return None
 
             home_probs = _american_to_prob(home_prices)
             away_probs = _american_to_prob(away_prices)
@@ -11360,8 +12104,16 @@ def predict_upcoming_games(
     trainer: Optional["ModelTrainer"] = None,
     config: Optional[NFLConfig] = None,
 ) -> Dict[str, pd.DataFrame]:
-    feature_builder = FeatureBuilder(engine)
-    feature_builder.build_features()
+    if trainer is not None and getattr(trainer, "feature_builder", None) is not None:
+        feature_builder = trainer.feature_builder
+    else:
+        supplemental_loader = None
+        if trainer is not None:
+            supplemental_loader = getattr(trainer, "supplemental_loader", None)
+        feature_builder = FeatureBuilder(engine, supplemental_loader)
+        feature_builder.build_features()
+    if feature_builder.games_frame is None:
+        feature_builder.build_features()
     model_uncertainty = model_uncertainty or {}
 
     base_games = pd.read_sql_table("nfl_games", engine).rename(columns=lambda col: str(col))
@@ -12181,6 +12933,308 @@ def predict_upcoming_games(
     return result_payload
 
 
+def paper_trade_recent_slates(
+    models: Dict[str, Pipeline],
+    trainer: Optional["ModelTrainer"],
+    config: NFLConfig,
+) -> Optional[PaperTradeSummary]:
+    if not config.enable_paper_trading:
+        return None
+
+    if trainer is None or trainer.feature_builder is None:
+        logging.warning("Paper trading skipped: training context unavailable.")
+        return None
+
+    feature_builder = trainer.feature_builder
+    games = feature_builder.games_frame
+    if games is None or games.empty:
+        logging.warning("Paper trading skipped: no games ingested for simulation.")
+        return None
+
+    if "game_winner" not in models:
+        logging.warning("Paper trading skipped: game_winner model not available.")
+        return None
+
+    completed = games.copy()
+    completed["start_time"] = pd.to_datetime(completed["start_time"], utc=True, errors="coerce")
+    completed = completed[
+        completed["start_time"].notna()
+        & completed["home_score"].notna()
+        & completed["away_score"].notna()
+    ]
+    def _resolve_price_series(frame: pd.DataFrame, side: str) -> pd.Series:
+        candidates: List[pd.Series] = []
+        for col in (f"{side}_closing_moneyline", f"{side}_moneyline"):
+            if col in frame.columns:
+                candidates.append(pd.to_numeric(frame[col], errors="coerce"))
+        if not candidates:
+            return pd.Series(np.nan, index=frame.index, dtype=float)
+        series = candidates[0]
+        for extra in candidates[1:]:
+            series = series.combine_first(extra)
+        return series
+
+    completed["_home_price"] = _resolve_price_series(completed, "home")
+    completed["_away_price"] = _resolve_price_series(completed, "away")
+    price_mask = completed[["_home_price", "_away_price"]].notna().any(axis=1)
+    closing_coverage = float(price_mask.mean()) if len(completed) else 0.0
+    completed = completed[price_mask]
+
+    lookback_days = max(int(config.paper_trade_lookback_days), 0)
+    if lookback_days > 0:
+        cutoff = default_now_utc() - dt.timedelta(days=lookback_days)
+        completed = completed[completed["start_time"] >= cutoff]
+
+    if completed.empty:
+        logging.warning(
+            "Paper trading skipped: no completed games with sportsbook odds in the lookback window.")
+        return None
+
+    completed = completed.sort_values("start_time").reset_index(drop=True)
+    game_features = feature_builder.prepare_upcoming_game_features(completed)
+    game_features = game_features.reset_index(drop=True)
+
+    def _ensure_model_features(frame: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
+        columns: Optional[Iterable[str]] = getattr(model, "feature_columns", None)
+        if not columns:
+            target_key = getattr(model, "target_name", None)
+            if trainer is not None and target_key:
+                columns = trainer.feature_column_map.get(target_key)
+        if not columns:
+            columns = getattr(model, "feature_names_in_", None)
+        if not columns:
+            numeric_cols = frame.select_dtypes(include=[np.number, bool]).columns.tolist()
+            if not numeric_cols:
+                return frame
+            return frame.loc[:, numeric_cols]
+        frame = frame.copy()
+        for col in columns:
+            if col not in frame.columns:
+                frame[col] = np.nan
+        return frame.loc[:, list(columns)]
+
+    winner_model = models["game_winner"]
+    winner_features = _ensure_model_features(game_features, winner_model)
+    try:
+        winner_probs = winner_model.predict_proba(winner_features)[:, 1]
+    except Exception:
+        logging.exception("Paper trading skipped: unable to score win probabilities for simulation.")
+        return None
+
+    if trainer is not None:
+        try:
+            specials = getattr(trainer, "special_models", {}) or {}
+        except Exception:
+            specials = {}
+        calibration_info = specials.get("game_winner", {}).get("calibration") if isinstance(specials, dict) else None
+        if calibration_info and calibration_info.get("method") == "logistic":
+            model = calibration_info.get("model")
+            if model is not None:
+                try:
+                    winner_probs = model.predict_proba(winner_probs.reshape(-1, 1))[:, 1]
+                except Exception:
+                    logging.debug(
+                        "Paper trading: unable to apply stored calibration for game_winner", exc_info=True
+                    )
+
+    bankroll = float(max(config.paper_trade_bankroll, 0.0))
+    max_fraction = float(max(config.paper_trade_max_fraction, 0.0))
+    min_edge = float(max(config.paper_trade_edge_threshold, 0.0))
+
+    trades: List[Dict[str, Any]] = []
+    total_staked = 0.0
+    total_profit = 0.0
+    wins = 0
+    graded_count = 0
+
+    def _american_prob(value: float) -> float:
+        try:
+            odds_val = float(value)
+        except (TypeError, ValueError):
+            return np.nan
+        if odds_val >= 0:
+            return 100.0 / (odds_val + 100.0)
+        return -odds_val / (-odds_val + 100.0)
+
+    for idx, row in completed.iterrows():
+        home_odds = row.get("home_closing_moneyline")
+        away_odds = row.get("away_closing_moneyline")
+        if pd.isna(home_odds):
+            home_odds = row.get("home_moneyline")
+        if pd.isna(away_odds):
+            away_odds = row.get("away_moneyline")
+        if pd.isna(home_odds):
+            home_odds = row.get("_home_price")
+        if pd.isna(away_odds):
+            away_odds = row.get("_away_price")
+        if pd.isna(home_odds) and pd.isna(away_odds):
+            continue
+
+        model_home = float(winner_probs[idx])
+        model_home = float(np.clip(model_home, 1e-6, 1 - 1e-6))
+        model_away = 1.0 - model_home
+
+        implied_home = _american_prob(home_odds)
+        implied_away = _american_prob(away_odds)
+
+        edge_home = model_home - implied_home if not pd.isna(implied_home) else -np.inf
+        edge_away = model_away - implied_away if not pd.isna(implied_away) else -np.inf
+
+        options = [
+            ("home", model_home, home_odds, implied_home, edge_home),
+            ("away", model_away, away_odds, implied_away, edge_away),
+        ]
+        best_side, model_prob, american_odds, implied_prob, edge_value = max(
+            options, key=lambda item: item[4]
+        )
+
+        if pd.isna(american_odds) or edge_value < min_edge:
+            continue
+
+        stake_fraction = kelly_fraction(model_prob, american_odds, max_fraction)
+        if stake_fraction <= 0.0:
+            continue
+
+        stake = bankroll * stake_fraction if bankroll > 0 else stake_fraction
+        expected_val = ev_of_bet(model_prob, american_odds, stake)
+        decimal_price = american_to_decimal(american_odds)
+
+        home_score = float(row.get("home_score", np.nan))
+        away_score = float(row.get("away_score", np.nan))
+        if pd.isna(home_score) or pd.isna(away_score):
+            result = "pending"
+            profit = 0.0
+        elif home_score == away_score:
+            result = "push"
+            profit = 0.0
+            graded_count += 1
+        else:
+            home_won = home_score > away_score
+            bet_won = home_won if best_side == "home" else not home_won
+            profit = stake * (decimal_price - 1.0) if bet_won else -stake
+            result = "win" if bet_won else "loss"
+            graded_count += 1
+            if bet_won:
+                wins += 1
+
+        total_staked += stake
+        total_profit += profit
+
+        trades.append(
+            {
+                "game_id": row.get("game_id"),
+                "season": row.get("season"),
+                "week": row.get("week"),
+                "start_time": row.get("start_time"),
+                "team_side": best_side,
+                "american_odds": american_odds,
+                "implied_prob": implied_prob,
+                "model_prob": model_prob,
+                "edge": edge_value,
+                "stake": stake,
+                "stake_fraction": stake_fraction,
+                "expected_value": expected_val,
+                "result": result,
+                "profit": profit,
+                "closing_bookmaker": row.get("closing_bookmaker"),
+            }
+        )
+
+    if not trades or total_staked <= 0.0:
+        logging.warning("Paper trading produced no actionable bets in the configured window.")
+        return None
+
+    roi = total_profit / total_staked if total_staked else 0.0
+    hit_rate = (wins / graded_count) if graded_count else float("nan")
+
+    logging.info(
+        "Paper trading summary: %d bets | staked %.2f units | profit %.2f | ROI %.2f%% | hit rate %s%%",
+        len(trades),
+        total_staked,
+        total_profit,
+        roi * 100.0,
+        f"{hit_rate * 100.0:.1f}" if not math.isnan(hit_rate) else "NA",
+    )
+
+    trades_df = pd.DataFrame(trades)
+    trades_df.sort_values("start_time", inplace=True)
+
+    ledger_path = Path("paper_trades.csv")
+    combined_df = trades_df.copy()
+    if ledger_path.exists():
+        try:
+            existing = pd.read_csv(ledger_path)
+        except Exception:
+            logging.warning("Paper trading: unable to read existing ledger at %s; recreating it.", ledger_path)
+        else:
+            if not existing.empty:
+                if "start_time" in existing.columns:
+                    existing["start_time"] = pd.to_datetime(existing["start_time"], errors="coerce")
+                combined_df = safe_concat([existing, trades_df], ignore_index=True, sort=False)
+                dedupe_keys = ["game_id", "team_side"]
+                if "start_time" in combined_df.columns:
+                    dedupe_keys.append("start_time")
+                dedupe_keys = [col for col in dedupe_keys if col in combined_df.columns]
+                if dedupe_keys:
+                    combined_df = (
+                        combined_df.sort_values("start_time")
+                        .drop_duplicates(subset=dedupe_keys, keep="last")
+                    )
+
+    combined_df.to_csv(ledger_path, index=False)
+    logging.info(
+        "Saved paper trading ledger to %s (%d total rows)",
+        ledger_path.resolve(),
+        len(combined_df),
+    )
+
+    settled = combined_df[combined_df["result"].isin(["win", "loss", "push"])]
+    cumulative_roi: Optional[float] = None
+    if not settled.empty:
+        settled = settled.copy()
+        settled["stake"] = pd.to_numeric(settled.get("stake"), errors="coerce")
+        settled["profit"] = pd.to_numeric(settled.get("profit"), errors="coerce")
+        total_staked_all = settled["stake"].fillna(0.0).sum()
+        total_profit_all = settled["profit"].fillna(0.0).sum()
+        graded = settled[settled["result"].isin(["win", "loss"])]
+        graded_count = len(graded)
+        if total_staked_all > 0 and graded_count:
+            cumulative_roi = total_profit_all / total_staked_all
+            logging.info(
+                "Paper trading cumulative ROI: %.2f%% across %d graded bets",
+                cumulative_roi * 100.0,
+                graded_count,
+            )
+
+        if "start_time" in settled.columns:
+            settled["start_time"] = pd.to_datetime(settled["start_time"], errors="coerce")
+            if lookback_days > 0:
+                recent_cutoff = default_now_utc() - dt.timedelta(days=lookback_days)
+                recent = settled[settled["start_time"] >= recent_cutoff]
+            else:
+                recent = settled
+            recent = recent[recent["result"].isin(["win", "loss"])]
+            if not recent.empty:
+                recent_staked = recent["stake"].fillna(0.0).sum()
+                recent_profit = recent["profit"].fillna(0.0).sum()
+                if recent_staked > 0:
+                    recent_roi = recent_profit / recent_staked
+                    logging.info(
+                        "Paper trading %d-day ROI: %.2f%% across %d graded bets",
+                        lookback_days,
+                        recent_roi * 100.0,
+                        len(recent),
+                    )
+
+    return PaperTradeSummary(
+        ledger=combined_df,
+        window_roi=roi,
+        cumulative_roi=cumulative_roi,
+        graded_bets=graded_count,
+        closing_coverage=closing_coverage,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -12204,6 +13258,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Filter modeling and props to starters from MSF lineup.json when available",
     )
+    parser.add_argument(
+        "--paper-trade",
+        action="store_true",
+        help="Simulate recent slates with recorded sportsbook odds to validate ROI",
+    )
     return parser.parse_args()
 
 
@@ -12225,6 +13284,8 @@ def main() -> None:
     config = load_config(args.config)
     if getattr(args, "respect_lineups", None) is not None:
         config.respect_lineups = bool(args.respect_lineups)
+    if getattr(args, "paper_trade", False):
+        config.enable_paper_trading = True
     setup_logging(config.log_level)
 
     logging.info("Connecting to PostgreSQL at %s", config.pg_url)
@@ -12244,7 +13305,7 @@ def main() -> None:
     ingestor = NFLIngestor(db, msf_client, odds_client, supplemental_loader)
     ingestor.ingest(config.seasons)
 
-    trainer = ModelTrainer(engine, db)
+    trainer = ModelTrainer(engine, db, supplemental_loader)
     try:
         models = trainer.train()
     except RuntimeError as exc:
@@ -12264,6 +13325,86 @@ def main() -> None:
         if args.predict:
             logging.error("Prediction generation skipped because no models were available.")
         return
+
+    games_frame = getattr(trainer.feature_builder, "games_frame", None)
+    if games_frame is None:
+        games_frame = pd.DataFrame()
+
+    def _coverage(frame: pd.DataFrame, columns: Sequence[str]) -> float:
+        available_cols = [col for col in columns if col in frame.columns]
+        if not available_cols or frame.empty:
+            return 0.0
+        mask = frame[available_cols].notna()
+        return float(mask.all(axis=1).mean())
+
+    closing_coverage = _coverage(games_frame, ["home_closing_moneyline", "away_closing_moneyline"])
+    rest_coverage = _coverage(games_frame, ["home_rest_days", "away_rest_days"])
+    timezone_coverage = _coverage(
+        games_frame, ["home_timezone_diff_hours", "away_timezone_diff_hours"]
+    )
+
+    if (
+        closing_coverage < 0.9
+        or rest_coverage < 0.9
+        or timezone_coverage < 0.9
+    ):
+        if not config.enable_paper_trading:
+            logging.warning(
+                "Enabling paper trading because data coverage is incomplete (closing=%.1f%%, rest=%.1f%%, timezone=%.1f%%).",
+                closing_coverage * 100.0,
+                rest_coverage * 100.0,
+                timezone_coverage * 100.0,
+            )
+            config.enable_paper_trading = True
+        else:
+            logging.warning(
+                "Data coverage is incomplete (closing=%.1f%%, rest=%.1f%%, timezone=%.1f%%); remain in paper trading mode.",
+                closing_coverage * 100.0,
+                rest_coverage * 100.0,
+                timezone_coverage * 100.0,
+            )
+
+    paper_summary: Optional[PaperTradeSummary] = None
+    if config.enable_paper_trading:
+        try:
+            paper_summary = paper_trade_recent_slates(models, trainer, config)
+            if paper_summary is not None and not paper_summary.ledger.empty:
+                sample = paper_summary.ledger.tail(
+                    min(5, len(paper_summary.ledger))
+                )
+                logging.info("Most recent paper trades:\n%s", sample.to_string(index=False))
+                logging.info(
+                    "Paper trading ledger now contains %d recorded wagers.",
+                    len(paper_summary.ledger),
+                )
+        except Exception:
+            logging.exception("Paper trading simulation failed.")
+
+    if paper_summary is None or paper_summary.ledger.empty:
+        logging.warning(
+            "Paper trading results unavailable; keep the strategy in simulation until closing odds and situational data are complete."
+        )
+    else:
+        graded = paper_summary.graded_bets
+        cumulative_roi = paper_summary.cumulative_roi or 0.0
+        if (
+            paper_summary.closing_coverage < 0.9
+            or graded < 50
+            or cumulative_roi <= 0.0
+        ):
+            logging.warning(
+                "Live betting disabled: closing coverage=%.1f%%, graded bets=%d, cumulative ROI=%.2f%%. Continue paper trading until odds-aware performance sustains a positive edge.",
+                paper_summary.closing_coverage * 100.0,
+                graded,
+                cumulative_roi * 100.0,
+            )
+        else:
+            logging.info(
+                "Paper trading shows %.2f%% cumulative ROI across %d graded bets with %.1f%% odds coverage. Review manually before considering live deployment.",
+                cumulative_roi * 100.0,
+                graded,
+                paper_summary.closing_coverage * 100.0,
+            )
 
     predict_upcoming_games(
         models,
