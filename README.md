@@ -2,22 +2,20 @@
 
 ## Why to Hold Off for Now
 
-The current pipeline still leans on synthetic data to pad historical records. When the
-system cannot find player outcomes it fabricates placeholder "prior" rows with
-`is_synthetic=True` so that training splits and ROI summaries do not break. That keeps
-the scripts running but it also means backtests can be built on assumptions instead of
-real bookmaker prices or verified player results, which is a red flag for live betting.
+The player feature builder no longer fabricates synthetic "prior" rows when stat lines
+are missing. Instead, the training datasets only include verified outcomes and emit a
+warning when gaps remain. Until those historical rows are populated, the models will
+have blind spots that paper trading should surface immediately.
 
-Several situational features are also unpopulated. The team-strength feature builder
-initializes travel, rest, weather, and even average timezone adjustments to `NaN`, so
-every scoring model is trained without that context. The downstream imputer will keep
-warning about those missing columns until actual values are collected and stored.
+Situational features also require real inputs. Travel, rest, weather, and timezone
+adjustments default to `NaN` until you supply the supplemental CSV. Models trained on
+missing context will not reflect real-world edges, and the runtime coverage checks keep
+the system in simulation mode until those tables are filled.
 
-Finally, ROI backtests have started to fail whenever completed games are missing
-moneyline history. The evaluation routine now refuses to produce profitability metrics
-and instructs you to backfill historical odds first. That is exactly the state of the
-repository today—the pipeline cannot certify an edge without those prices, and neither
-should you.
+Finally, backtests now demand authentic sportsbook closing lines. If a completed game
+does not have a recorded bookmaker close, the script logs the gap, treats the matchup
+as uncovered, and refuses to enter live mode. Without that data you cannot audit
+`MAE_vs_close` or ROI, so the guardrails treat the system as paper-trade only.
 
 ## Prerequisites Before Betting Real Money
 
@@ -35,9 +33,10 @@ betting environment.
 
 When you run `python NFL_SPORTSBETTING.py`, the driver inspects the assembled games
 frame and measures how many rows have authentic closing moneylines, rest metrics, and
-timezone adjustments. If any of those coverage ratios fall below 90%, the script
-automatically forces paper-trade mode, prints the exact percentages, and refuses to
-surface a live-deployment summary. A log entry such as:
+timezone adjustments. If you try to disable paper trading while closing coverage is
+below 90%, the run aborts with an explicit error. Otherwise, the script automatically
+forces paper-trade mode, prints the exact percentages, and refuses to surface a
+live-deployment summary. A log entry such as:
 
 ```
 WARNING | root | Enabling paper trading because data coverage is incomplete (closing=3.1%, rest=0.0%, timezone=0.0%).

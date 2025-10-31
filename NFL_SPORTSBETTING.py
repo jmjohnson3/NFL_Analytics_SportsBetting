@@ -6871,8 +6871,6 @@ class FeatureBuilder:
             if not missing.any():
                 continue
 
-            working.loc[missing, closing_col] = working.loc[missing, fallback_col]
-
             fallback_probs = self._american_to_prob_series(working.loc[missing, fallback_col])
             if closing_prob_col in working.columns:
                 combined = working.loc[missing, closing_prob_col]
@@ -6884,17 +6882,22 @@ class FeatureBuilder:
             inferred_mask = inferred_mask | missing
 
         if inferred_mask.any():
-            if "closing_bookmaker" in working.columns:
-                working.loc[inferred_mask, "closing_bookmaker"] = working.loc[
-                    inferred_mask, "closing_bookmaker"
-                ].fillna("inferred_last_snapshot")
-            if "closing_line_time" in working.columns:
-                inferred_times = working.loc[inferred_mask, "closing_line_time"]
-                if "odds_updated" in working.columns:
-                    inferred_times = inferred_times.fillna(working.loc[inferred_mask, "odds_updated"])
-                if "start_time" in working.columns:
-                    inferred_times = inferred_times.fillna(working.loc[inferred_mask, "start_time"])
-                working.loc[inferred_mask, "closing_line_time"] = inferred_times
+            inferred_count = int(inferred_mask.sum())
+            logging.warning(
+                "Closing odds are missing for %d games; they will be treated as unavailable until verified closing lines are loaded.",
+                inferred_count,
+            )
+            closing_cols = [
+                "home_closing_moneyline",
+                "away_closing_moneyline",
+                "home_closing_implied_prob",
+                "away_closing_implied_prob",
+                "closing_bookmaker",
+                "closing_line_time",
+            ]
+            for col in closing_cols:
+                if col in working.columns:
+                    working.loc[inferred_mask, col] = np.nan
 
         return working
 
@@ -7549,77 +7552,14 @@ class FeatureBuilder:
                 labeled["is_synthetic"] = False
                 labeled["sample_weight"] = labeled["_usage_weight"].clip(lower=1e-4)
 
-                def _group_stats(frame: pd.DataFrame, cols: List[str]) -> Dict[Any, Dict[str, float]]:
-                    if frame.empty:
-                        return {}
-                    stats: Dict[Any, Dict[str, float]] = {}
-                    for key, group in frame.groupby(cols):
-                        weights = group["_usage_weight"].clip(lower=1e-4)
-                        values = group[target].astype(float)
-                        if weights.sum() <= 0:
-                            weights = pd.Series(1.0, index=values.index)
-                        mean_val = float(np.average(values, weights=weights))
-                        stats[key if isinstance(key, tuple) else key] = {
-                            "mean": mean_val,
-                            "weight": float(weights.sum()),
-                        }
-                    return stats
-
-                team_pos_prior = _group_stats(labeled, ["team", "position"])
-                pos_prior = _group_stats(labeled, ["position"])
-                league_weights = labeled["_usage_weight"].clip(lower=1e-4)
-                league_mean = float(np.average(labeled[target].astype(float), weights=league_weights))
-                league_weight = float(league_weights.sum())
-
-                placeholders = subset_all[subset_all[target].isna()].copy()
-                synthetic_rows: List[Dict[str, Any]] = []
-                if not placeholders.empty:
-                    for _, row in placeholders.iterrows():
-                        team_key = (row.get("team"), row.get("position"))
-                        pos_key = row.get("position")
-                        numerator = 0.0
-                        weight_sum = 0.0
-                        effective_weight = 0.0
-
-                        team_stats = team_pos_prior.get(team_key)
-                        if team_stats:
-                            w = max(team_stats["weight"], 1e-4)
-                            numerator += team_stats["mean"] * w
-                            weight_sum += w
-                            effective_weight += w
-
-                        pos_stats = pos_prior.get(pos_key)
-                        if pos_stats:
-                            w = max(pos_stats["weight"] * 0.5, 1e-4)
-                            numerator += pos_stats["mean"] * w
-                            weight_sum += w
-                            effective_weight += pos_stats["weight"]
-
-                        if league_weight > 0:
-                            league_w = max(league_weight * 0.25, 1e-4)
-                            numerator += league_mean * league_w
-                            weight_sum += league_w
-                            effective_weight += league_weight
-
-                        if weight_sum <= 0:
-                            continue
-
-                        target_estimate = numerator / weight_sum
-                        synthetic = row.to_dict()
-                        synthetic[target] = float(target_estimate)
-                        synthetic["is_synthetic"] = True
-                        influence = effective_weight / (effective_weight + 25.0)
-                        synthetic["sample_weight"] = float(np.clip(influence, 0.05, 0.4))
-                        synthetic_rows.append(synthetic)
-
-                if synthetic_rows:
-                    logging.debug(
-                        "Generated %d prior rows for %s but leaving them out of model training",
-                        len(synthetic_rows),
+                combined = labeled.drop(columns=["_usage_weight"], errors="ignore")
+                missing_count = int(subset_all[target].isna().sum())
+                if missing_count:
+                    logging.warning(
+                        "%d %s rows are missing outcomes. Populate historical stats instead of relying on synthetic priors.",
+                        missing_count,
                         target,
                     )
-
-                combined = labeled.drop(columns=["_usage_weight"], errors="ignore")
                 datasets[target] = combined
 
             ordered_targets = [
@@ -13633,6 +13573,12 @@ def main() -> None:
     timezone_coverage = _coverage(
         games_frame, ["home_timezone_diff_hours", "away_timezone_diff_hours"]
     )
+
+    if not config.enable_paper_trading and closing_coverage < 0.9:
+        raise RuntimeError(
+            "Closing odds coverage is %.1f%%. Load verified sportsbook closings before disabling paper trading."
+            % (closing_coverage * 100.0)
+        )
 
     if (
         closing_coverage < 0.9
