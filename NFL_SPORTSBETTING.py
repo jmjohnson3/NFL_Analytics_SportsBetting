@@ -13622,6 +13622,70 @@ def main() -> None:
         )
         return report_path
 
+    def _emit_closing_gap_summary(frame: pd.DataFrame) -> Optional[Path]:
+        required = {"home_closing_moneyline", "away_closing_moneyline"}
+        if frame is None or frame.empty or not required.issubset(frame.columns):
+            return None
+
+        group_columns = [col for col in ("season", "week") if col in frame.columns]
+        if not group_columns:
+            return None
+
+        working = frame.copy()
+        working["_has_closing"] = ~working[list(required)].isna().any(axis=1)
+
+        grouped = working.groupby(group_columns, dropna=False)["_has_closing"].agg(
+            total_games="count",
+            with_closing="sum",
+        )
+        summary = grouped.reset_index()
+        summary["missing_games"] = summary["total_games"] - summary["with_closing"]
+        summary["coverage_pct"] = summary["with_closing"] / summary["total_games"] * 100.0
+
+        if "week" in summary.columns:
+            def _format_week(value: Any) -> Any:
+                if pd.isna(value):
+                    return value
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    return value
+                if math.isfinite(numeric) and numeric.is_integer():
+                    return int(numeric)
+                return value
+
+            summary["week"] = summary["week"].map(_format_week)
+
+        summary.sort_values([col for col in ("coverage_pct", "season", "week") if col in summary.columns], inplace=True)
+
+        summary_path = SCRIPT_ROOT / "reports" / "closing_coverage_summary.csv"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            summary.to_csv(summary_path, index=False)
+        except Exception:
+            logging.exception("Failed to write closing odds coverage summary to %s", summary_path)
+            return None
+
+        missing = summary[summary["missing_games"] > 0]
+        if not missing.empty:
+            preview = missing.sort_values("coverage_pct").head(5)
+            for _, row in preview.iterrows():
+                season = row.get("season", "unknown")
+                week = row.get("week", "n/a")
+                missing_count = int(row["missing_games"])
+                total_games = int(row["total_games"])
+                coverage_pct = float(row["coverage_pct"])
+                logging.warning(
+                    "Closing odds coverage gap -> season=%s week=%s: %d of %d games missing closers (coverage %.1f%%).",
+                    season,
+                    week,
+                    missing_count,
+                    total_games,
+                    coverage_pct,
+                )
+
+        return summary_path
+
     closing_coverage = _coverage(games_frame, ["home_closing_moneyline", "away_closing_moneyline"])
     rest_coverage = _coverage(games_frame, ["home_rest_days", "away_rest_days"])
     timezone_coverage = _coverage(
@@ -13629,8 +13693,26 @@ def main() -> None:
     )
 
     closing_gap_report: Optional[Path] = None
+    closing_gap_summary: Optional[Path] = None
+    closing_gap_report_logged = False
+    closing_gap_summary_logged = False
     if closing_coverage < 1.0:
         closing_gap_report = _emit_closing_gap_report(games_frame)
+        closing_gap_summary = _emit_closing_gap_summary(games_frame)
+
+    def _log_gap_location() -> None:
+        nonlocal closing_gap_report_logged
+        if closing_gap_report is not None and not closing_gap_report_logged:
+            logging.warning("Missing closing odds are detailed in %s", closing_gap_report)
+            closing_gap_report_logged = True
+
+    def _log_summary_location() -> None:
+        nonlocal closing_gap_summary_logged
+        if closing_gap_summary is not None and not closing_gap_summary_logged:
+            logging.warning(
+                "Closing odds coverage by season/week written to %s", closing_gap_summary
+            )
+            closing_gap_summary_logged = True
 
     if not config.enable_paper_trading and closing_coverage < 0.9:
         logging.warning(
@@ -13638,8 +13720,8 @@ def main() -> None:
             closing_coverage * 100.0,
         )
         config.enable_paper_trading = True
-        if closing_gap_report is not None:
-            logging.warning("Missing closing odds are detailed in %s", closing_gap_report)
+        _log_gap_location()
+        _log_summary_location()
 
     if (
         closing_coverage < 0.9
@@ -13654,8 +13736,9 @@ def main() -> None:
                 timezone_coverage * 100.0,
             )
             config.enable_paper_trading = True
-            if closing_gap_report is not None and closing_coverage < 0.9:
-                logging.warning("Missing closing odds are detailed in %s", closing_gap_report)
+            if closing_coverage < 0.9:
+                _log_gap_location()
+                _log_summary_location()
         else:
             logging.warning(
                 "Data coverage is incomplete (closing=%.1f%%, rest=%.1f%%, timezone=%.1f%%); remain in paper trading mode.",
@@ -13663,8 +13746,9 @@ def main() -> None:
                 rest_coverage * 100.0,
                 timezone_coverage * 100.0,
             )
-            if closing_gap_report is not None and closing_coverage < 0.9:
-                logging.warning("Missing closing odds are detailed in %s", closing_gap_report)
+            if closing_coverage < 0.9:
+                _log_gap_location()
+                _log_summary_location()
 
     paper_summary: Optional[PaperTradeSummary] = None
     if config.enable_paper_trading:

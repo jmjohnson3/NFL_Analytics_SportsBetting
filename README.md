@@ -49,7 +49,11 @@ not ready for real-money wagering. Each run now also emits `reports/missing_clos
 whenever the coverage check finds unmatched games. The file lists the season, week,
 teams, kickoff, and whatever odds data already exist for quick reconciliation. Fill in
 the bookmaker closing lines there (or import them into your database) and rerun the
-pipeline until the closing coverage passes 90%.
+pipeline until the closing coverage passes 90%. When large portions of history are
+uncovered, the driver also writes `reports/closing_coverage_summary.csv`, which
+aggregates coverage by season/week so you can target the exact windows that still need
+verified closes or adjust the configuration to a span where authentic pricing is
+available.
 
 ## New data hooks
 
