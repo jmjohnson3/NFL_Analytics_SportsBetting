@@ -45,7 +45,11 @@ WARNING | root | Paper trading results unavailable; keep the strategy in simulat
 
 means the supplemental CSVs are still mostly empty. Until those warnings disappear and
 the historical paper-trading ledger shows a sustained, odds-aware edge, the project is
-not ready for real-money wagering.
+not ready for real-money wagering. Each run now also emits `reports/missing_closing_odds.csv`
+whenever the coverage check finds unmatched games. The file lists the season, week,
+teams, kickoff, and whatever odds data already exist for quick reconciliation. Fill in
+the bookmaker closing lines there (or import them into your database) and rerun the
+pipeline until the closing coverage passes 90%.
 
 ## New data hooks
 
@@ -63,3 +67,30 @@ and auditable:
 
 Both files ship with example rows to illustrate the required schema. Replace the
 samples with real, validated records before relying on any model output.
+
+### If you cannot locate closing odds for certain games
+
+The guardrails are intentionally strict: any matchup without a verified
+bookmaker close keeps the entire run in paper-trade mode. When the coverage
+report lists games you cannot immediately source, use one of the following
+approaches:
+
+1. **Track down an alternative feed.** Many historical odds vendors (e.g.,
+   SportsOddsHistory, KillerSports, licensed sportsbook data products) archive
+   closing prices. Import those values into `data/closing_odds_history.csv` (or
+   your database) so the evaluation metrics stay grounded in real markets.
+2. **Manually enter vetted closes.** If you have access to trusted screenshots
+   or settlement reports, convert those into the CSV format and mark the
+   `bookmaker` and `close_timestamp` columns accordingly. Leave rows blank rather
+   than guessing; a missing value is safer than an invented one.
+3. **Narrow the training window.** When certain seasons lack dependable pricing,
+   adjust your configuration so backtests only span the period where authentic
+   closes exist. The coverage check will pass once at least 90% of the games in
+   scope contain real closing odds.
+4. **Stay in simulation.** If genuine closing numbers cannot be obtained for the
+   relevant window, do not disable the paper-trade requirement. The models would
+   be benchmarking against assumptions instead of the odds you actually face.
+
+The key principle is that you should never fabricate or forward-fill closing
+prices. Either find the real numbers or exclude the affected games from any
+evaluation you intend to trust for live betting decisions.

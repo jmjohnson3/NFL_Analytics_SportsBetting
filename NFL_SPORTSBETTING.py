@@ -13568,11 +13568,69 @@ def main() -> None:
         mask = frame[available_cols].notna()
         return float(mask.all(axis=1).mean())
 
+    def _emit_closing_gap_report(frame: pd.DataFrame) -> Optional[Path]:
+        required = {"home_closing_moneyline", "away_closing_moneyline"}
+        if frame is None or frame.empty or not required.issubset(frame.columns):
+            return None
+        missing_mask = frame[list(required)].isna().any(axis=1)
+        report_rows = frame.loc[missing_mask]
+        report_path = SCRIPT_ROOT / "reports" / "missing_closing_odds.csv"
+        if report_rows.empty:
+            if report_path.exists():
+                try:
+                    report_path.unlink()
+                except OSError:
+                    logging.debug("Unable to remove stale closing odds gap report at %s", report_path)
+            return None
+
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        candidate_columns = [
+            "season",
+            "week",
+            "game_id",
+            "game_start",
+            "home_team",
+            "away_team",
+            "home_moneyline",
+            "away_moneyline",
+            "home_closing_moneyline",
+            "away_closing_moneyline",
+            "home_closing_implied_prob",
+            "away_closing_implied_prob",
+            "closing_bookmaker",
+            "closing_line_time",
+        ]
+        available_columns = [col for col in candidate_columns if col in report_rows.columns]
+        report = report_rows[available_columns].copy()
+        if "game_start" in report.columns:
+            report["game_start"] = pd.to_datetime(report["game_start"], errors="coerce", utc=True)
+            report["game_start"] = report["game_start"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        report.sort_values([col for col in ("season", "week", "game_start", "game_id") if col in report.columns], inplace=True)
+        try:
+            report.to_csv(report_path, index=False)
+        except Exception:
+            logging.exception("Failed to write closing odds gap report to %s", report_path)
+            return None
+
+        logging.warning(
+            "Closing odds gap report generated with %d games missing verified closers: %s",
+            len(report),
+            report_path,
+        )
+        logging.warning(
+            "Populate sportsbook closing prices for these games and rerun ingestion to qualify for live trading."
+        )
+        return report_path
+
     closing_coverage = _coverage(games_frame, ["home_closing_moneyline", "away_closing_moneyline"])
     rest_coverage = _coverage(games_frame, ["home_rest_days", "away_rest_days"])
     timezone_coverage = _coverage(
         games_frame, ["home_timezone_diff_hours", "away_timezone_diff_hours"]
     )
+
+    closing_gap_report: Optional[Path] = None
+    if closing_coverage < 1.0:
+        closing_gap_report = _emit_closing_gap_report(games_frame)
 
     if not config.enable_paper_trading and closing_coverage < 0.9:
         logging.warning(
@@ -13580,6 +13638,8 @@ def main() -> None:
             closing_coverage * 100.0,
         )
         config.enable_paper_trading = True
+        if closing_gap_report is not None:
+            logging.warning("Missing closing odds are detailed in %s", closing_gap_report)
 
     if (
         closing_coverage < 0.9
@@ -13594,6 +13654,8 @@ def main() -> None:
                 timezone_coverage * 100.0,
             )
             config.enable_paper_trading = True
+            if closing_gap_report is not None and closing_coverage < 0.9:
+                logging.warning("Missing closing odds are detailed in %s", closing_gap_report)
         else:
             logging.warning(
                 "Data coverage is incomplete (closing=%.1f%%, rest=%.1f%%, timezone=%.1f%%); remain in paper trading mode.",
@@ -13601,6 +13663,8 @@ def main() -> None:
                 rest_coverage * 100.0,
                 timezone_coverage * 100.0,
             )
+            if closing_gap_report is not None and closing_coverage < 0.9:
+                logging.warning("Missing closing odds are detailed in %s", closing_gap_report)
 
     paper_summary: Optional[PaperTradeSummary] = None
     if config.enable_paper_trading:
