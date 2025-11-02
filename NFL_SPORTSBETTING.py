@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import dataclasses
 import datetime as dt
+import io
 import json
 import logging
 import math
@@ -41,6 +42,7 @@ import aiohttp
 import numpy as np
 import pandas as pd
 import requests
+import zipfile
 from aiohttp import client_exceptions
 import certifi
 from requests import HTTPError
@@ -141,6 +143,685 @@ def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
         # Avoid returning a view into the input DataFrame which could be mutated upstream
         return cleaned[0].copy()
     return pd.concat(cleaned, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Closing odds archive downloaders
+# ---------------------------------------------------------------------------
+
+
+MONEYLINE_PATTERN = re.compile(r"[-+]?\d+")
+
+SEASON_COLUMN_CANDIDATES = ["season", "yr", "year"]
+WEEK_COLUMN_CANDIDATES = ["week", "wk", "weeknum", "week_no", "game_week"]
+HOME_TEAM_COLUMN_CANDIDATES = [
+    "home",
+    "home_team",
+    "home_team_name",
+    "home_team_abbr",
+    "home_club",
+    "home_name",
+    "team_home",
+    "home side",
+    "homeclub",
+]
+AWAY_TEAM_COLUMN_CANDIDATES = [
+    "away",
+    "away_team",
+    "away_team_name",
+    "away_team_abbr",
+    "visitor",
+    "visitor_team",
+    "road",
+    "opp",
+    "opponent",
+    "team_away",
+    "vis",
+]
+TEAM_COLUMN_CANDIDATES = ["team", "team_name", "club", "squad"]
+OPPONENT_COLUMN_CANDIDATES = ["opponent", "opp", "opp_name", "opponent_name"]
+SITE_COLUMN_CANDIDATES = ["site", "homeaway", "home_away", "ha", "venue_type"]
+DATE_COLUMN_CANDIDATES = ["date", "game_date", "start_date", "schedule_date"]
+TIME_COLUMN_CANDIDATES = ["time", "start_time", "game_time", "kickoff", "kickoff_time"]
+HOME_MONEYLINE_COLUMN_CANDIDATES = [
+    "home_ml",
+    "home_moneyline",
+    "home_money_line",
+    "moneyline_home",
+    "ml_home",
+    "home_close_ml",
+    "home_close_moneyline",
+    "home_closing_ml",
+    "home_close",
+]
+AWAY_MONEYLINE_COLUMN_CANDIDATES = [
+    "away_ml",
+    "away_moneyline",
+    "away_money_line",
+    "moneyline_away",
+    "ml_away",
+    "road_ml",
+    "road_moneyline",
+    "visitor_ml",
+    "visitor_moneyline",
+    "vis_ml",
+    "away_close_ml",
+    "away_close_moneyline",
+]
+TEAM_MONEYLINE_COLUMN_CANDIDATES = [
+    "ml",
+    "moneyline",
+    "close_ml",
+    "team_ml",
+    "team_moneyline",
+]
+BOOKMAKER_COLUMN_CANDIDATES = ["book", "sportsbook", "bookmaker", "source", "sportsbook_name"]
+
+
+def _canonicalize_column_name(label: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(label or "").strip().lower())
+
+
+def _match_column(columns: Dict[str, str], candidates: Sequence[str]) -> Optional[str]:
+    for candidate in candidates:
+        if candidate in columns:
+            return columns[candidate]
+    for candidate in candidates:
+        for key, original in columns.items():
+            if candidate in key:
+                return original
+    return None
+
+
+def _parse_moneyline_series(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype=float)
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    text = series.astype(str).str.strip().str.replace(",", "", regex=False)
+    text = text.replace({"nan": np.nan, "": np.nan, "None": np.nan})
+    extracted = text.str.extract(MONEYLINE_PATTERN)
+    numeric = pd.to_numeric(extracted[0], errors="coerce")
+    return numeric
+
+
+def _combine_date_time(
+    date_series: Optional[pd.Series], time_series: Optional[pd.Series]
+) -> pd.Series:
+    if date_series is None:
+        return pd.Series(dtype="datetime64[ns, UTC]")
+    date_values = pd.to_datetime(date_series, errors="coerce")
+    if time_series is not None:
+        combined = (
+            date_series.astype(str).str.strip()
+            + " "
+            + time_series.astype(str).str.strip()
+        )
+        combined_dt = pd.to_datetime(combined, errors="coerce")
+        if hasattr(combined_dt, "combine_first"):
+            date_values = combined_dt.combine_first(date_values)
+    try:
+        if hasattr(date_values.dt, "tz") and date_values.dt.tz is None:
+            date_values = date_values.dt.tz_localize("UTC")
+    except (TypeError, AttributeError, ValueError):
+        try:
+            date_values = date_values.dt.tz_localize(
+                "UTC", nonexistent="NaT", ambiguous="NaT"
+            )
+        except Exception:
+            date_values = date_values.dt.tz_localize(None)
+    return date_values
+
+
+def _safe_week_value(value: Any) -> Optional[int]:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _compose_game_key(
+    season_value: Any,
+    week_value: Any,
+    kickoff: Optional[pd.Timestamp],
+    home_team: Optional[str],
+    away_team: Optional[str],
+) -> Tuple[str, Optional[int], str, str]:
+    season_str = str(season_value) if season_value not in (None, "") else ""
+    week_int = _safe_week_value(week_value)
+    if isinstance(kickoff, pd.Timestamp) and not pd.isna(kickoff):
+        kickoff_token = kickoff.tz_convert("UTC").strftime("%Y-%m-%d") if kickoff.tzinfo else kickoff.strftime("%Y-%m-%d")
+    else:
+        kickoff_token = ""
+    teams_sorted = sorted(filter(None, [home_team, away_team]))
+    team_token = "|".join(teams_sorted)
+    return season_str, week_int, kickoff_token, team_token
+
+
+def _normalize_historical_closing_frame(
+    frame: pd.DataFrame,
+    provider_name: str,
+    season_hint: Optional[str] = None,
+) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    columns = {
+        _canonicalize_column_name(col): col for col in frame.columns
+    }
+
+    season_col = _match_column(columns, SEASON_COLUMN_CANDIDATES)
+    week_col = _match_column(columns, WEEK_COLUMN_CANDIDATES)
+    home_col = _match_column(columns, HOME_TEAM_COLUMN_CANDIDATES)
+    away_col = _match_column(columns, AWAY_TEAM_COLUMN_CANDIDATES)
+    book_col = _match_column(columns, BOOKMAKER_COLUMN_CANDIDATES)
+    date_col = _match_column(columns, DATE_COLUMN_CANDIDATES)
+    time_col = _match_column(columns, TIME_COLUMN_CANDIDATES)
+
+    if not home_col or not away_col:
+        team_col = _match_column(columns, TEAM_COLUMN_CANDIDATES)
+        opp_col = _match_column(columns, OPPONENT_COLUMN_CANDIDATES)
+        site_col = _match_column(columns, SITE_COLUMN_CANDIDATES)
+        ml_col = _match_column(columns, TEAM_MONEYLINE_COLUMN_CANDIDATES)
+        if not all([team_col, opp_col, site_col, ml_col]):
+            logging.warning(
+                "%s dataset is missing explicit home/away columns and cannot be reshaped",
+                provider_name,
+            )
+            return pd.DataFrame()
+
+        working = frame.copy()
+        working["_team"] = working[team_col].apply(normalize_team_abbr)
+        working["_opp"] = working[opp_col].apply(normalize_team_abbr)
+        working["_site"] = working[site_col].astype(str).str.strip().str.upper()
+        working["_is_home"] = working["_site"].str.startswith("H")
+        working["_is_away"] = working["_site"].str.startswith("A")
+        if not working["_is_home"].any() or not working["_is_away"].any():
+            logging.warning(
+                "%s dataset did not contain both home and away rows after site parsing",
+                provider_name,
+            )
+            return pd.DataFrame()
+
+        if season_col:
+            working["_season"] = working[season_col]
+        else:
+            working["_season"] = season_hint
+        if week_col:
+            working["_week"] = pd.to_numeric(working[week_col], errors="coerce")
+        else:
+            working["_week"] = np.nan
+
+        kickoff_series = _combine_date_time(
+            working[date_col] if date_col else None,
+            working[time_col] if time_col else None,
+        )
+        working["_kickoff"] = kickoff_series
+        working["_ml"] = _parse_moneyline_series(working[ml_col])
+
+        home_rows = working[working["_is_home"]].copy()
+        away_rows = working[working["_is_away"]].copy()
+        if home_rows.empty or away_rows.empty:
+            logging.warning(
+                "%s dataset did not provide complementary home/away rows after filtering",
+                provider_name,
+            )
+            return pd.DataFrame()
+
+        home_rows["_key"] = home_rows.apply(
+            lambda row: _compose_game_key(
+                row["_season"],
+                row["_week"],
+                row.get("_kickoff"),
+                row.get("_team"),
+                row.get("_opp"),
+            ),
+            axis=1,
+        )
+        away_rows["_key"] = away_rows.apply(
+            lambda row: _compose_game_key(
+                row["_season"],
+                row["_week"],
+                row.get("_kickoff"),
+                row.get("_opp"),
+                row.get("_team"),
+            ),
+            axis=1,
+        )
+
+        away_subset = away_rows[["_key", "_team", "_ml"]].rename(
+            columns={"_team": "_away_team", "_ml": "_away_ml"}
+        )
+        merged = home_rows.merge(away_subset, on="_key", how="inner")
+        if merged.empty:
+            logging.warning(
+                "%s dataset failed to merge complementary home/away rows",
+                provider_name,
+            )
+            return pd.DataFrame()
+
+        merged["home_team"] = merged["_team"]
+        merged["away_team"] = merged["_away_team"].combine_first(merged["_opp"])
+        merged["home_closing_moneyline"] = merged["_ml"]
+        merged["away_closing_moneyline"] = merged["_away_ml"]
+        merged["season"] = (
+            merged["_season"].fillna(season_hint).astype(str)
+            if season_col
+            else str(season_hint) if season_hint else merged["_season"].astype(str)
+        )
+        merged["week"] = merged["_week"]
+        merged["closing_line_time"] = merged["_kickoff"]
+        if book_col:
+            merged["closing_bookmaker"] = merged[book_col].astype(str).fillna("")
+        else:
+            merged["closing_bookmaker"] = provider_name
+
+        result = merged[
+            [
+                "season",
+                "week",
+                "home_team",
+                "away_team",
+                "home_closing_moneyline",
+                "away_closing_moneyline",
+                "closing_line_time",
+                "closing_bookmaker",
+            ]
+        ].copy()
+        return result
+
+    home_ml_col = _match_column(columns, HOME_MONEYLINE_COLUMN_CANDIDATES)
+    away_ml_col = _match_column(columns, AWAY_MONEYLINE_COLUMN_CANDIDATES)
+    if not home_ml_col or not away_ml_col:
+        logging.warning(
+            "%s dataset is missing moneyline columns and cannot be imported",
+            provider_name,
+        )
+        return pd.DataFrame()
+
+    season_series = (
+        frame[season_col].fillna(season_hint) if season_col else season_hint
+    )
+    week_series = (
+        pd.to_numeric(frame[week_col], errors="coerce") if week_col else np.nan
+    )
+    kickoff_series = _combine_date_time(
+        frame[date_col] if date_col else None,
+        frame[time_col] if time_col else None,
+    )
+
+    result = pd.DataFrame()
+    result["season"] = (
+        season_series.astype(str)
+        if isinstance(season_series, pd.Series)
+        else str(season_series) if season_series else str(season_hint or "")
+    )
+    result["week"] = week_series
+    result["home_team"] = frame[home_col].apply(normalize_team_abbr)
+    result["away_team"] = frame[away_col].apply(normalize_team_abbr)
+    result["home_closing_moneyline"] = _parse_moneyline_series(frame[home_ml_col])
+    result["away_closing_moneyline"] = _parse_moneyline_series(frame[away_ml_col])
+    if book_col:
+        result["closing_bookmaker"] = frame[book_col].astype(str).fillna("")
+    else:
+        result["closing_bookmaker"] = provider_name
+    result["closing_line_time"] = kickoff_series
+
+    return result
+
+
+class SportsOddsHistoryFetcher:
+    def __init__(
+        self,
+        session: requests.Session,
+        *,
+        base_url: str = "https://sportsoddshistory.com/download/nfl-game-odds",
+        timeout: int = 45,
+        user_agent: str = "nfl-analytics-sportsoddshistory/1.0",
+        download_dir: Optional[Path] = None,
+    ) -> None:
+        self.session = session
+        self.base_url = base_url
+        self.timeout = timeout
+        self.headers = {"User-Agent": user_agent}
+        self.download_dir = download_dir
+
+    def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
+        frames: List[pd.DataFrame] = []
+        for season in seasons:
+            frame = self._fetch_season(str(season))
+            if not _is_effectively_empty_df(frame):
+                frames.append(frame)
+        return safe_concat(frames, ignore_index=True)
+
+    def _fetch_season(self, season: str) -> pd.DataFrame:
+        params = {"season": season, "download": "1"}
+        try:
+            response = self.session.get(
+                self.base_url,
+                params=params,
+                headers=self.headers,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+        except HTTPError as exc:
+            logging.warning(
+                "SportsOddsHistory request failed for season %s: %s",
+                season,
+                exc,
+            )
+            return pd.DataFrame()
+        except Exception:
+            logging.exception(
+                "SportsOddsHistory request encountered an error for season %s",
+                season,
+            )
+            return pd.DataFrame()
+
+        if self.download_dir is not None:
+            try:
+                self.download_dir.mkdir(parents=True, exist_ok=True)
+                target = self.download_dir / f"sportsoddshistory_{season}.csv"
+                target.write_bytes(response.content)
+            except Exception:
+                logging.debug(
+                    "Unable to persist SportsOddsHistory raw payload for season %s",
+                    season,
+                )
+
+        payload = self._parse_payload(response.content)
+        if _is_effectively_empty_df(payload):
+            logging.warning(
+                "SportsOddsHistory returned no rows for season %s", season
+            )
+            return pd.DataFrame()
+
+        normalized = _normalize_historical_closing_frame(payload, "SportsOddsHistory", season)
+        if normalized.empty:
+            logging.warning(
+                "SportsOddsHistory data for season %s could not be normalized", season
+            )
+        return normalized
+
+    def _parse_payload(self, content: bytes) -> pd.DataFrame:
+        buffers = [io.BytesIO(content)]
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                for name in archive.namelist():
+                    if name.lower().endswith(".csv"):
+                        with archive.open(name) as handle:
+                            return pd.read_csv(handle)
+        except zipfile.BadZipFile:
+            pass
+        except Exception:
+            logging.debug("SportsOddsHistory payload not a ZIP archive")
+
+        for buffer in buffers:
+            buffer.seek(0)
+            try:
+                df = pd.read_csv(buffer)
+                if not df.empty:
+                    return df
+            except Exception:
+                continue
+
+        try:
+            tables = pd.read_html(io.BytesIO(content))
+            for table in tables:
+                if not table.empty:
+                    return table
+        except Exception:
+            logging.debug("SportsOddsHistory payload not parseable via read_html")
+        return pd.DataFrame()
+
+
+class KillerSportsFetcher:
+    def __init__(
+        self,
+        session: requests.Session,
+        *,
+        base_url: Optional[str] = None,
+        timeout: int = 45,
+        api_key: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> None:
+        self.session = session
+        self.base_url = base_url
+        self.timeout = timeout
+        self.api_key = api_key
+        self.auth = HTTPBasicAuth(username, password) if username and password else None
+
+    def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
+        if not self.base_url:
+            logging.warning(
+                "KillerSports provider configured but no base URL supplied; skipping download"
+            )
+            return pd.DataFrame()
+
+        frames: List[pd.DataFrame] = []
+        for season in seasons:
+            frame = self._fetch_season(str(season))
+            if not _is_effectively_empty_df(frame):
+                frames.append(frame)
+        return safe_concat(frames, ignore_index=True)
+
+    def _fetch_season(self, season: str) -> pd.DataFrame:
+        params = {"season": season, "format": "csv"}
+        headers: Dict[str, str] = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            response = self.session.get(
+                self.base_url,
+                params=params,
+                headers=headers,
+                timeout=self.timeout,
+                auth=self.auth,
+            )
+            response.raise_for_status()
+        except HTTPError as exc:
+            logging.warning("KillerSports request failed for season %s: %s", season, exc)
+            return pd.DataFrame()
+        except Exception:
+            logging.exception(
+                "KillerSports request encountered an error for season %s", season
+            )
+            return pd.DataFrame()
+
+        try:
+            payload = pd.read_csv(io.BytesIO(response.content))
+        except Exception:
+            try:
+                payload = pd.read_html(io.BytesIO(response.content))[0]
+            except Exception:
+                logging.warning(
+                    "KillerSports response for season %s was not a readable CSV/HTML table",
+                    season,
+                )
+                return pd.DataFrame()
+
+        normalized = _normalize_historical_closing_frame(payload, "KillerSports", season)
+        if normalized.empty:
+            logging.warning(
+                "KillerSports data for season %s could not be normalized", season
+            )
+        return normalized
+
+
+class ClosingOddsArchiveSyncer:
+    def __init__(self, config: "NFLConfig", db: "NFLDatabase") -> None:
+        self.config = config
+        self.db = db
+        self.session = requests.Session()
+
+    def sync(self) -> None:
+        provider = (self.config.closing_odds_provider or "").strip().lower()
+        if not provider:
+            logging.debug("No closing odds provider configured; skipping archive sync")
+            return
+
+        try:
+            seasons = [str(season) for season in self.config.seasons]
+            download_dir = (
+                Path(self.config.closing_odds_download_dir)
+                if self.config.closing_odds_download_dir
+                else None
+            )
+
+            if provider in {"sportsoddshistory", "sports-odds-history", "soh"}:
+                fetcher = SportsOddsHistoryFetcher(
+                    self.session,
+                    base_url=self.config.sportsoddshistory_base_url,
+                    timeout=self.config.closing_odds_timeout,
+                    user_agent=self.config.sportsoddshistory_user_agent,
+                    download_dir=download_dir,
+                )
+                provider_name = "SportsOddsHistory"
+            elif provider in {"killersports", "ks"}:
+                fetcher = KillerSportsFetcher(
+                    self.session,
+                    base_url=self.config.killersports_base_url,
+                    timeout=self.config.closing_odds_timeout,
+                    api_key=self.config.killersports_api_key,
+                    username=self.config.killersports_username,
+                    password=self.config.killersports_password,
+                )
+                provider_name = "KillerSports"
+            else:
+                logging.warning("Unknown closing odds provider '%s'", provider)
+                return
+
+            archive = fetcher.fetch(seasons)
+            if archive.empty:
+                logging.warning(
+                    "%s did not return any closing odds for seasons %s",
+                    provider_name,
+                    ", ".join(seasons),
+                )
+                return
+
+            archive = self._attach_game_ids(archive)
+            archive = self._finalize_probabilities(archive)
+            self._write_history(provider_name, archive)
+        finally:
+            self.session.close()
+
+    def _attach_game_ids(self, archive: pd.DataFrame) -> pd.DataFrame:
+        try:
+            games = pd.read_sql_table("nfl_games", self.db.engine)
+        except Exception:
+            logging.debug("Unable to load nfl_games while attaching closing odds game IDs")
+            return archive
+
+        if games.empty:
+            return archive
+
+        games["season"] = games["season"].astype(str)
+        games["week"] = pd.to_numeric(games["week"], errors="coerce")
+        for team_col in ("home_team", "away_team"):
+            if team_col in games.columns:
+                games[team_col] = games[team_col].apply(normalize_team_abbr)
+
+        merge_cols = [col for col in ("season", "week", "home_team", "away_team") if col in archive.columns]
+        if len(merge_cols) < 4:
+            return archive
+
+        archive = archive.copy()
+        archive["season"] = archive["season"].astype(str)
+        archive["week"] = pd.to_numeric(archive["week"], errors="coerce")
+        for team_col in ("home_team", "away_team"):
+            archive[team_col] = archive[team_col].apply(normalize_team_abbr)
+
+        joined = archive.merge(
+            games[["game_id", "start_time", "season", "week", "home_team", "away_team"]],
+            on=merge_cols,
+            how="left",
+        )
+        if "start_time" in joined.columns:
+            joined.rename(columns={"start_time": "game_start"}, inplace=True)
+        return joined
+
+    @staticmethod
+    def _finalize_probabilities(frame: pd.DataFrame) -> pd.DataFrame:
+        result = frame.copy()
+        for side in ("home", "away"):
+            col = f"{side}_closing_moneyline"
+            if col in result.columns:
+                result[col] = pd.to_numeric(result[col], errors="coerce")
+                prob_col = f"{side}_closing_implied_prob"
+                result[prob_col] = result[col].apply(
+                    lambda val: odds_american_to_prob(float(val))
+                    if pd.notna(val)
+                    else np.nan
+                )
+        if "closing_line_time" in result.columns:
+            result["closing_line_time"] = pd.to_datetime(
+                result["closing_line_time"], errors="coerce", utc=True
+            )
+        if "closing_bookmaker" in result.columns:
+            result["closing_bookmaker"] = result["closing_bookmaker"].fillna("")
+        return result
+
+    def _write_history(self, provider_name: str, archive: pd.DataFrame) -> None:
+        dest_path = self._history_path()
+        try:
+            existing = pd.read_csv(dest_path)
+        except FileNotFoundError:
+            existing = pd.DataFrame()
+        except Exception:
+            logging.warning("Unable to read existing closing odds history at %s", dest_path)
+            existing = pd.DataFrame()
+
+        combined = safe_concat([existing, archive], ignore_index=True)
+        if combined.empty:
+            logging.warning("No closing odds data available to write after combining frames")
+            return
+
+        for team_col in ("home_team", "away_team"):
+            if team_col in combined.columns:
+                combined[team_col] = combined[team_col].apply(normalize_team_abbr)
+        if "closing_line_time" in combined.columns:
+            combined["closing_line_time"] = pd.to_datetime(
+                combined["closing_line_time"], errors="coerce", utc=True
+            )
+            combined["closing_line_time"] = combined["closing_line_time"].dt.strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            combined["closing_line_time"] = combined["closing_line_time"].replace(
+                "NaT", ""
+            )
+
+        key_columns = [
+            col
+            for col in ["game_id", "season", "week", "home_team", "away_team"]
+            if col in combined.columns
+        ]
+        if key_columns:
+            combined = combined.drop_duplicates(subset=key_columns, keep="last")
+
+        combined = combined.sort_values(
+            [col for col in ("season", "week", "home_team", "away_team") if col in combined.columns]
+        )
+
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        combined.to_csv(dest_path, index=False)
+        logging.info(
+            "Wrote %d rows of closing odds to %s using provider %s",
+            len(combined),
+            dest_path,
+            provider_name,
+        )
+
+    def _history_path(self) -> Path:
+        if self.config.closing_odds_history_path:
+            return Path(self.config.closing_odds_history_path)
+        default_path = SCRIPT_ROOT / "data" / "closing_odds_history.csv"
+        default_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.closing_odds_history_path = str(default_path)
+        return default_path
 
 
 def compute_rmse(y_true: Union[pd.Series, np.ndarray], y_pred: Union[pd.Series, np.ndarray]) -> float:
@@ -3731,6 +4412,21 @@ class NFLConfig:
     paper_trade_edge_threshold: float = 0.02
     paper_trade_bankroll: float = 1_000.0
     paper_trade_max_fraction: float = 0.05
+    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER")
+    closing_odds_timeout: int = int(os.getenv("NFL_CLOSING_ODDS_TIMEOUT", "45"))
+    closing_odds_download_dir: Optional[str] = os.getenv("NFL_CLOSING_ODDS_DOWNLOAD_DIR")
+    sportsoddshistory_base_url: str = os.getenv(
+        "SPORTSODDSHISTORY_BASE_URL",
+        "https://sportsoddshistory.com/download/nfl-game-odds",
+    )
+    sportsoddshistory_user_agent: str = os.getenv(
+        "SPORTSODDSHISTORY_USER_AGENT",
+        "nfl-analytics-closing-odds/1.0",
+    )
+    killersports_base_url: Optional[str] = os.getenv("KILLERSPORTS_BASE_URL")
+    killersports_api_key: Optional[str] = os.getenv("KILLERSPORTS_API_KEY")
+    killersports_username: Optional[str] = os.getenv("KILLERSPORTS_USERNAME")
+    killersports_password: Optional[str] = os.getenv("KILLERSPORTS_PASSWORD")
 
     @property
     def pg_url(self) -> str:
@@ -13522,6 +14218,12 @@ def main() -> None:
     logging.info("Connecting to PostgreSQL at %s", config.pg_url)
     engine = create_engine(config.pg_url, future=True)
     db = NFLDatabase(engine)
+
+    try:
+        syncer = ClosingOddsArchiveSyncer(config, db)
+        syncer.sync()
+    except Exception:
+        logging.exception("Automated closing odds synchronization failed")
 
     msf_client = MySportsFeedsClient(NFL_API_USER, NFL_API_PASS)
     odds_client = OddsApiClient(

@@ -98,6 +98,68 @@ approaches:
    relevant window, do not disable the paper-trade requirement. The models would
    be benchmarking against assumptions instead of the odds you actually face.
 
+### What if the coverage never reaches 90%?
+
+When closing odds remain missing after you exhaust the steps above, the runtime
+guardrails simply keep you in paper-trade mode:
+
+- The driver continues to emit warnings that list the exact seasons and weeks
+  where closes are absent.
+- `reports/missing_closing_odds.csv` and `reports/closing_coverage_summary.csv`
+  are regenerated on every run so you can revisit the gaps later.
+- No live-deployment summary is produced, and any attempt to override paper
+  trading is blocked while coverage stays below the 90% threshold.
+
+In other words, the application assumes the data are incomplete and refuses to
+endorse live staking. Continue operating in simulation until you can supply
+authentic bookmaker closes or shrink the evaluation window to a span where the
+market data are trustworthy.
+
 The key principle is that you should never fabricate or forward-fill closing
 prices. Either find the real numbers or exclude the affected games from any
 evaluation you intend to trust for live betting decisions.
+
+### Automating the closing-odds backfill
+
+To simplify the backfill, the driver script can now download and normalize
+archived moneylines directly from supported vendors before every run. Configure
+the provider via environment variables or a `.env` file before launching the
+pipeline:
+
+| Setting | Purpose |
+| --- | --- |
+| `NFL_CLOSING_ODDS_PROVIDER` | Required. Set to `sportsoddshistory` or `killersports` to pick the downloader. |
+| `NFL_CLOSING_ODDS_TIMEOUT` | Optional HTTP timeout (seconds). Defaults to `45`. |
+| `NFL_CLOSING_ODDS_DOWNLOAD_DIR` | Optional folder where raw payloads are cached for auditing. |
+| `SPORTSODDSHISTORY_BASE_URL` | Override the default SportsOddsHistory endpoint if needed. |
+| `SPORTSODDSHISTORY_USER_AGENT` | Custom User-Agent string when hitting SportsOddsHistory. |
+| `KILLERSPORTS_BASE_URL` | Base URL for KillerSports exports (required when that provider is selected). |
+| `KILLERSPORTS_API_KEY` | Bearer token for KillerSports, when their API requires it. |
+| `KILLERSPORTS_USERNAME` / `KILLERSPORTS_PASSWORD` | HTTP basic credentials for KillerSports, if applicable. |
+
+Example shell snippet for SportsOddsHistory:
+
+```bash
+export NFL_CLOSING_ODDS_PROVIDER=sportsoddshistory
+export NFL_CLOSING_ODDS_TIMEOUT=60
+python NFL_SPORTSBETTING.py
+```
+
+Example for KillerSports (when hosted behind basic auth):
+
+```bash
+export NFL_CLOSING_ODDS_PROVIDER=killersports
+export KILLERSPORTS_BASE_URL="https://api.killersports.com/nfl/closing"
+export KILLERSPORTS_USERNAME="my-user"
+export KILLERSPORTS_PASSWORD="my-secret"
+python NFL_SPORTSBETTING.py
+```
+
+During startup the script downloads the requested seasons, normalizes the
+payload into the schema used by `data/closing_odds_history.csv`, and merges the
+result with the local history file (deduplicating by season, week, and teams).
+If the provider fails, the code logs a warning and falls back to whatever odds
+already exist in the CSV. You can therefore seed the CSV manually, automate the
+pull via these providers, or combine both approaches. The coverage reports and
+paper-trade guardrails continue to operate exactly as before; the automated
+sync merely helps you reach the 90% threshold with less manual data entry.
