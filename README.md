@@ -128,7 +128,7 @@ pipeline:
 
 | Setting | Purpose |
 | --- | --- |
-| `NFL_CLOSING_ODDS_PROVIDER` | Required. Set to `sportsoddshistory` or `killersports` to pick the downloader. |
+| `NFL_CLOSING_ODDS_PROVIDER` | Optional. Defaults to `sportsoddshistory`; set to `killersports` to use that feed or `none`/empty to disable the automatic sync. |
 | `NFL_CLOSING_ODDS_TIMEOUT` | Optional HTTP timeout (seconds). Defaults to `45`. |
 | `NFL_CLOSING_ODDS_DOWNLOAD_DIR` | Optional folder where raw payloads are cached for auditing. |
 | `SPORTSODDSHISTORY_BASE_URL` | Override the default SportsOddsHistory endpoint if needed. |
@@ -137,11 +137,18 @@ pipeline:
 | `KILLERSPORTS_API_KEY` | Bearer token for KillerSports, when their API requires it. |
 | `KILLERSPORTS_USERNAME` / `KILLERSPORTS_PASSWORD` | HTTP basic credentials for KillerSports, if applicable. |
 
-Example shell snippet for SportsOddsHistory:
+Example shell snippet for SportsOddsHistory (now the default):
 
 ```bash
-export NFL_CLOSING_ODDS_PROVIDER=sportsoddshistory
 export NFL_CLOSING_ODDS_TIMEOUT=60
+python NFL_SPORTSBETTING.py
+```
+
+To skip the automatic download entirely and rely on a manually curated
+`data/closing_odds_history.csv`, explicitly clear the provider before running:
+
+```bash
+export NFL_CLOSING_ODDS_PROVIDER=none
 python NFL_SPORTSBETTING.py
 ```
 

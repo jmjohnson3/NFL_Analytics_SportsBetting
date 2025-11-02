@@ -662,6 +662,12 @@ class ClosingOddsArchiveSyncer:
         if not provider:
             logging.debug("No closing odds provider configured; skipping archive sync")
             return
+        if provider in {"none", "off", "disable", "disabled"}:
+            logging.info(
+                "Closing odds archive sync disabled via NFL_CLOSING_ODDS_PROVIDER=%s",
+                provider,
+            )
+            return
 
         try:
             seasons = [str(season) for season in self.config.seasons]
@@ -4412,7 +4418,7 @@ class NFLConfig:
     paper_trade_edge_threshold: float = 0.02
     paper_trade_bankroll: float = 1_000.0
     paper_trade_max_fraction: float = 0.05
-    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER")
+    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER") or "sportsoddshistory"
     closing_odds_timeout: int = int(os.getenv("NFL_CLOSING_ODDS_TIMEOUT", "45"))
     closing_odds_download_dir: Optional[str] = os.getenv("NFL_CLOSING_ODDS_DOWNLOAD_DIR")
     sportsoddshistory_base_url: str = os.getenv(
