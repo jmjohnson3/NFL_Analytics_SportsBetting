@@ -13589,8 +13589,11 @@ def main() -> None:
             "week",
             "game_id",
             "game_start",
+            "start_time",
             "home_team",
             "away_team",
+            "home_score",
+            "away_score",
             "home_moneyline",
             "away_moneyline",
             "home_closing_moneyline",
@@ -13602,10 +13605,48 @@ def main() -> None:
         ]
         available_columns = [col for col in candidate_columns if col in report_rows.columns]
         report = report_rows[available_columns].copy()
-        if "game_start" in report.columns:
-            report["game_start"] = pd.to_datetime(report["game_start"], errors="coerce", utc=True)
-            report["game_start"] = report["game_start"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        report.sort_values([col for col in ("season", "week", "game_start", "game_id") if col in report.columns], inplace=True)
+        kickoff_utc: Optional[pd.Series] = None
+
+        for candidate in ("game_start", "start_time", "commence_time", "kickoff"):
+            if candidate in report_rows.columns:
+                parsed = pd.to_datetime(report_rows[candidate], errors="coerce", utc=True)
+                if parsed.notna().any():
+                    kickoff_utc = parsed
+                    if candidate in report.columns:
+                        formatted = parsed.dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        report[candidate] = formatted.fillna("")
+                    break
+
+        for col in ("game_start", "start_time"):
+            if col in report.columns:
+                parsed = pd.to_datetime(report[col], errors="coerce", utc=True)
+                report[col] = parsed.dt.strftime("%Y-%m-%dT%H:%M:%SZ").fillna("")
+
+        if kickoff_utc is not None:
+            report["kickoff_utc"] = kickoff_utc.dt.strftime("%Y-%m-%dT%H:%M:%SZ").fillna("")
+            report["kickoff_date"] = kickoff_utc.dt.strftime("%Y-%m-%d")
+            report["kickoff_weekday"] = kickoff_utc.dt.strftime("%a")
+
+        for score_col in ("home_score", "away_score"):
+            if score_col in report.columns:
+                report[score_col] = pd.to_numeric(report[score_col], errors="coerce")
+                report[score_col] = report[score_col].apply(
+                    lambda x: int(x) if pd.notna(x) else ""
+                )
+
+        sort_priority = [
+            col
+            for col in (
+                "season",
+                "week",
+                "kickoff_utc",
+                "game_start",
+                "game_id",
+            )
+            if col in report.columns
+        ]
+        if sort_priority:
+            report.sort_values(sort_priority, inplace=True)
         try:
             report.to_csv(report_path, index=False)
         except Exception:
