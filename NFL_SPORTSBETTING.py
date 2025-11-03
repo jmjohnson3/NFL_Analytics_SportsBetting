@@ -472,6 +472,19 @@ def _normalize_historical_closing_frame(
     return result
 
 
+def _season_param_from_label(label: str) -> str:
+    if not label:
+        return ""
+    label_str = str(label)
+    match = re.search(r"\d{4}", label_str)
+    if match:
+        return match.group(0)
+    digits = re.findall(r"\d+", label_str)
+    if digits:
+        return digits[0]
+    return label_str
+
+
 class SportsOddsHistoryFetcher:
     def __init__(
         self,
@@ -497,7 +510,12 @@ class SportsOddsHistoryFetcher:
         return safe_concat(frames, ignore_index=True)
 
     def _fetch_season(self, season: str) -> pd.DataFrame:
-        params = {"season": season, "download": "1"}
+        season_param = _season_param_from_label(season)
+        if season_param and season_param != season:
+            logging.debug(
+                "SportsOddsHistory season label %s sanitized to %s", season, season_param
+            )
+        params = {"season": season_param or season, "download": "1"}
         try:
             response = self.session.get(
                 self.base_url,
@@ -609,7 +627,12 @@ class KillerSportsFetcher:
         return safe_concat(frames, ignore_index=True)
 
     def _fetch_season(self, season: str) -> pd.DataFrame:
-        params = {"season": season, "format": "csv"}
+        season_param = _season_param_from_label(season)
+        if season_param and season_param != season:
+            logging.debug(
+                "KillerSports season label %s sanitized to %s", season, season_param
+            )
+        params = {"season": season_param or season, "format": "csv"}
         headers: Dict[str, str] = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
