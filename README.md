@@ -141,10 +141,13 @@ pipeline:
 | `KILLERSPORTS_API_KEY` | Bearer token for KillerSports, when their API requires it. |
 | `KILLERSPORTS_USERNAME` / `KILLERSPORTS_PASSWORD` | HTTP basic credentials for KillerSports, if applicable. |
 
-If you see HTTPS errors when fetching historical odds (common behind corporate
-proxies), point `NFL_ODDS_SSL_CERT` at a trusted certificate bundle or, as a
-last resort, set `ODDS_ALLOW_INSECURE_SSL=true` to disable verification for the
-download step.
+When an HTTPS handshake fails during the automatic download, the script now
+retries the request with certificate verification disabled so the run can
+continue in the short term. The first successful insecure response is clearly
+logged and persisted for the rest of the session. To avoid staying in that
+degraded mode, either point `NFL_ODDS_SSL_CERT` at a trusted corporate CA bundle
+or explicitly acknowledge the behaviour by setting
+`ODDS_ALLOW_INSECURE_SSL=true` before you run the script.
 
 Example shell snippet for the default OddsPortal sync:
 
