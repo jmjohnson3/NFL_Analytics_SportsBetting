@@ -135,9 +135,16 @@ pipeline:
 | `ODDSPORTAL_RESULTS_PATH` | Override the relative results path (defaults to `nfl/results/`). |
 | `ODDSPORTAL_SEASON_TEMPLATE` | Customize the fallback slug template (defaults to `nfl-{season}/results/`). |
 | `ODDSPORTAL_USER_AGENTS` | Comma- or semicolon-separated list of additional User-Agent strings to rotate when scraping OddsPortal. |
+| `NFL_ODDS_SSL_CERT` | Optional path to a custom CA bundle used when verifying OddsPortal/KillerSports HTTPS connections. |
+| `ODDS_ALLOW_INSECURE_SSL` | Set to `true` to disable HTTPS verification (not recommended except for temporary corporate proxy issues). |
 | `KILLERSPORTS_BASE_URL` | Base URL for KillerSports exports (required when that provider is selected). |
 | `KILLERSPORTS_API_KEY` | Bearer token for KillerSports, when their API requires it. |
 | `KILLERSPORTS_USERNAME` / `KILLERSPORTS_PASSWORD` | HTTP basic credentials for KillerSports, if applicable. |
+
+If you see HTTPS errors when fetching historical odds (common behind corporate
+proxies), point `NFL_ODDS_SSL_CERT` at a trusted certificate bundle or, as a
+last resort, set `ODDS_ALLOW_INSECURE_SSL=true` to disable verification for the
+download step.
 
 Example shell snippet for the default OddsPortal sync:
 

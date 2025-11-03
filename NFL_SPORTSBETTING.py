@@ -47,7 +47,10 @@ from aiohttp import client_exceptions
 import certifi
 from requests import HTTPError
 from requests.auth import HTTPBasicAuth
-from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
+from requests.exceptions import (
+    JSONDecodeError as RequestsJSONDecodeError,
+    SSLError,
+)
 from http import HTTPStatus
 from sklearn import set_config
 from sklearn.base import clone
@@ -105,20 +108,6 @@ try:  # Optional dependency used for HTML parsing when available
     from bs4 import BeautifulSoup  # type: ignore
 except Exception:  # pragma: no cover - fallback when bs4 is absent
     BeautifulSoup = None  # type: ignore
-
-
-SCRIPT_ROOT = Path(__file__).resolve().parent
-
-
-def _default_data_file(name: str) -> Optional[str]:
-    candidate = SCRIPT_ROOT / "data" / name
-    if candidate.exists():
-        return str(candidate)
-    return None
-
-
-DEFAULT_CLOSING_ODDS_PATH = _default_data_file("closing_odds_history.csv")
-DEFAULT_TRAVEL_CONTEXT_PATH = _default_data_file("team_travel_context.csv")
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -701,6 +690,14 @@ class OddsPortalFetcher:
             }
             try:
                 response = self.session.get(url, headers=headers, timeout=self.timeout)
+            except SSLError as exc:
+                logging.error("OddsPortal SSL error for %s: %s", url, exc)
+                logging.warning(
+                    "Certificate verification failed when contacting OddsPortal. "
+                    "If you are behind a corporate proxy, set NFL_ODDS_SSL_CERT to "
+                    "a trusted CA bundle or temporarily enable ODDS_ALLOW_INSECURE_SSL=true."
+                )
+                return None
             except Exception:
                 logging.exception("OddsPortal request error for %s", url)
                 continue
@@ -941,6 +938,16 @@ class KillerSportsFetcher:
                 auth=self.auth,
             )
             response.raise_for_status()
+        except SSLError as exc:
+            logging.error(
+                "KillerSports SSL error for season %s: %s", season, exc
+            )
+            logging.warning(
+                "Certificate verification failed when contacting KillerSports. "
+                "Set NFL_ODDS_SSL_CERT to a trusted CA bundle or use "
+                "ODDS_ALLOW_INSECURE_SSL=true if you accept the risk."
+            )
+            return pd.DataFrame()
         except HTTPError as exc:
             logging.warning("KillerSports request failed for season %s: %s", season, exc)
             return pd.DataFrame()
@@ -975,6 +982,21 @@ class ClosingOddsArchiveSyncer:
         self.config = config
         self.db = db
         self.session = requests.Session()
+        if config.odds_ssl_cert_path:
+            self.session.verify = config.odds_ssl_cert_path
+            logging.info(
+                "Using custom SSL certificate bundle for odds downloads: %s",
+                config.odds_ssl_cert_path,
+            )
+        elif config.odds_allow_insecure_ssl:
+            self.session.verify = False
+            logging.warning(
+                "ODDS_ALLOW_INSECURE_SSL enabled; HTTPS verification is disabled"
+                " for odds archive downloads. Use only if a corporate proxy"
+                " prevents certificate validation."
+            )
+        else:
+            self.session.verify = certifi.where()
 
     def sync(self) -> None:
         provider = (self.config.closing_odds_provider or "").strip().lower()
@@ -4768,6 +4790,7 @@ class NFLConfig:
     rest_travel_context_path: Optional[str] = os.getenv("NFL_TRAVEL_CONTEXT_PATH") or DEFAULT_TRAVEL_CONTEXT_PATH
     respect_lineups: bool = True
     odds_allow_insecure_ssl: bool = env_flag("ODDS_ALLOW_INSECURE_SSL", False)
+    odds_ssl_cert_path: Optional[str] = os.getenv("NFL_ODDS_SSL_CERT")
     enable_paper_trading: bool = env_flag("NFL_PAPER_TRADE", False)
     paper_trade_lookback_days: int = 21
     paper_trade_edge_threshold: float = 0.02
