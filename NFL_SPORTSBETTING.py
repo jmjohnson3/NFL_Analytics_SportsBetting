@@ -485,6 +485,47 @@ def _season_param_from_label(label: str) -> str:
     return label_str
 
 
+def _season_param_candidates(label: str) -> List[str]:
+    """Yield plausible SportsOddsHistory season parameters for a label.
+
+    SportsOddsHistory typically accepts a four-digit year (e.g. ``2024``), but
+    historically it has also exposed archives keyed by year ranges such as
+    ``2024-25`` or ``2024-2025``.  When users provide custom labels like
+    ``2024-regular`` we want to transparently fan out to the different variants
+    so a single oddity in the remote naming convention does not derail the
+    entire sync.
+    """
+
+    candidates: List[str] = []
+    label = str(label or "").strip()
+    if label:
+        candidates.append(label)
+
+    base = _season_param_from_label(label)
+    if base and base not in candidates:
+        candidates.append(base)
+
+    if base.isdigit():
+        try:
+            year = int(base)
+        except ValueError:
+            year = None
+        if year is not None:
+            next_year = year + 1
+            # Common range formats observed in the wild.
+            range_full = f"{year}-{next_year}"
+            range_short = f"{year}-{str(next_year)[-2:]}"
+            for value in (range_full, range_short, str(year - 1) + f"-{year}" if year > 0 else ""):
+                if value and value not in candidates:
+                    candidates.append(value)
+
+    # Fall back to a generic token if nothing else matched.
+    if not candidates:
+        candidates.append(base or label)
+
+    return candidates
+
+
 class SportsOddsHistoryFetcher:
     def __init__(
         self,
@@ -510,58 +551,85 @@ class SportsOddsHistoryFetcher:
         return safe_concat(frames, ignore_index=True)
 
     def _fetch_season(self, season: str) -> pd.DataFrame:
-        season_param = _season_param_from_label(season)
-        if season_param and season_param != season:
-            logging.debug(
-                "SportsOddsHistory season label %s sanitized to %s", season, season_param
-            )
-        params = {"season": season_param or season, "download": "1"}
-        try:
-            response = self.session.get(
-                self.base_url,
-                params=params,
-                headers=self.headers,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-        except HTTPError as exc:
-            logging.warning(
-                "SportsOddsHistory request failed for season %s: %s",
-                season,
-                exc,
-            )
-            return pd.DataFrame()
-        except Exception:
-            logging.exception(
-                "SportsOddsHistory request encountered an error for season %s",
-                season,
-            )
-            return pd.DataFrame()
-
-        if self.download_dir is not None:
-            try:
-                self.download_dir.mkdir(parents=True, exist_ok=True)
-                target = self.download_dir / f"sportsoddshistory_{season}.csv"
-                target.write_bytes(response.content)
-            except Exception:
+        candidates = _season_param_candidates(season)
+        last_payload: Optional[pd.DataFrame] = None
+        for param in candidates:
+            if param != season:
                 logging.debug(
-                    "Unable to persist SportsOddsHistory raw payload for season %s",
+                    "SportsOddsHistory attempting season parameter %s for label %s",
+                    param,
                     season,
                 )
+            params = {"season": param, "download": "1"}
+            try:
+                response = self.session.get(
+                    self.base_url,
+                    params=params,
+                    headers=self.headers,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+            except HTTPError as exc:
+                logging.debug(
+                    "SportsOddsHistory request failed for season %s (param=%s): %s",
+                    season,
+                    param,
+                    exc,
+                )
+                continue
+            except Exception:
+                logging.exception(
+                    "SportsOddsHistory request encountered an error for season %s (param=%s)",
+                    season,
+                    param,
+                )
+                continue
 
-        payload = self._parse_payload(response.content)
-        if _is_effectively_empty_df(payload):
-            logging.warning(
-                "SportsOddsHistory returned no rows for season %s", season
+            if self.download_dir is not None:
+                try:
+                    self.download_dir.mkdir(parents=True, exist_ok=True)
+                    target = self.download_dir / f"sportsoddshistory_{season}_{param}.csv"
+                    target.write_bytes(response.content)
+                except Exception:
+                    logging.debug(
+                        "Unable to persist SportsOddsHistory raw payload for season %s (param=%s)",
+                        season,
+                        param,
+                    )
+
+            payload = self._parse_payload(response.content)
+            if _is_effectively_empty_df(payload):
+                last_payload = payload
+                logging.debug(
+                    "SportsOddsHistory returned no rows for season %s using param %s",
+                    season,
+                    param,
+                )
+                continue
+
+            normalized = _normalize_historical_closing_frame(
+                payload, "SportsOddsHistory", season
             )
-            return pd.DataFrame()
+            if not normalized.empty:
+                return normalized
 
-        normalized = _normalize_historical_closing_frame(payload, "SportsOddsHistory", season)
-        if normalized.empty:
+            last_payload = payload
+            logging.debug(
+                "SportsOddsHistory normalization failed for season %s using param %s",
+                season,
+                param,
+            )
+
+        logging.warning(
+            "SportsOddsHistory returned no usable rows for season %s (tried: %s)",
+            season,
+            ", ".join(candidates),
+        )
+        if last_payload is not None and not last_payload.empty:
             logging.warning(
                 "SportsOddsHistory data for season %s could not be normalized", season
             )
-        return normalized
+        return pd.DataFrame()
 
     def _parse_payload(self, content: bytes) -> pd.DataFrame:
         buffers = [io.BytesIO(content)]
