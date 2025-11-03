@@ -48,6 +48,7 @@ import certifi
 from requests import HTTPError
 from requests.auth import HTTPBasicAuth
 from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
+from http import HTTPStatus
 from sklearn import set_config
 from sklearn.base import clone
 from sklearn.calibration import CalibratedClassifierCV
@@ -98,7 +99,26 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
+
+try:  # Optional dependency used for HTML parsing when available
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:  # pragma: no cover - fallback when bs4 is absent
+    BeautifulSoup = None  # type: ignore
+
+
+SCRIPT_ROOT = Path(__file__).resolve().parent
+
+
+def _default_data_file(name: str) -> Optional[str]:
+    candidate = SCRIPT_ROOT / "data" / name
+    if candidate.exists():
+        return str(candidate)
+    return None
+
+
+DEFAULT_CLOSING_ODDS_PATH = _default_data_file("closing_odds_history.csv")
+DEFAULT_TRAVEL_CONTEXT_PATH = _default_data_file("team_travel_context.csv")
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -472,195 +492,403 @@ def _normalize_historical_closing_frame(
     return result
 
 
-def _season_param_from_label(label: str) -> str:
-    if not label:
-        return ""
-    label_str = str(label)
-    match = re.search(r"\d{4}", label_str)
-    if match:
-        return match.group(0)
-    digits = re.findall(r"\d+", label_str)
-    if digits:
-        return digits[0]
-    return label_str
 
-
-def _season_param_candidates(label: str) -> List[str]:
-    """Yield plausible SportsOddsHistory season parameters for a label.
-
-    SportsOddsHistory typically accepts a four-digit year (e.g. ``2024``), but
-    historically it has also exposed archives keyed by year ranges such as
-    ``2024-25`` or ``2024-2025``.  When users provide custom labels like
-    ``2024-regular`` we want to transparently fan out to the different variants
-    so a single oddity in the remote naming convention does not derail the
-    entire sync.
-    """
-
+def _oddsportal_slug_candidates(season_label: str) -> List[str]:
+    """Return likely OddsPortal result slugs for a given season label."""
+    default_slug = "nfl/results/"
+    label = str(season_label or "").strip()
     candidates: List[str] = []
-    label = str(label or "").strip()
-    if label:
-        candidates.append(label)
+    if default_slug not in candidates:
+        candidates.append(default_slug)
 
-    base = _season_param_from_label(label)
-    if base and base not in candidates:
-        candidates.append(base)
-
-    if base.isdigit():
+    digit_tokens = [tok for tok in re.findall(r"\d{4}", label)]
+    for token in digit_tokens:
         try:
-            year = int(base)
+            year = int(token)
         except ValueError:
-            year = None
-        if year is not None:
-            next_year = year + 1
-            # Common range formats observed in the wild.
-            range_full = f"{year}-{next_year}"
-            range_short = f"{year}-{str(next_year)[-2:]}"
-            for value in (range_full, range_short, str(year - 1) + f"-{year}" if year > 0 else ""):
-                if value and value not in candidates:
-                    candidates.append(value)
+            continue
+        next_year = year + 1
+        for slug in (
+            f"nfl-{year}-{next_year}/results/",
+            f"nfl-{year}-{str(next_year)[-2:]}/results/",
+            f"nfl-{year}/results/",
+        ):
+            if slug not in candidates:
+                candidates.append(slug)
 
-    # Fall back to a generic token if nothing else matched.
-    if not candidates:
-        candidates.append(base or label)
+    normalized = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+    if normalized and normalized not in {"nfl", "usa", "results"}:
+        slug = normalized
+        if not slug.endswith("/results") and not slug.endswith("/results/"):
+            slug = f"{slug}/results/"
+        elif slug.endswith("/results"):
+            slug = f"{slug}/"
+        if slug not in candidates:
+            candidates.append(slug)
 
     return candidates
 
 
-class SportsOddsHistoryFetcher:
+def _parse_decimal_odds(value: Optional[str]) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", ".")
+    if not text:
+        return None
+    match = re.search(r"\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        decimal = float(match.group(0))
+    except ValueError:
+        return None
+    if not math.isfinite(decimal) or decimal <= 1.0:
+        return None
+    return decimal
+
+
+def _decimal_to_american(decimal: Optional[float]) -> Optional[int]:
+    if decimal is None or not math.isfinite(decimal) or decimal <= 1.0:
+        return None
+    if decimal >= 2.0:
+        return int(round((decimal - 1.0) * 100.0))
+    try:
+        return int(round(-100.0 / (decimal - 1.0)))
+    except ZeroDivisionError:
+        return None
+
+
+def _parse_oddsportal_datetime(
+    date_text: Optional[str],
+    time_text: Optional[str],
+    *,
+    timezone: str = "UTC",
+) -> Optional[pd.Timestamp]:
+    pieces = []
+    if date_text:
+        pieces.append(str(date_text).strip())
+    if time_text:
+        pieces.append(str(time_text).strip())
+    if not pieces:
+        return None
+    combined = " ".join(pieces)
+    parsed = pd.to_datetime(combined, errors="coerce")
+    if parsed is pd.NaT or parsed is None:
+        return None
+    if isinstance(parsed, pd.DatetimeIndex):
+        parsed = parsed.to_series().iloc[0]
+    if getattr(parsed, "tzinfo", None) is None:
+        try:
+            parsed = parsed.tz_localize(timezone)
+        except Exception:
+            try:
+                parsed = parsed.tz_localize("UTC", nonexistent="NaT", ambiguous="NaT")
+            except Exception:
+                return None
+    else:
+        try:
+            parsed = parsed.tz_convert(timezone)
+        except Exception:
+            pass
+    return parsed
+
+
+class OddsPortalFetcher:
+    """Scrape historical closing odds from OddsPortal results pages."""
+
     def __init__(
         self,
         session: requests.Session,
         *,
-        base_url: str = "https://sportsoddshistory.com/download/nfl-game-odds",
+        base_url: str = "https://www.oddsportal.com/american-football/usa/",
+        results_path: str = "nfl/results/",
+        season_path_template: str = "nfl-{season}/results/",
         timeout: int = 45,
-        user_agent: str = "nfl-analytics-sportsoddshistory/1.0",
-        download_dir: Optional[Path] = None,
+        user_agents: Optional[Sequence[str]] = None,
     ) -> None:
         self.session = session
-        self.base_url = base_url
+        self.base_url = (base_url or "https://www.oddsportal.com/american-football/usa/").strip()
+        if not self.base_url.endswith("/"):
+            self.base_url += "/"
+        self.results_path = results_path.strip("/") + "/" if results_path else "nfl/results/"
+        self.season_path_template = season_path_template
         self.timeout = timeout
-        self.headers = {"User-Agent": user_agent}
-        self.download_dir = download_dir
+
+        candidates: List[str] = []
+        for ua in list(user_agents or []):
+            cleaned = (ua or "").strip()
+            if cleaned and cleaned not in candidates:
+                candidates.append(cleaned)
+        for default in (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:118.0) Gecko/20100101 Firefox/118.0",
+        ):
+            if default not in candidates:
+                candidates.append(default)
+        if not candidates:
+            candidates.append("Mozilla/5.0")
+        self.user_agents = candidates
 
     def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
         frames: List[pd.DataFrame] = []
         for season in seasons:
-            frame = self._fetch_season(str(season))
-            if not _is_effectively_empty_df(frame):
-                frames.append(frame)
+            season_label = str(season)
+            season_frame = self._fetch_season(season_label)
+            if not _is_effectively_empty_df(season_frame):
+                frames.append(season_frame)
         return safe_concat(frames, ignore_index=True)
 
-    def _fetch_season(self, season: str) -> pd.DataFrame:
-        candidates = _season_param_candidates(season)
-        last_payload: Optional[pd.DataFrame] = None
-        for param in candidates:
-            if param != season:
-                logging.debug(
-                    "SportsOddsHistory attempting season parameter %s for label %s",
-                    param,
-                    season,
-                )
-            params = {"season": param, "download": "1"}
-            try:
-                response = self.session.get(
-                    self.base_url,
-                    params=params,
-                    headers=self.headers,
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
-            except HTTPError as exc:
-                logging.debug(
-                    "SportsOddsHistory request failed for season %s (param=%s): %s",
-                    season,
-                    param,
-                    exc,
-                )
-                continue
-            except Exception:
-                logging.exception(
-                    "SportsOddsHistory request encountered an error for season %s (param=%s)",
-                    season,
-                    param,
-                )
-                continue
-
-            if self.download_dir is not None:
-                try:
-                    self.download_dir.mkdir(parents=True, exist_ok=True)
-                    target = self.download_dir / f"sportsoddshistory_{season}_{param}.csv"
-                    target.write_bytes(response.content)
-                except Exception:
+    def _fetch_season(self, season_label: str) -> pd.DataFrame:
+        slugs = self._season_slugs(season_label)
+        frames: List[pd.DataFrame] = []
+        for slug in slugs:
+            data = self._scrape_slug(slug, season_label)
+            if not _is_effectively_empty_df(data):
+                frames.append(data)
+                if slug != slugs[0]:
                     logging.debug(
-                        "Unable to persist SportsOddsHistory raw payload for season %s (param=%s)",
-                        season,
-                        param,
+                        "OddsPortal used fallback slug %s for season %s", slug, season_label
                     )
+                break
+        return safe_concat(frames, ignore_index=True)
 
-            payload = self._parse_payload(response.content)
-            if _is_effectively_empty_df(payload):
-                last_payload = payload
-                logging.debug(
-                    "SportsOddsHistory returned no rows for season %s using param %s",
-                    season,
-                    param,
-                )
+    def _season_slugs(self, season_label: str) -> List[str]:
+        slugs = []
+        base_slug = self.results_path
+        if base_slug and base_slug not in slugs:
+            slugs.append(base_slug)
+        for candidate in _oddsportal_slug_candidates(season_label):
+            if candidate not in slugs:
+                slugs.append(candidate)
+        template = (self.season_path_template or "nfl-{season}/results/").strip()
+        if "{season}" in template:
+            sanitized = re.sub(r"[^0-9a-zA-Z]+", "-", str(season_label).strip()).strip("-")
+            if sanitized:
+                slug = template.format(season=sanitized)
+                slug = slug.strip("/") + "/"
+                if slug not in slugs:
+                    slugs.append(slug)
+        return slugs
+
+    def _scrape_slug(self, slug: str, season_label: str) -> pd.DataFrame:
+        url = urljoin(self.base_url, slug)
+        html = self._request(url)
+        if not html:
+            return pd.DataFrame()
+
+        frames: List[pd.DataFrame] = []
+        parsed = self._parse_results_page(html, season_label)
+        if not _is_effectively_empty_df(parsed):
+            frames.append(parsed)
+
+        for page_url in self._discover_additional_pages(url, html):
+            page_html = self._request(page_url)
+            if not page_html:
                 continue
+            chunk = self._parse_results_page(page_html, season_label)
+            if not _is_effectively_empty_df(chunk):
+                frames.append(chunk)
 
-            normalized = _normalize_historical_closing_frame(
-                payload, "SportsOddsHistory", season
-            )
-            if not normalized.empty:
-                return normalized
+        return safe_concat(frames, ignore_index=True)
 
-            last_payload = payload
-            logging.debug(
-                "SportsOddsHistory normalization failed for season %s using param %s",
-                season,
-                param,
-            )
-
-        logging.warning(
-            "SportsOddsHistory returned no usable rows for season %s (tried: %s)",
-            season,
-            ", ".join(candidates),
-        )
-        if last_payload is not None and not last_payload.empty:
-            logging.warning(
-                "SportsOddsHistory data for season %s could not be normalized", season
-            )
-        return pd.DataFrame()
-
-    def _parse_payload(self, content: bytes) -> pd.DataFrame:
-        buffers = [io.BytesIO(content)]
-        try:
-            with zipfile.ZipFile(io.BytesIO(content)) as archive:
-                for name in archive.namelist():
-                    if name.lower().endswith(".csv"):
-                        with archive.open(name) as handle:
-                            return pd.read_csv(handle)
-        except zipfile.BadZipFile:
-            pass
-        except Exception:
-            logging.debug("SportsOddsHistory payload not a ZIP archive")
-
-        for buffer in buffers:
-            buffer.seek(0)
+    def _request(self, url: str) -> Optional[str]:
+        for ua in self.user_agents:
+            headers = {
+                "User-Agent": ua,
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": self.base_url,
+            }
             try:
-                df = pd.read_csv(buffer)
-                if not df.empty:
-                    return df
+                response = self.session.get(url, headers=headers, timeout=self.timeout)
             except Exception:
+                logging.exception("OddsPortal request error for %s", url)
+                continue
+            if response.status_code == HTTPStatus.OK:
+                text = response.text or ""
+                if text.strip():
+                    return text
+            elif response.status_code in {HTTPStatus.FORBIDDEN, HTTPStatus.NOT_FOUND}:
+                logging.warning(
+                    "OddsPortal request for %s returned status %s", url, response.status_code
+                )
+                return None
+            else:
+                logging.debug(
+                    "OddsPortal request for %s returned status %s", url, response.status_code
+                )
+        return None
+
+    def _discover_additional_pages(self, base_url: str, html: str) -> List[str]:
+        if BeautifulSoup is None:
+            return []
+        soup = BeautifulSoup(html, "html.parser")
+        pages: Set[str] = set()
+        for anchor in soup.find_all("a", href=True):
+            match = re.search(r"/page/(\d+)/", anchor["href"])
+            if not match:
+                continue
+            page = match.group(1)
+            candidate = urljoin(base_url, f"page/{page}/")
+            pages.add(candidate)
+        return sorted(pages)
+
+    def _parse_results_page(self, html: str, season_label: str) -> pd.DataFrame:
+        if BeautifulSoup is None:
+            logging.warning(
+                "BeautifulSoup is required to parse OddsPortal pages; install beautifulsoup4"
+            )
+            return pd.DataFrame()
+
+        soup = BeautifulSoup(html, "html.parser")
+        table = soup.find("div", class_=re.compile("table-main"))
+        if table is None:
+            try:
+                frames = pd.read_html(io.StringIO(html))
+            except Exception:
+                frames = []
+            if not frames:
+                return pd.DataFrame()
+            # Fallback: attempt to normalise first readable table
+            for frame in frames:
+                if frame.empty:
+                    continue
+                normalized = self._normalise_table(frame, season_label)
+                if not normalized.empty:
+                    return normalized
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+        current_date: Optional[str] = None
+        for node in table.find_all(recursive=False):
+            node_classes = node.get("class", [])
+            if any(cls.startswith("event__header") for cls in node_classes):
+                current_date = node.get_text(" ", strip=True)
+                continue
+            if not any(cls.startswith("event__match") for cls in node_classes):
                 continue
 
-        try:
-            tables = pd.read_html(io.BytesIO(content))
-            for table in tables:
-                if not table.empty:
-                    return table
-        except Exception:
-            logging.debug("SportsOddsHistory payload not parseable via read_html")
-        return pd.DataFrame()
+            home_node = node.find(class_=re.compile("event__participant--home"))
+            away_node = node.find(class_=re.compile("event__participant--away"))
+            if home_node is None or away_node is None:
+                continue
+            home_team = normalize_team_abbr(home_node.get_text(" ", strip=True))
+            away_team = normalize_team_abbr(away_node.get_text(" ", strip=True))
+
+            time_node = node.find(class_=re.compile("event__time"))
+            scores_node = node.find(class_=re.compile("event__scores"))
+            odds_nodes = node.find_all(class_=re.compile("(odd|odds)"))
+
+            kickoff = _parse_oddsportal_datetime(current_date, time_node.get_text(strip=True) if time_node else None)
+            kickoff_str = kickoff.isoformat() if kickoff is not None else ""
+
+            home_score = away_score = np.nan
+            if scores_node:
+                score_match = re.findall(r"\d+", scores_node.get_text(" ", strip=True))
+                if len(score_match) >= 2:
+                    home_score = float(score_match[0])
+                    away_score = float(score_match[1])
+
+            decimals: List[float] = []
+            for odds in odds_nodes:
+                value = _parse_decimal_odds(odds.get_text(" ", strip=True))
+                if value is not None:
+                    decimals.append(value)
+            home_decimal = decimals[0] if decimals else None
+            away_decimal = decimals[-1] if len(decimals) > 1 else None
+
+            rows.append(
+                {
+                    "season": season_label,
+                    "week": np.nan,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_closing_moneyline": _decimal_to_american(home_decimal),
+                    "away_closing_moneyline": _decimal_to_american(away_decimal),
+                    "closing_bookmaker": "OddsPortal",
+                    "closing_line_time": kickoff,
+                    "kickoff_utc": kickoff,
+                    "kickoff_date": kickoff.strftime("%Y-%m-%d") if kickoff else "",
+                    "kickoff_weekday": kickoff.strftime("%a") if kickoff else "",
+                    "home_score": home_score,
+                    "away_score": away_score,
+                }
+            )
+
+        return pd.DataFrame(rows)
+
+    def _normalise_table(self, frame: pd.DataFrame, season_label: str) -> pd.DataFrame:
+        frame = frame.copy()
+        lower_cols = {col.lower(): col for col in frame.columns}
+        home_col = None
+        away_col = None
+        for key in ("home", "home team", "home_team"):
+            if key in lower_cols:
+                home_col = lower_cols[key]
+                break
+        for key in ("away", "away team", "away_team"):
+            if key in lower_cols:
+                away_col = lower_cols[key]
+                break
+        if not home_col or not away_col:
+            return pd.DataFrame()
+
+        home_decimal = None
+        away_decimal = None
+        for key in ("1", "home odds", "home_odds"):
+            if key in lower_cols:
+                home_decimal = lower_cols[key]
+                break
+        for key in ("2", "away odds", "away_odds"):
+            if key in lower_cols:
+                away_decimal = lower_cols[key]
+                break
+
+        result = pd.DataFrame()
+        result["season"] = season_label
+        result["week"] = np.nan
+        result["home_team"] = frame[home_col].apply(normalize_team_abbr)
+        result["away_team"] = frame[away_col].apply(normalize_team_abbr)
+        if home_decimal and home_decimal in frame.columns:
+            result["home_closing_moneyline"] = frame[home_decimal].apply(
+                lambda val: _decimal_to_american(_parse_decimal_odds(str(val)))
+            )
+        else:
+            result["home_closing_moneyline"] = np.nan
+        if away_decimal and away_decimal in frame.columns:
+            result["away_closing_moneyline"] = frame[away_decimal].apply(
+                lambda val: _decimal_to_american(_parse_decimal_odds(str(val)))
+            )
+        else:
+            result["away_closing_moneyline"] = np.nan
+        result["closing_bookmaker"] = "OddsPortal"
+        result["closing_line_time"] = pd.NaT
+        result["kickoff_utc"] = pd.NaT
+        result["kickoff_date"] = ""
+        result["kickoff_weekday"] = ""
+        return result
+
+
+def _season_param_from_label(label: str) -> Optional[str]:
+    """Normalize a season label for providers expecting year or year-range strings."""
+
+    text = (label or "").strip()
+    if not text:
+        return None
+
+    years = re.findall(r"\d{4}", text)
+    if not years:
+        return text
+
+    if len(years) >= 2:
+        return f"{years[0]}-{years[1]}"
+
+    year = years[0]
+    try:
+        next_year = str(int(year) + 1)
+    except ValueError:
+        return year
+    return f"{year}-{next_year}"
 
 
 class KillerSportsFetcher:
@@ -751,8 +979,7 @@ class ClosingOddsArchiveSyncer:
     def sync(self) -> None:
         provider = (self.config.closing_odds_provider or "").strip().lower()
         if not provider:
-            logging.debug("No closing odds provider configured; skipping archive sync")
-            return
+            provider = "oddsportal"
         if provider in {"none", "off", "disable", "disabled"}:
             logging.info(
                 "Closing odds archive sync disabled via NFL_CLOSING_ODDS_PROVIDER=%s",
@@ -762,21 +989,17 @@ class ClosingOddsArchiveSyncer:
 
         try:
             seasons = [str(season) for season in self.config.seasons]
-            download_dir = (
-                Path(self.config.closing_odds_download_dir)
-                if self.config.closing_odds_download_dir
-                else None
-            )
 
-            if provider in {"sportsoddshistory", "sports-odds-history", "soh"}:
-                fetcher = SportsOddsHistoryFetcher(
+            if provider in {"oddsportal", "odds-portal", "op"}:
+                fetcher = OddsPortalFetcher(
                     self.session,
-                    base_url=self.config.sportsoddshistory_base_url,
+                    base_url=self.config.oddsportal_base_url,
+                    results_path=self.config.oddsportal_results_path,
+                    season_path_template=self.config.oddsportal_season_template,
                     timeout=self.config.closing_odds_timeout,
-                    user_agent=self.config.sportsoddshistory_user_agent,
-                    download_dir=download_dir,
+                    user_agents=self.config.oddsportal_user_agents,
                 )
-                provider_name = "SportsOddsHistory"
+                provider_name = "OddsPortal"
             elif provider in {"killersports", "ks"}:
                 fetcher = KillerSportsFetcher(
                     self.session,
@@ -827,6 +1050,7 @@ class ClosingOddsArchiveSyncer:
             return archive
 
         archive = archive.copy()
+        archive["_archive_index"] = np.arange(len(archive))
         archive["season"] = archive["season"].astype(str)
         archive["week"] = pd.to_numeric(archive["week"], errors="coerce")
         for team_col in ("home_team", "away_team"):
@@ -837,8 +1061,48 @@ class ClosingOddsArchiveSyncer:
             on=merge_cols,
             how="left",
         )
+
+        if "kickoff_utc" in archive.columns and "game_id" in joined.columns:
+            needs_kickoff = joined["game_id"].isna()
+            if needs_kickoff.any() and "start_time" in games.columns:
+                kickoff_map = archive[["_archive_index", "kickoff_utc"]].copy()
+                kickoff_map["kickoff_utc"] = pd.to_datetime(
+                    kickoff_map["kickoff_utc"], errors="coerce", utc=True
+                )
+
+                games_times = games[["game_id", "start_time"]].copy()
+                games_times["start_time"] = pd.to_datetime(
+                    games_times["start_time"], errors="coerce", utc=True
+                )
+
+                kick_join = kickoff_map.merge(
+                    games_times,
+                    left_on="kickoff_utc",
+                    right_on="start_time",
+                    how="left",
+                )
+
+                joined = joined.merge(
+                    kick_join[["_archive_index", "game_id", "start_time"]],
+                    on="_archive_index",
+                    how="left",
+                    suffixes=("", "_kick"),
+                )
+                if "game_id_kick" in joined.columns:
+                    joined["game_id"] = joined["game_id"].fillna(joined["game_id_kick"])
+                    joined.drop(columns=["game_id_kick"], inplace=True)
+                if "start_time_kick" in joined.columns:
+                    if "game_start" not in joined.columns:
+                        joined["game_start"] = pd.NaT
+                    joined["game_start"] = joined["game_start"].fillna(
+                        joined["start_time_kick"]
+                    )
+                    joined.drop(columns=["start_time_kick"], inplace=True)
+
         if "start_time" in joined.columns:
             joined.rename(columns={"start_time": "game_start"}, inplace=True)
+        if "_archive_index" in joined.columns:
+            joined.drop(columns=["_archive_index"], inplace=True)
         return joined
 
     @staticmethod
@@ -4509,16 +4773,28 @@ class NFLConfig:
     paper_trade_edge_threshold: float = 0.02
     paper_trade_bankroll: float = 1_000.0
     paper_trade_max_fraction: float = 0.05
-    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER") or "sportsoddshistory"
+    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER") or "oddsportal"
     closing_odds_timeout: int = int(os.getenv("NFL_CLOSING_ODDS_TIMEOUT", "45"))
     closing_odds_download_dir: Optional[str] = os.getenv("NFL_CLOSING_ODDS_DOWNLOAD_DIR")
-    sportsoddshistory_base_url: str = os.getenv(
-        "SPORTSODDSHISTORY_BASE_URL",
-        "https://sportsoddshistory.com/download/nfl-game-odds",
+    oddsportal_base_url: str = os.getenv(
+        "ODDSPORTAL_BASE_URL",
+        "https://www.oddsportal.com/american-football/usa/",
     )
-    sportsoddshistory_user_agent: str = os.getenv(
-        "SPORTSODDSHISTORY_USER_AGENT",
-        "nfl-analytics-closing-odds/1.0",
+    oddsportal_results_path: str = os.getenv(
+        "ODDSPORTAL_RESULTS_PATH",
+        "nfl/results/",
+    )
+    oddsportal_season_template: str = os.getenv(
+        "ODDSPORTAL_SEASON_TEMPLATE",
+        "nfl-{season}/results/",
+    )
+    oddsportal_user_agents: Tuple[str, ...] = tuple(
+        ua.strip()
+        for ua in re.split(
+            r"[;,]",
+            os.getenv("ODDSPORTAL_USER_AGENTS", ""),
+        )
+        if ua.strip()
     )
     killersports_base_url: Optional[str] = os.getenv("KILLERSPORTS_BASE_URL")
     killersports_api_key: Optional[str] = os.getenv("KILLERSPORTS_API_KEY")

@@ -83,7 +83,7 @@ report lists games you cannot immediately source, use one of the following
 approaches:
 
 1. **Track down an alternative feed.** Many historical odds vendors (e.g.,
-   SportsOddsHistory, KillerSports, licensed sportsbook data products) archive
+   OddsPortal exports, KillerSports, licensed sportsbook data products) archive
    closing prices. Import those values into `data/closing_odds_history.csv` (or
    your database) so the evaluation metrics stay grounded in real markets.
 2. **Manually enter vetted closes.** If you have access to trusted screenshots
@@ -128,16 +128,18 @@ pipeline:
 
 | Setting | Purpose |
 | --- | --- |
-| `NFL_CLOSING_ODDS_PROVIDER` | Optional. Defaults to `sportsoddshistory`; set to `killersports` to use that feed or `none`/empty to disable the automatic sync. |
+| `NFL_CLOSING_ODDS_PROVIDER` | Optional. Defaults to `oddsportal`; set to `killersports` to use that feed or `none`/empty to disable the automatic sync. |
 | `NFL_CLOSING_ODDS_TIMEOUT` | Optional HTTP timeout (seconds). Defaults to `45`. |
 | `NFL_CLOSING_ODDS_DOWNLOAD_DIR` | Optional folder where raw payloads are cached for auditing. |
-| `SPORTSODDSHISTORY_BASE_URL` | Override the default SportsOddsHistory endpoint if needed. |
-| `SPORTSODDSHISTORY_USER_AGENT` | Custom User-Agent string when hitting SportsOddsHistory. |
+| `ODDSPORTAL_BASE_URL` | Override the base OddsPortal URL (defaults to `https://www.oddsportal.com/american-football/usa/`). |
+| `ODDSPORTAL_RESULTS_PATH` | Override the relative results path (defaults to `nfl/results/`). |
+| `ODDSPORTAL_SEASON_TEMPLATE` | Customize the fallback slug template (defaults to `nfl-{season}/results/`). |
+| `ODDSPORTAL_USER_AGENTS` | Comma- or semicolon-separated list of additional User-Agent strings to rotate when scraping OddsPortal. |
 | `KILLERSPORTS_BASE_URL` | Base URL for KillerSports exports (required when that provider is selected). |
 | `KILLERSPORTS_API_KEY` | Bearer token for KillerSports, when their API requires it. |
 | `KILLERSPORTS_USERNAME` / `KILLERSPORTS_PASSWORD` | HTTP basic credentials for KillerSports, if applicable. |
 
-Example shell snippet for SportsOddsHistory (now the default):
+Example shell snippet for the default OddsPortal sync:
 
 ```bash
 export NFL_CLOSING_ODDS_TIMEOUT=60
