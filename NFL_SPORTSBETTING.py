@@ -118,6 +118,8 @@ except Exception:  # pragma: no cover - fallback when bs4 is absent
 
 _BEAUTIFULSOUP_WARNING_EMITTED = False
 
+_BEAUTIFULSOUP_WARNING_EMITTED = False
+
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
 
