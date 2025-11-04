@@ -111,9 +111,12 @@ from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util import Retry
 
 try:  # Optional dependency used for HTML parsing when available
-    from bs4 import BeautifulSoup  # type: ignore
+    from bs4 import BeautifulSoup, Tag  # type: ignore
 except Exception:  # pragma: no cover - fallback when bs4 is absent
     BeautifulSoup = None  # type: ignore
+    Tag = None  # type: ignore
+
+_BEAUTIFULSOUP_WARNING_EMITTED = False
 
 _BEAUTIFULSOUP_WARNING_EMITTED = False
 
@@ -555,6 +558,41 @@ def _decimal_to_american(decimal: Optional[float]) -> Optional[int]:
         return None
 
 
+def _parse_moneyline_text(value: Optional[str]) -> Optional[int]:
+    """Parse an odds string expressed as either American or decimal prices."""
+
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    normalized = text.replace("\xa0", " ")
+    american_match = re.search(r"[+-]\d{2,4}", normalized)
+    if american_match:
+        try:
+            return int(american_match.group(0))
+        except ValueError:
+            return None
+
+    bare_match = re.search(r"\b\d{3,4}\b", normalized)
+    if bare_match:
+        try:
+            candidate = int(bare_match.group(0))
+        except ValueError:
+            candidate = None
+        else:
+            if candidate is not None and candidate >= 100:
+                return candidate
+
+    decimal = _parse_decimal_odds(normalized)
+    if decimal is not None:
+        return _decimal_to_american(decimal)
+
+    return None
+
+
 def _parse_oddsportal_datetime(
     date_text: Optional[str],
     time_text: Optional[str],
@@ -863,8 +901,9 @@ class OddsPortalFetcher:
         if table is None:
             table = soup.find(id=re.compile("tournamentTable", re.IGNORECASE))
         if table is None:
-            table = soup.find("div", id=re.compile("tournamentTable", re.IGNORECASE))
-        if table is None:
+            modern_rows = self._parse_modern_results(soup, season_label)
+            if not modern_rows.empty:
+                return modern_rows
             try:
                 frames = pd.read_html(io.StringIO(html))
             except Exception:
@@ -954,6 +993,155 @@ class OddsPortalFetcher:
                 return normalized
 
         return pd.DataFrame()
+
+    def _parse_modern_results(self, soup: "BeautifulSoup", season_label: str) -> pd.DataFrame:
+        if Tag is None:
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+
+        for node in soup.find_all(attrs={"data-testid": "game-row"}):
+            if not isinstance(node, Tag):
+                continue
+            if node.name == "a":
+                continue
+            if node.find_parent(attrs={"data-testid": "game-row"}) is not None:
+                continue
+
+            participants = node.find(attrs={"data-testid": "event-participants"})
+            if not isinstance(participants, Tag):
+                continue
+
+            team_links = [link for link in participants.find_all("a", limit=2) if isinstance(link, Tag)]
+            if len(team_links) < 2:
+                continue
+
+            away_link, home_link = team_links[:2]
+
+            def _extract_team(link: "Tag") -> Tuple[str, Optional[float]]:
+                raw_name = (link.get("title") or "").strip()
+                if not raw_name:
+                    name_node = link.find(class_=re.compile("participant-name"))
+                    raw_name = (
+                        name_node.get_text(" ", strip=True)
+                        if isinstance(name_node, Tag)
+                        else link.get_text(" ", strip=True)
+                    )
+                team = normalize_team_abbr(raw_name)
+
+                score_value: Optional[float] = None
+                for token in reversed(list(link.stripped_strings)):
+                    token = token.strip()
+                    if not token:
+                        continue
+                    if re.fullmatch(r"\d+", token):
+                        try:
+                            score_value = float(token)
+                        except ValueError:
+                            score_value = None
+                        break
+                return team, score_value
+
+            away_team, away_score = _extract_team(away_link)
+            home_team, home_score = _extract_team(home_link)
+
+            if not away_team or not home_team:
+                continue
+
+            time_node = node.find(attrs={"data-testid": "time-item"})
+            time_text = (
+                time_node.get_text(" ", strip=True)
+                if isinstance(time_node, Tag)
+                else None
+            )
+
+            date_text = self._find_associated_date(node)
+            kickoff = _parse_oddsportal_datetime(date_text, time_text)
+
+            odds_values: List[int] = []
+            for odd_container in node.find_all(
+                attrs={"data-testid": re.compile("^odd-container", re.IGNORECASE)}
+            ):
+                if not isinstance(odd_container, Tag):
+                    continue
+                price = _parse_moneyline_text(odd_container.get_text(" ", strip=True))
+                if price is None:
+                    continue
+                odds_values.append(price)
+                if len(odds_values) >= 2:
+                    break
+
+            away_moneyline = odds_values[0] if odds_values else None
+            home_moneyline = odds_values[1] if len(odds_values) > 1 else None
+
+            rows.append(
+                {
+                    "season": season_label,
+                    "week": np.nan,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_closing_moneyline": home_moneyline,
+                    "away_closing_moneyline": away_moneyline,
+                    "closing_bookmaker": "OddsPortal",
+                    "closing_line_time": kickoff,
+                    "kickoff_utc": kickoff,
+                    "kickoff_date": kickoff.strftime("%Y-%m-%d") if kickoff else "",
+                    "kickoff_weekday": kickoff.strftime("%a") if kickoff else "",
+                    "home_score": home_score if home_score is not None else np.nan,
+                    "away_score": away_score if away_score is not None else np.nan,
+                }
+            )
+
+        if not rows:
+            return pd.DataFrame()
+
+        return pd.DataFrame(rows)
+
+    def _find_associated_date(self, node: "Tag") -> Optional[str]:
+        if Tag is None:
+            return None
+
+        date_pattern = re.compile(r"(date|day|header)", re.IGNORECASE)
+        month_pattern = re.compile(
+            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)", re.IGNORECASE
+        )
+
+        current: Optional[Tag] = node
+        while current is not None:
+            sibling = current.previous_sibling
+            while sibling is not None:
+                if isinstance(sibling, Tag):
+                    if sibling.has_attr("data-testid") and date_pattern.search(
+                        str(sibling["data-testid"])
+                    ):
+                        text = sibling.get_text(" ", strip=True)
+                        if text:
+                            return text
+                    if sibling.get("class") and any(
+                        date_pattern.search(str(cls)) for cls in sibling.get("class", [])
+                    ):
+                        text = sibling.get_text(" ", strip=True)
+                        if text:
+                            return text
+                    text = sibling.get_text(" ", strip=True)
+                    if text and (
+                        month_pattern.search(text)
+                        or re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", text)
+                    ):
+                        return text
+                sibling = getattr(sibling, "previous_sibling", None)
+            current = current.parent if isinstance(getattr(current, "parent", None), Tag) else None
+
+        for candidate in node.find_all_previous(True, limit=25):
+            if not isinstance(candidate, Tag):
+                continue
+            text = candidate.get_text(" ", strip=True)
+            if not text:
+                continue
+            if month_pattern.search(text) or re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", text):
+                return text
+
+        return None
 
     def _normalise_table(self, frame: pd.DataFrame, season_label: str) -> pd.DataFrame:
         frame = frame.copy()
