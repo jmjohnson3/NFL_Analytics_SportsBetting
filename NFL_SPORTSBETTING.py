@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
+from html import unescape
 
 import aiohttp
 import numpy as np
@@ -902,6 +903,9 @@ class OddsPortalFetcher:
             modern_rows = self._parse_modern_results(soup, season_label)
             if not modern_rows.empty:
                 return modern_rows
+            state_rows = self._parse_embedded_state(html, season_label, soup=soup)
+            if not state_rows.empty:
+                return state_rows
             try:
                 frames = pd.read_html(io.StringIO(html))
             except Exception:
@@ -982,6 +986,9 @@ class OddsPortalFetcher:
         modern_rows = self._parse_modern_results(soup, season_label)
         if not modern_rows.empty:
             return modern_rows
+        state_rows = self._parse_embedded_state(html, season_label, soup=soup)
+        if not state_rows.empty:
+            return state_rows
 
         try:
             frames = pd.read_html(io.StringIO(html))
@@ -1159,6 +1166,518 @@ class OddsPortalFetcher:
             return pd.DataFrame()
 
         return pd.DataFrame(rows)
+
+    def _parse_embedded_state(
+        self,
+        html: str,
+        season_label: str,
+        *,
+        soup: Optional["BeautifulSoup"] = None,
+    ) -> pd.DataFrame:
+        if BeautifulSoup is None:
+            return pd.DataFrame()
+
+        if soup is None:
+            soup = BeautifulSoup(html, "html.parser")
+
+        payloads = self._extract_json_payloads(html, soup)
+        if not payloads:
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+        seen: Set[Tuple[Any, ...]] = set()
+
+        for payload in payloads:
+            data = self._safe_json_loads(payload)
+            if data is None:
+                continue
+
+            name_cache: Dict[int, Optional[str]] = {}
+            for ancestors, _, participant_list in self._iter_json_candidate_lists(
+                data, name_cache
+            ):
+                normalized = self._normalise_json_participants(participant_list, name_cache)
+                if len(normalized) < 2:
+                    continue
+
+                valid_entries = [entry for entry in normalized if entry.get("team")]
+                if len({entry["team"] for entry in valid_entries}) < 2:
+                    continue
+
+                has_odds = any(entry.get("moneyline") is not None for entry in valid_entries)
+                if not has_odds:
+                    continue
+
+                home_entry = next((e for e in valid_entries if e.get("is_home") is True), None)
+                away_entry = next((e for e in valid_entries if e.get("is_home") is False), None)
+
+                if home_entry is None or away_entry is None:
+                    ordered = sorted(
+                        valid_entries,
+                        key=lambda item: (
+                            0 if item.get("is_home") is False else 1 if item.get("is_home") is True else 2,
+                            item.get("index", 0),
+                        ),
+                    )
+                    if len(ordered) >= 2:
+                        away_entry, home_entry = ordered[0], ordered[1]
+                    else:
+                        continue
+
+                kickoff = self._extract_json_kickoff(ancestors)
+
+                key = (
+                    home_entry.get("team"),
+                    away_entry.get("team"),
+                    kickoff.isoformat() if isinstance(kickoff, pd.Timestamp) else kickoff,
+                    home_entry.get("moneyline"),
+                    away_entry.get("moneyline"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                rows.append(
+                    {
+                        "season": season_label,
+                        "week": np.nan,
+                        "home_team": home_entry.get("team"),
+                        "away_team": away_entry.get("team"),
+                        "home_closing_moneyline": home_entry.get("moneyline"),
+                        "away_closing_moneyline": away_entry.get("moneyline"),
+                        "closing_bookmaker": "OddsPortal",
+                        "closing_line_time": kickoff,
+                        "kickoff_utc": kickoff,
+                        "kickoff_date": kickoff.strftime("%Y-%m-%d") if isinstance(kickoff, pd.Timestamp) else "",
+                        "kickoff_weekday": kickoff.strftime("%a") if isinstance(kickoff, pd.Timestamp) else "",
+                        "home_score": home_entry.get("score", np.nan),
+                        "away_score": away_entry.get("score", np.nan),
+                    }
+                )
+
+        if not rows:
+            return pd.DataFrame()
+
+        frame = pd.DataFrame(rows)
+        frame["kickoff_utc"] = pd.to_datetime(frame["kickoff_utc"], utc=True, errors="coerce")
+        frame["closing_line_time"] = frame["kickoff_utc"]
+        frame["kickoff_date"] = frame["kickoff_utc"].dt.strftime("%Y-%m-%d").fillna("")
+        frame["kickoff_weekday"] = frame["kickoff_utc"].dt.strftime("%a").fillna("")
+        frame["home_score"] = pd.to_numeric(frame["home_score"], errors="coerce")
+        frame["away_score"] = pd.to_numeric(frame["away_score"], errors="coerce")
+        frame["home_score"] = frame["home_score"].where(frame["home_score"].notna(), np.nan)
+        frame["away_score"] = frame["away_score"].where(frame["away_score"].notna(), np.nan)
+
+        return frame.reset_index(drop=True)
+
+    def _extract_json_payloads(
+        self, html: str, soup: Optional["BeautifulSoup"]
+    ) -> List[str]:
+        payloads: List[str] = []
+
+        if soup is not None:
+            for script in soup.find_all("script"):
+                text = script.string or script.get_text()
+                if not text:
+                    continue
+                if script.get("id") == "__NEXT_DATA__":
+                    payloads.append(text)
+                    continue
+                snippet = text.strip()
+                if any(token in snippet for token in ("__NEXT_DATA__", "__NUXT__", "eventGroup")):
+                    payloads.append(snippet)
+
+        patterns = [
+            r"<script[^>]+id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>",
+            r"window\.__NEXT_DATA__\s*=\s*(\{.*?\})\s*;",
+            r"window\.__NUXT__\s*=\s*(\{.*?\})\s*;",
+            r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;",
+            r"data-state=(?:\"|\')(\{.*?\})(?:\"|\')",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, html, flags=re.DOTALL):
+                payloads.append(match.group(1))
+
+        unique: List[str] = []
+        seen: Set[str] = set()
+        for payload in payloads:
+            if not payload:
+                continue
+            cleaned = unescape(payload).strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            unique.append(cleaned)
+
+        return unique
+
+    def _safe_json_loads(self, payload: str) -> Optional[Any]:
+        text = (payload or "").strip()
+        if not text:
+            return None
+
+        text = unescape(text)
+        text = text.strip()
+
+        for prefix in ("window.__NEXT_DATA__", "window.__NUXT__", "window.__INITIAL_STATE__"):
+            if text.startswith(prefix):
+                parts = text.split("=", 1)
+                text = parts[1] if len(parts) == 2 else ""
+                break
+
+        text = text.strip()
+        if text.startswith("export default"):
+            text = text[len("export default") :].strip()
+
+        if text.startswith("const ") or text.startswith("var "):
+            parts = text.split("=", 1)
+            text = parts[1] if len(parts) == 2 else ""
+
+        text = text.strip()
+        if text.endswith(";"):
+            text = text[:-1]
+
+        text = text.strip()
+        if not text:
+            return None
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            sanitized = re.sub(r"//.*?$", "", text, flags=re.MULTILINE).strip()
+            sanitized = sanitized.strip(";")
+            if not sanitized:
+                return None
+            try:
+                return json.loads(sanitized)
+            except json.JSONDecodeError:
+                return None
+
+    def _iter_json_candidate_lists(
+        self, data: Any, name_cache: Dict[int, Optional[str]]
+    ) -> Iterable[Tuple[List[Dict[str, Any]], Optional[str], List[Dict[str, Any]]]]:
+        if not isinstance(data, (dict, list)):
+            return []
+
+        visited_lists: Set[int] = set()
+        stack: List[Tuple[List[Dict[str, Any]], Any]] = [([], data)]
+
+        while stack:
+            ancestors, node = stack.pop()
+
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if isinstance(value, list):
+                        if id(value) not in visited_lists:
+                            visited_lists.add(id(value))
+                            if self._looks_like_participant_list(value, name_cache):
+                                yield ancestors + [node], key, value  # type: ignore[arg-type]
+                            stack.append((ancestors + [node], value))
+                    elif isinstance(value, (dict, list)):
+                        stack.append((ancestors + [node], value))
+            elif isinstance(node, list):
+                for item in node:
+                    stack.append((ancestors, item))
+
+    def _looks_like_participant_list(
+        self, value: Sequence[Any], name_cache: Dict[int, Optional[str]]
+    ) -> bool:
+        if not isinstance(value, Sequence) or len(value) < 2:
+            return False
+
+        dict_count = sum(1 for item in value if isinstance(item, dict))
+        if dict_count < 2:
+            return False
+
+        identified = 0
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            name = self._extract_json_team_name(item, name_cache)
+            if name:
+                identified += 1
+            if identified >= 2:
+                return True
+
+        return False
+
+    def _normalise_json_participants(
+        self, entries: Sequence[Any], name_cache: Dict[int, Optional[str]]
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+
+            name = self._extract_json_team_name(entry, name_cache)
+            if not name:
+                continue
+
+            team = normalize_team_abbr(name)
+            if not team:
+                continue
+
+            normalized.append(
+                {
+                    "team": team,
+                    "is_home": self._infer_json_home_indicator(entry),
+                    "moneyline": self._extract_json_odds(entry),
+                    "score": self._extract_json_score(entry),
+                    "index": index,
+                }
+            )
+
+        return normalized
+
+    def _extract_json_team_name(
+        self, node: Any, cache: Dict[int, Optional[str]]
+    ) -> Optional[str]:
+        queue: List[Any] = [node]
+        seen: Set[int] = set()
+
+        while queue:
+            current = queue.pop(0)
+            node_id = id(current)
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+
+            if node_id in cache:
+                cached = cache[node_id]
+                if cached:
+                    return cached
+                continue
+
+            if isinstance(current, dict):
+                for key, value in current.items():
+                    lower = str(key).lower()
+                    if any(
+                        token in lower
+                        for token in (
+                            "name",
+                            "team",
+                            "participant",
+                            "competitor",
+                            "club",
+                            "title",
+                            "slug",
+                            "abbr",
+                            "abbreviation",
+                        )
+                    ):
+                        if isinstance(value, str):
+                            cleaned = value.strip()
+                            if cleaned and any(ch.isalpha() for ch in cleaned):
+                                cache[node_id] = cleaned
+                                return cleaned
+                        elif isinstance(value, (dict, list)):
+                            queue.append(value)
+                            continue
+                    if isinstance(value, (dict, list)):
+                        queue.append(value)
+
+                cache[node_id] = None
+
+            elif isinstance(current, list):
+                queue.extend(current)
+
+        return None
+
+    def _infer_json_home_indicator(self, entry: Dict[str, Any]) -> Optional[bool]:
+        for key, value in entry.items():
+            lower = str(key).lower()
+            if lower in {"ishome", "home"}:
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    if value == 1:
+                        return True
+                    if value == 0 or value == -1:
+                        return False
+                if isinstance(value, str):
+                    token = value.strip().lower()
+                    if token.startswith("home") or token in {"h", "host"}:
+                        return True
+                    if token.startswith("away") or token in {"a", "visitor", "road", "guest"}:
+                        return False
+
+        for key in (
+            "homeAway",
+            "home_away",
+            "homeAwayTeam",
+            "qualifier",
+            "alignment",
+            "side",
+            "designation",
+            "teamType",
+            "teamRole",
+            "venueType",
+        ):
+            if key not in entry:
+                continue
+            value = entry[key]
+            if isinstance(value, str):
+                token = value.strip().lower()
+                if "home" in token and "away" not in token:
+                    return True
+                if any(tag in token for tag in ("away", "road", "guest", "visitor")):
+                    return False
+            elif isinstance(value, dict):
+                nested = value.get("value") or value.get("label") or value.get("name")
+                if isinstance(nested, str):
+                    nested_token = nested.strip().lower()
+                    if "home" in nested_token and "away" not in nested_token:
+                        return True
+                    if any(tag in nested_token for tag in ("away", "road", "guest", "visitor")):
+                        return False
+
+        indicator = entry.get("isHome")
+        if isinstance(indicator, bool):
+            return indicator
+
+        return None
+
+    def _extract_json_odds(self, entry: Dict[str, Any]) -> Optional[int]:
+        candidates: List[Tuple[bool, Optional[int]]] = []
+
+        def visit(node: Any, *, keyed: bool = False) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    is_odds_key = any(
+                        token in lower
+                        for token in (
+                            "american",
+                            "moneyline",
+                            "money_line",
+                            "price",
+                            "odds",
+                            "us",
+                        )
+                    )
+                    if isinstance(value, (str, int, float)) and is_odds_key:
+                        price = _parse_moneyline_text(str(value))
+                        candidates.append((True, price))
+                    elif isinstance(value, (dict, list)):
+                        visit(value, keyed=is_odds_key or keyed)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item, keyed=keyed)
+            elif keyed and isinstance(node, (str, int, float)):
+                price = _parse_moneyline_text(str(node))
+                candidates.append((False, price))
+
+        visit(entry)
+
+        for keyed, price in candidates:
+            if price is not None:
+                return price
+
+        return None
+
+    def _extract_json_score(self, entry: Dict[str, Any]) -> Optional[float]:
+        values: List[float] = []
+
+        def visit(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    if any(token in lower for token in ("score", "points", "result")):
+                        if isinstance(value, (int, float)):
+                            values.append(float(value))
+                        elif isinstance(value, str):
+                            match = re.search(r"-?\d+(?:\.\d+)?", value)
+                            if match:
+                                try:
+                                    values.append(float(match.group(0)))
+                                except ValueError:
+                                    pass
+                        elif isinstance(value, (dict, list)):
+                            visit(value)
+                    elif isinstance(value, (dict, list)):
+                        visit(value)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item)
+
+        visit(entry)
+
+        return values[0] if values else None
+
+    def _extract_json_kickoff(self, ancestors: Sequence[Dict[str, Any]]) -> Optional[pd.Timestamp]:
+        for container in reversed(ancestors):
+            if not isinstance(container, dict):
+                continue
+            for key, value in container.items():
+                lower = str(key).lower()
+                if any(
+                    token in lower
+                    for token in (
+                        "start",
+                        "kickoff",
+                        "commence",
+                        "date",
+                        "time",
+                        "begin",
+                        "eventtime",
+                        "timestamp",
+                    )
+                ):
+                    timestamp = self._convert_json_datetime(value)
+                    if timestamp is not None:
+                        return timestamp
+
+        return None
+
+    def _convert_json_datetime(self, value: Any) -> Optional[pd.Timestamp]:
+        if value is None:
+            return None
+
+        if isinstance(value, pd.Timestamp):
+            return value.tz_convert("UTC") if value.tzinfo else value.tz_localize("UTC")
+
+        if isinstance(value, (int, float)):
+            if value > 1e12:
+                timestamp = pd.to_datetime(value, unit="ms", utc=True, errors="coerce")
+            else:
+                timestamp = pd.to_datetime(value, unit="s", utc=True, errors="coerce")
+            if pd.notna(timestamp):
+                return timestamp
+            return None
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                timestamp = pd.to_datetime(text, utc=True, errors="coerce")
+            except Exception:
+                timestamp = pd.NaT
+            if pd.notna(timestamp):
+                return timestamp
+            digits = re.sub(r"\D", "", text)
+            if digits:
+                try:
+                    numeric = int(digits)
+                except ValueError:
+                    numeric = None
+                if numeric is not None:
+                    if len(digits) >= 13:
+                        timestamp = pd.to_datetime(numeric, unit="ms", utc=True, errors="coerce")
+                    else:
+                        timestamp = pd.to_datetime(numeric, unit="s", utc=True, errors="coerce")
+                    if pd.notna(timestamp):
+                        return timestamp
+
+        if isinstance(value, dict):
+            for key in ("iso", "utc", "value", "timestamp"):
+                if key in value:
+                    candidate = self._convert_json_datetime(value[key])
+                    if candidate is not None:
+                        return candidate
+
+        return None
 
     def _find_associated_date(self, node: "Tag") -> Optional[str]:
         if Tag is None:
