@@ -782,7 +782,14 @@ class OddsPortalFetcher:
             allowed_methods=None,
         )
 
-        adapter = HTTPAdapter(max_retries=retry, ssl_context=context)
+        try:
+            adapter = HTTPAdapter(max_retries=retry, ssl_context=context)
+        except TypeError:
+            logging.debug(
+                "requests.HTTPAdapter does not support the ssl_context argument; "
+                "falling back to a legacy-compatible adapter"
+            )
+            adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
         self._insecure_adapter_installed = True
