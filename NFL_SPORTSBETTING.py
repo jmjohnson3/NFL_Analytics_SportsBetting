@@ -49,7 +49,9 @@ from requests import HTTPError
 from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
 from requests.exceptions import (
+    ConnectionError as RequestsConnectionError,
     JSONDecodeError as RequestsJSONDecodeError,
+    ReadTimeout,
     SSLError,
 )
 from http import HTTPStatus
@@ -104,12 +106,16 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from urllib.parse import urlencode, urljoin
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util import Retry
 
 try:  # Optional dependency used for HTML parsing when available
     from bs4 import BeautifulSoup  # type: ignore
 except Exception:  # pragma: no cover - fallback when bs4 is absent
     BeautifulSoup = None  # type: ignore
+
+_BEAUTIFULSOUP_WARNING_EMITTED = False
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -625,6 +631,13 @@ class OddsPortalFetcher:
         self._ssl_failure_logged = False
         self._insecure_adapter_installed = False
 
+        if BeautifulSoup is None:
+            raise RuntimeError(
+                "The beautifulsoup4 package is required to scrape OddsPortal closing odds. "
+                "Install it with 'pip install beautifulsoup4' inside your environment or disable "
+                "OddsPortal scraping in your configuration if you do not need closing odds."
+            )
+
     def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
         frames: List[pd.DataFrame] = []
         for season in seasons:
@@ -782,9 +795,17 @@ class OddsPortalFetcher:
             allowed_methods=None,
         )
 
-        adapter = HTTPAdapter(max_retries=retry, ssl_context=context)
+        try:
+            adapter = HTTPAdapter(max_retries=retry, ssl_context=context)
+        except TypeError:
+            logging.debug(
+                "requests.HTTPAdapter does not support the ssl_context argument; "
+                "falling back to a legacy-compatible adapter"
+            )
+            adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        urllib3.disable_warnings(InsecureRequestWarning)
         self._insecure_adapter_installed = True
 
     def _process_oddsportal_response(
@@ -828,10 +849,13 @@ class OddsPortalFetcher:
         return sorted(pages)
 
     def _parse_results_page(self, html: str, season_label: str) -> pd.DataFrame:
+        global _BEAUTIFULSOUP_WARNING_EMITTED
         if BeautifulSoup is None:
-            logging.warning(
-                "BeautifulSoup is required to parse OddsPortal pages; install beautifulsoup4"
-            )
+            if not _BEAUTIFULSOUP_WARNING_EMITTED:
+                logging.warning(
+                    "BeautifulSoup is required to parse OddsPortal pages; install beautifulsoup4"
+                )
+                _BEAUTIFULSOUP_WARNING_EMITTED = True
             return pd.DataFrame()
 
         soup = BeautifulSoup(html, "html.parser")
@@ -5477,7 +5501,18 @@ class MySportsFeedsClient:
     def _request(self, endpoint: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{API_PREFIX_NFL}/{endpoint}"
         logging.debug("Requesting MySportsFeeds endpoint %s", url)
-        resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
+        try:
+            resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
+        except ReadTimeout:
+            logging.warning(
+                "MySportsFeeds request to %s timed out after %ss; returning empty payload",
+                url,
+                self.timeout,
+            )
+            return {}
+        except RequestsConnectionError as exc:
+            logging.warning("MySportsFeeds request to %s failed: %s", url, exc)
+            return {}
         resp.raise_for_status()
         try:
             return resp.json()
