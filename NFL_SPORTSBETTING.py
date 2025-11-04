@@ -1012,12 +1012,14 @@ class OddsPortalFetcher:
         for node in soup.find_all(attrs={"data-testid": "game-row"}):
             if not isinstance(node, Tag):
                 continue
-            if node.name == "a":
-                continue
             if node.find_parent(attrs={"data-testid": "game-row"}) is not None:
                 continue
 
-            participants = node.find(attrs={"data-testid": "event-participants"})
+            container = node if node.name != "a" else node.parent
+            if not isinstance(container, Tag):
+                container = node
+
+            participants = container.find(attrs={"data-testid": "event-participants"})
             if not isinstance(participants, Tag):
                 continue
 
@@ -1118,18 +1120,18 @@ class OddsPortalFetcher:
             if not away_team or not home_team:
                 continue
 
-            time_node = node.find(attrs={"data-testid": "time-item"})
+            time_node = container.find(attrs={"data-testid": "time-item"})
             time_text = (
                 time_node.get_text(" ", strip=True)
                 if isinstance(time_node, Tag)
                 else None
             )
 
-            date_text = self._find_associated_date(node)
+            date_text = self._find_associated_date(container)
             kickoff = _parse_oddsportal_datetime(date_text, time_text)
 
             odds_values: List[int] = []
-            for odd_container in node.find_all(
+            for odd_container in container.find_all(
                 attrs={"data-testid": re.compile("^odd-container", re.IGNORECASE)}
             ):
                 if not isinstance(odd_container, Tag):
