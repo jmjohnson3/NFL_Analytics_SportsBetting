@@ -668,6 +668,34 @@ class OddsPortalFetcher:
         self._ssl_failure_logged = False
         self._insecure_adapter_installed = False
 
+        self._debug_dump_enabled = False
+        self._debug_dir: Optional[Path] = None
+        self._debug_dumped_sources: Set[str] = set()
+        self._debug_capture_logged: Set[str] = set()
+        self._no_rows_warned: Set[str] = set()
+
+        debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
+        if str(debug_flag).strip().lower() in {"1", "true", "yes", "on", "debug"}:
+            self._debug_dump_enabled = True
+            debug_dir = os.environ.get("NFL_ODDSPORTAL_DEBUG_DIR")
+            self._debug_dir = (
+                Path(debug_dir).expanduser()
+                if debug_dir
+                else SCRIPT_ROOT / "reports" / "oddsportal_debug"
+            )
+            try:
+                self._debug_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                logging.exception(
+                    "Unable to create OddsPortal debug directory at %s", self._debug_dir
+                )
+                self._debug_dump_enabled = False
+            else:
+                logging.warning(
+                    "NFL_ODDSPORTAL_DEBUG_HTML enabled; raw OddsPortal pages will be written to %s",
+                    self._debug_dir,
+                )
+
         if BeautifulSoup is None:
             raise RuntimeError(
                 "The beautifulsoup4 package is required to scrape OddsPortal closing odds. "
@@ -730,6 +758,8 @@ class OddsPortalFetcher:
         parsed = self._parse_results_page(html, season_label)
         if not _is_effectively_empty_df(parsed):
             frames.append(parsed)
+        else:
+            self._debug_capture_failure(slug, html, source_url=url)
 
         for page_url in self._discover_additional_pages(url, html):
             page_html = self._request(page_url)
@@ -738,8 +768,13 @@ class OddsPortalFetcher:
             chunk = self._parse_results_page(page_html, season_label)
             if not _is_effectively_empty_df(chunk):
                 frames.append(chunk)
+            else:
+                self._debug_capture_failure(slug, page_html, source_url=page_url)
 
-        return safe_concat(frames, ignore_index=True)
+        result = safe_concat(frames, ignore_index=True)
+        if _is_effectively_empty_df(result):
+            self._debug_warn_no_rows(slug, season_label, url)
+        return result
 
     def _request(self, url: str) -> Optional[str]:
         attempt_insecure = False
@@ -1002,6 +1037,90 @@ class OddsPortalFetcher:
                 return normalized
 
         return pd.DataFrame()
+
+    def _debug_capture_failure(self, slug: str, html: str, *, source_url: str) -> None:
+        if not html:
+            return
+
+        key = f"{slug}|{source_url}"
+        if key in self._debug_capture_logged:
+            return
+        self._debug_capture_logged.add(key)
+
+        html_bytes = len(html)
+        legacy_nodes = modern_rows = participant_nodes = next_data_scripts = 0
+
+        if BeautifulSoup is not None:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+            except Exception as exc:
+                logging.debug(
+                    "OddsPortal diagnostics unable to parse HTML for %s (%s): %s",
+                    source_url,
+                    slug,
+                    exc,
+                )
+            else:
+                legacy_nodes = len(soup.find_all(class_=re.compile("event__match")))
+                modern_rows = len(soup.find_all(attrs={"data-testid": "game-row"}))
+                participant_nodes = len(
+                    soup.find_all(attrs={"data-testid": "event-participants"})
+                )
+                next_data_scripts = len(soup.find_all(id="__NEXT_DATA__"))
+
+        logging.info(
+            "OddsPortal parse diagnostics for %s -> %s: html_bytes=%d legacy_nodes=%d modern_rows=%d participant_nodes=%d next_data_scripts=%d",
+            slug,
+            source_url,
+            html_bytes,
+            legacy_nodes,
+            modern_rows,
+            participant_nodes,
+            next_data_scripts,
+        )
+
+        self._debug_dump_html(slug, source_url, html)
+
+    def _debug_dump_html(self, slug: str, source_url: str, html: str) -> None:
+        if not self._debug_dump_enabled or not html or self._debug_dir is None:
+            return
+
+        key = f"{slug}|{source_url}"
+        if key in self._debug_dumped_sources:
+            return
+        self._debug_dumped_sources.add(key)
+
+        timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        safe_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/")) or "root"
+        filename = f"{timestamp}_{safe_slug}.html"
+        path = self._debug_dir / filename
+
+        try:
+            path.write_text(html, encoding="utf-8")
+        except Exception:
+            logging.exception("Failed to write OddsPortal debug HTML to %s", path)
+            self._debug_dump_enabled = False
+            return
+
+        logging.warning(
+            "Saved OddsPortal HTML snapshot to %s for slug %s (%s). Share this file if parsing remains empty.",
+            path,
+            slug,
+            source_url,
+        )
+
+    def _debug_warn_no_rows(self, slug: str, season_label: str, source_url: str) -> None:
+        key = f"{season_label}|{slug}"
+        if key in self._no_rows_warned:
+            return
+
+        self._no_rows_warned.add(key)
+        logging.warning(
+            "OddsPortal parser did not find closing odds for slug %s (season %s, url=%s). Set NFL_ODDSPORTAL_DEBUG_HTML=1 and rerun to capture the raw HTML for troubleshooting.",
+            slug,
+            season_label,
+            source_url,
+        )
 
     def _parse_modern_results(self, soup: "BeautifulSoup", season_label: str) -> pd.DataFrame:
         if Tag is None:
