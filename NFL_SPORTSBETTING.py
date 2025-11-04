@@ -861,6 +861,8 @@ class OddsPortalFetcher:
         soup = BeautifulSoup(html, "html.parser")
         table = soup.find("div", class_=re.compile("table-main"))
         if table is None:
+            table = soup.find("div", id=re.compile("tournamentTable", re.IGNORECASE))
+        if table is None:
             try:
                 frames = pd.read_html(io.StringIO(html))
             except Exception:
@@ -877,14 +879,14 @@ class OddsPortalFetcher:
             return pd.DataFrame()
 
         rows: List[Dict[str, Any]] = []
-        current_date: Optional[str] = None
-        for node in table.find_all(recursive=False):
-            node_classes = node.get("class", [])
-            if any(cls.startswith("event__header") for cls in node_classes):
-                current_date = node.get_text(" ", strip=True)
-                continue
-            if not any(cls.startswith("event__match") for cls in node_classes):
-                continue
+        for node in table.find_all(class_=re.compile("event__match")):
+            header = node.find_previous(class_=re.compile("event__header"))
+            current_date = None
+            if header is not None:
+                for ancestor in header.parents:
+                    if ancestor is table:
+                        current_date = header.get_text(" ", strip=True)
+                        break
 
             home_node = node.find(class_=re.compile("event__participant--home"))
             away_node = node.find(class_=re.compile("event__participant--away"))
@@ -897,8 +899,10 @@ class OddsPortalFetcher:
             scores_node = node.find(class_=re.compile("event__scores"))
             odds_nodes = node.find_all(class_=re.compile("(odd|odds)"))
 
-            kickoff = _parse_oddsportal_datetime(current_date, time_node.get_text(strip=True) if time_node else None)
-            kickoff_str = kickoff.isoformat() if kickoff is not None else ""
+            kickoff = _parse_oddsportal_datetime(
+                current_date,
+                time_node.get_text(strip=True) if time_node else None,
+            )
 
             home_score = away_score = np.nan
             if scores_node:
@@ -933,7 +937,21 @@ class OddsPortalFetcher:
                 }
             )
 
-        return pd.DataFrame(rows)
+        if rows:
+            return pd.DataFrame(rows)
+
+        try:
+            frames = pd.read_html(io.StringIO(html))
+        except Exception:
+            return pd.DataFrame()
+        for frame in frames:
+            if frame.empty:
+                continue
+            normalized = self._normalise_table(frame, season_label)
+            if not normalized.empty:
+                return normalized
+
+        return pd.DataFrame()
 
     def _normalise_table(self, frame: pd.DataFrame, season_label: str) -> pd.DataFrame:
         frame = frame.copy()
