@@ -859,7 +859,9 @@ class OddsPortalFetcher:
             return pd.DataFrame()
 
         soup = BeautifulSoup(html, "html.parser")
-        table = soup.find("div", class_=re.compile("table-main"))
+        table = soup.find(class_=re.compile(r"\btable-main\b"))
+        if table is None:
+            table = soup.find(id=re.compile("tournamentTable", re.IGNORECASE))
         if table is None:
             table = soup.find("div", id=re.compile("tournamentTable", re.IGNORECASE))
         if table is None:
@@ -955,6 +957,14 @@ class OddsPortalFetcher:
 
     def _normalise_table(self, frame: pd.DataFrame, season_label: str) -> pd.DataFrame:
         frame = frame.copy()
+        if isinstance(frame.columns, pd.MultiIndex):
+            frame.columns = [
+                " ".join(str(part) for part in col if str(part) != "nan").strip()
+                for col in frame.columns
+            ]
+        frame = frame.loc[:, ~frame.columns.astype(str).str.contains(r"^Unnamed", case=False)]
+        frame.columns = [str(col).strip() for col in frame.columns]
+
         lower_cols = {col.lower(): col for col in frame.columns}
         home_col = None
         away_col = None
@@ -966,8 +976,39 @@ class OddsPortalFetcher:
             if key in lower_cols:
                 away_col = lower_cols[key]
                 break
+
+        match_col = None
         if not home_col or not away_col:
-            return pd.DataFrame()
+            for key in ("match", "event", "teams", "matchup", "home - away"):
+                if key in lower_cols:
+                    match_col = lower_cols[key]
+                    break
+            if match_col is None:
+                for col in frame.columns:
+                    sample = (
+                        frame[col]
+                        .astype(str)
+                        .str.contains(r"\b(vs|vs\.|@| - | – | v )\b", case=False, regex=True)
+                    )
+                    if sample.any():
+                        match_col = col
+                        break
+
+        odds_columns: List[str] = []
+        for col in frame.columns:
+            parsed = frame[col].apply(lambda val: _parse_decimal_odds(str(val)))
+            if parsed.notna().sum() >= max(1, int(len(frame) * 0.4)):
+                odds_columns.append(col)
+        if not odds_columns:
+            odds_columns = [
+                col
+                for col in frame.columns
+                if frame[col]
+                .astype(str)
+                .str.contains(r"\d\.\d", regex=True)
+                .sum()
+                >= max(1, int(len(frame) * 0.4))
+            ]
 
         home_decimal = None
         away_decimal = None
@@ -980,29 +1021,68 @@ class OddsPortalFetcher:
                 away_decimal = lower_cols[key]
                 break
 
+        if home_decimal is None and odds_columns:
+            home_decimal = odds_columns[0]
+        if away_decimal is None and len(odds_columns) >= 2:
+            away_decimal = odds_columns[1]
+
+        def _split_teams(value: Any) -> Tuple[str, str]:
+            text = str(value or "").strip()
+            separators = [" - ", " – ", " vs ", " vs. ", " v ", " @ "]
+            for sep in separators:
+                if sep in text:
+                    parts = [part.strip() for part in text.split(sep, 1)]
+                    if len(parts) == 2:
+                        return parts[0], parts[1]
+            tokens = re.split(r"\s+vs\.?\s+|\s+@\s+", text, maxsplit=1, flags=re.IGNORECASE)
+            if len(tokens) == 2:
+                return tokens[0].strip(), tokens[1].strip()
+            return "", ""
+
+        if match_col and (not home_col or not away_col):
+            extracted = frame[match_col].apply(_split_teams)
+            frame["__home"] = extracted.apply(lambda pair: pair[0])
+            frame["__away"] = extracted.apply(lambda pair: pair[1])
+            home_col = home_col or "__home"
+            away_col = away_col or "__away"
+
+        if not home_col or not away_col:
+            return pd.DataFrame()
+
         result = pd.DataFrame()
         result["season"] = season_label
         result["week"] = np.nan
         result["home_team"] = frame[home_col].apply(normalize_team_abbr)
         result["away_team"] = frame[away_col].apply(normalize_team_abbr)
-        if home_decimal and home_decimal in frame.columns:
-            result["home_closing_moneyline"] = frame[home_decimal].apply(
+
+        def _convert_series(col: Optional[str]) -> pd.Series:
+            if not col or col not in frame.columns:
+                return pd.Series(np.nan, index=frame.index)
+            return frame[col].apply(
                 lambda val: _decimal_to_american(_parse_decimal_odds(str(val)))
             )
-        else:
-            result["home_closing_moneyline"] = np.nan
-        if away_decimal and away_decimal in frame.columns:
-            result["away_closing_moneyline"] = frame[away_decimal].apply(
-                lambda val: _decimal_to_american(_parse_decimal_odds(str(val)))
-            )
-        else:
-            result["away_closing_moneyline"] = np.nan
+
+        result["home_closing_moneyline"] = _convert_series(home_decimal)
+        result["away_closing_moneyline"] = _convert_series(away_decimal)
         result["closing_bookmaker"] = "OddsPortal"
         result["closing_line_time"] = pd.NaT
         result["kickoff_utc"] = pd.NaT
         result["kickoff_date"] = ""
         result["kickoff_weekday"] = ""
-        return result
+        result["home_score"] = np.nan
+        result["away_score"] = np.nan
+
+        score_col = None
+        for key in ("score", "result", "ft", "full time"):
+            if key in lower_cols:
+                score_col = lower_cols[key]
+                break
+        if score_col and score_col in frame.columns:
+            scores = frame[score_col].astype(str).apply(lambda text: re.findall(r"\d+", text))
+            result["home_score"] = scores.apply(lambda vals: float(vals[0]) if len(vals) >= 1 else np.nan)
+            result["away_score"] = scores.apply(lambda vals: float(vals[1]) if len(vals) >= 2 else np.nan)
+
+        return result.reset_index(drop=True)
 
 
 def _season_param_from_label(label: str) -> Optional[str]:
