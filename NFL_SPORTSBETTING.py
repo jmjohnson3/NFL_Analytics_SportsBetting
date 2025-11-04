@@ -979,6 +979,10 @@ class OddsPortalFetcher:
         if rows:
             return pd.DataFrame(rows)
 
+        modern_rows = self._parse_modern_results(soup, season_label)
+        if not modern_rows.empty:
+            return modern_rows
+
         try:
             frames = pd.read_html(io.StringIO(html))
         except Exception:
