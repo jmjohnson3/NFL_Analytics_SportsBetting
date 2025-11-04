@@ -49,7 +49,9 @@ from requests import HTTPError
 from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
 from requests.exceptions import (
+    ConnectionError as RequestsConnectionError,
     JSONDecodeError as RequestsJSONDecodeError,
+    ReadTimeout,
     SSLError,
 )
 from http import HTTPStatus
@@ -104,12 +106,16 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from urllib.parse import urlencode, urljoin
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util import Retry
 
 try:  # Optional dependency used for HTML parsing when available
     from bs4 import BeautifulSoup  # type: ignore
 except Exception:  # pragma: no cover - fallback when bs4 is absent
     BeautifulSoup = None  # type: ignore
+
+_BEAUTIFULSOUP_WARNING_EMITTED = False
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -625,6 +631,13 @@ class OddsPortalFetcher:
         self._ssl_failure_logged = False
         self._insecure_adapter_installed = False
 
+        if BeautifulSoup is None:
+            raise RuntimeError(
+                "The beautifulsoup4 package is required to scrape OddsPortal closing odds. "
+                "Install it with 'pip install beautifulsoup4' inside your environment or disable "
+                "OddsPortal scraping in your configuration if you do not need closing odds."
+            )
+
     def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
         frames: List[pd.DataFrame] = []
         for season in seasons:
@@ -782,9 +795,17 @@ class OddsPortalFetcher:
             allowed_methods=None,
         )
 
-        adapter = HTTPAdapter(max_retries=retry, ssl_context=context)
+        try:
+            adapter = HTTPAdapter(max_retries=retry, ssl_context=context)
+        except TypeError:
+            logging.debug(
+                "requests.HTTPAdapter does not support the ssl_context argument; "
+                "falling back to a legacy-compatible adapter"
+            )
+            adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        urllib3.disable_warnings(InsecureRequestWarning)
         self._insecure_adapter_installed = True
 
     def _process_oddsportal_response(
@@ -828,14 +849,19 @@ class OddsPortalFetcher:
         return sorted(pages)
 
     def _parse_results_page(self, html: str, season_label: str) -> pd.DataFrame:
+        global _BEAUTIFULSOUP_WARNING_EMITTED
         if BeautifulSoup is None:
-            logging.warning(
-                "BeautifulSoup is required to parse OddsPortal pages; install beautifulsoup4"
-            )
+            if not _BEAUTIFULSOUP_WARNING_EMITTED:
+                logging.warning(
+                    "BeautifulSoup is required to parse OddsPortal pages; install beautifulsoup4"
+                )
+                _BEAUTIFULSOUP_WARNING_EMITTED = True
             return pd.DataFrame()
 
         soup = BeautifulSoup(html, "html.parser")
         table = soup.find("div", class_=re.compile("table-main"))
+        if table is None:
+            table = soup.find("div", id=re.compile("tournamentTable", re.IGNORECASE))
         if table is None:
             try:
                 frames = pd.read_html(io.StringIO(html))
@@ -853,14 +879,14 @@ class OddsPortalFetcher:
             return pd.DataFrame()
 
         rows: List[Dict[str, Any]] = []
-        current_date: Optional[str] = None
-        for node in table.find_all(recursive=False):
-            node_classes = node.get("class", [])
-            if any(cls.startswith("event__header") for cls in node_classes):
-                current_date = node.get_text(" ", strip=True)
-                continue
-            if not any(cls.startswith("event__match") for cls in node_classes):
-                continue
+        for node in table.find_all(class_=re.compile("event__match")):
+            header = node.find_previous(class_=re.compile("event__header"))
+            current_date = None
+            if header is not None:
+                for ancestor in header.parents:
+                    if ancestor is table:
+                        current_date = header.get_text(" ", strip=True)
+                        break
 
             home_node = node.find(class_=re.compile("event__participant--home"))
             away_node = node.find(class_=re.compile("event__participant--away"))
@@ -873,8 +899,10 @@ class OddsPortalFetcher:
             scores_node = node.find(class_=re.compile("event__scores"))
             odds_nodes = node.find_all(class_=re.compile("(odd|odds)"))
 
-            kickoff = _parse_oddsportal_datetime(current_date, time_node.get_text(strip=True) if time_node else None)
-            kickoff_str = kickoff.isoformat() if kickoff is not None else ""
+            kickoff = _parse_oddsportal_datetime(
+                current_date,
+                time_node.get_text(strip=True) if time_node else None,
+            )
 
             home_score = away_score = np.nan
             if scores_node:
@@ -909,7 +937,21 @@ class OddsPortalFetcher:
                 }
             )
 
-        return pd.DataFrame(rows)
+        if rows:
+            return pd.DataFrame(rows)
+
+        try:
+            frames = pd.read_html(io.StringIO(html))
+        except Exception:
+            return pd.DataFrame()
+        for frame in frames:
+            if frame.empty:
+                continue
+            normalized = self._normalise_table(frame, season_label)
+            if not normalized.empty:
+                return normalized
+
+        return pd.DataFrame()
 
     def _normalise_table(self, frame: pd.DataFrame, season_label: str) -> pd.DataFrame:
         frame = frame.copy()
@@ -5477,7 +5519,18 @@ class MySportsFeedsClient:
     def _request(self, endpoint: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{API_PREFIX_NFL}/{endpoint}"
         logging.debug("Requesting MySportsFeeds endpoint %s", url)
-        resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
+        try:
+            resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
+        except ReadTimeout:
+            logging.warning(
+                "MySportsFeeds request to %s timed out after %ss; returning empty payload",
+                url,
+                self.timeout,
+            )
+            return {}
+        except RequestsConnectionError as exc:
+            logging.warning("MySportsFeeds request to %s failed: %s", url, exc)
+            return {}
         resp.raise_for_status()
         try:
             return resp.json()
