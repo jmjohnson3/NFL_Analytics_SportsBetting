@@ -118,8 +118,6 @@ except Exception:  # pragma: no cover - fallback when bs4 is absent
 
 _BEAUTIFULSOUP_WARNING_EMITTED = False
 
-_BEAUTIFULSOUP_WARNING_EMITTED = False
-
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
 
@@ -1012,38 +1010,99 @@ class OddsPortalFetcher:
             if not isinstance(participants, Tag):
                 continue
 
-            team_links = [link for link in participants.find_all("a", limit=2) if isinstance(link, Tag)]
-            if len(team_links) < 2:
-                continue
+            score_pattern = re.compile(r"^-?\d+$")
 
-            away_link, home_link = team_links[:2]
-
-            def _extract_team(link: "Tag") -> Tuple[str, Optional[float]]:
-                raw_name = (link.get("title") or "").strip()
+            def _extract_team(tag: "Tag") -> Tuple[str, Optional[float]]:
+                raw_name = (tag.get("title") or "").strip()
                 if not raw_name:
-                    name_node = link.find(class_=re.compile("participant-name"))
-                    raw_name = (
-                        name_node.get_text(" ", strip=True)
-                        if isinstance(name_node, Tag)
-                        else link.get_text(" ", strip=True)
-                    )
+                    name_node = tag.find(class_=re.compile("participant-name"))
+                    if isinstance(name_node, Tag):
+                        raw_name = name_node.get_text(" ", strip=True)
+                    elif tag.name == "p" and re.search("participant-name", " ".join(tag.get("class", []))):
+                        raw_name = tag.get_text(" ", strip=True)
+                    else:
+                        raw_name = tag.get_text(" ", strip=True)
+
                 team = normalize_team_abbr(raw_name)
+                if not team:
+                    return "", None
 
                 score_value: Optional[float] = None
-                for token in reversed(list(link.stripped_strings)):
-                    token = token.strip()
-                    if not token:
+                for candidate in tag.find_all(True):
+                    if not isinstance(candidate, Tag):
                         continue
-                    if re.fullmatch(r"\d+", token):
+                    text = candidate.get_text("", strip=True)
+                    if score_pattern.fullmatch(text):
                         try:
-                            score_value = float(token)
+                            score_value = float(text)
                         except ValueError:
                             score_value = None
                         break
+                if score_value is None:
+                    for token in tag.stripped_strings:
+                        text = token.strip()
+                        if score_pattern.fullmatch(text):
+                            try:
+                                score_value = float(text)
+                            except ValueError:
+                                score_value = None
+                            break
+
+                if score_value is None:
+                    sibling = tag
+                    for _ in range(3):
+                        sibling = getattr(sibling, "next_sibling", None)
+                        while isinstance(sibling, str) and not sibling.strip():
+                            sibling = getattr(sibling, "next_sibling", None)
+                        if not isinstance(sibling, Tag):
+                            continue
+                        text = sibling.get_text("", strip=True)
+                        if score_pattern.fullmatch(text):
+                            try:
+                                score_value = float(text)
+                            except ValueError:
+                                score_value = None
+                            break
+                        for token in sibling.stripped_strings:
+                            t = token.strip()
+                            if score_pattern.fullmatch(t):
+                                try:
+                                    score_value = float(t)
+                                except ValueError:
+                                    score_value = None
+                                break
+                        if score_value is not None:
+                            break
+
                 return team, score_value
 
-            away_team, away_score = _extract_team(away_link)
-            home_team, home_score = _extract_team(home_link)
+            teams: List[Tuple[str, Optional[float]]] = []
+            for link in participants.find_all("a"):
+                if not isinstance(link, Tag):
+                    continue
+                team, score = _extract_team(link)
+                if not team:
+                    continue
+                teams.append((team, score))
+                if len(teams) >= 2:
+                    break
+
+            if len(teams) < 2:
+                for name_node in participants.find_all(class_=re.compile("participant-name")):
+                    if not isinstance(name_node, Tag):
+                        continue
+                    team, score = _extract_team(name_node)
+                    if not team:
+                        continue
+                    teams.append((team, score))
+                    if len(teams) >= 2:
+                        break
+
+            if len(teams) < 2:
+                continue
+
+            away_team, away_score = teams[0]
+            home_team, home_score = teams[1]
 
             if not away_team or not home_team:
                 continue
