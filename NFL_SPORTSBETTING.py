@@ -106,6 +106,8 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from urllib.parse import urlencode, urljoin
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util import Retry
 
 try:  # Optional dependency used for HTML parsing when available
@@ -629,6 +631,13 @@ class OddsPortalFetcher:
         self._ssl_failure_logged = False
         self._insecure_adapter_installed = False
 
+        if BeautifulSoup is None:
+            raise RuntimeError(
+                "The beautifulsoup4 package is required to scrape OddsPortal closing odds. "
+                "Install it with 'pip install beautifulsoup4' inside your environment or disable "
+                "OddsPortal scraping in your configuration if you do not need closing odds."
+            )
+
     def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
         frames: List[pd.DataFrame] = []
         for season in seasons:
@@ -796,6 +805,7 @@ class OddsPortalFetcher:
             adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        urllib3.disable_warnings(InsecureRequestWarning)
         self._insecure_adapter_installed = True
 
     def _process_oddsportal_response(
