@@ -779,20 +779,62 @@ class OddsPortalFetcher:
     def _request(self, url: str) -> Optional[str]:
         attempt_insecure = False
 
+        base_headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Referer": self.base_url,
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+        def _build_headers(user_agent: str, *, json_variant: bool) -> Dict[str, str]:
+            headers = dict(base_headers)
+            headers["User-Agent"] = user_agent
+            if json_variant:
+                headers.update(
+                    {
+                        "Accept": "application/json, text/plain, */*",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "x-nextjs-data": "1",
+                    }
+                )
+            else:
+                headers.setdefault("Sec-Fetch-Site", "same-origin")
+                headers.setdefault("Sec-Fetch-Mode", "navigate")
+                headers.setdefault("Sec-Fetch-Dest", "document")
+            return headers
+
         for ua in self.user_agents:
-            headers = {
-                "User-Agent": ua,
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": self.base_url,
-            }
             try:
-                response = self.session.get(url, headers=headers, timeout=self.timeout)
+                response = self.session.get(
+                    url, headers=_build_headers(ua, json_variant=False), timeout=self.timeout
+                )
             except SSLError as exc:
                 logging.error("OddsPortal SSL error for %s: %s", url, exc)
                 attempt_insecure = True
                 break
             except Exception:
                 logging.exception("OddsPortal request error for %s", url)
+                response = None
+
+            if response is not None:
+                result = self._process_oddsportal_response(response, url, insecure=False)
+                if result is not None:
+                    return result
+
+            try:
+                response = self.session.get(
+                    url,
+                    headers=_build_headers(ua, json_variant=True),
+                    timeout=self.timeout,
+                )
+            except SSLError as exc:
+                logging.error("OddsPortal SSL error for %s (JSON variant): %s", url, exc)
+                attempt_insecure = True
+                break
+            except Exception:
+                logging.exception("OddsPortal JSON request error for %s", url)
                 continue
 
             result = self._process_oddsportal_response(response, url, insecure=False)
@@ -814,14 +856,12 @@ class OddsPortalFetcher:
             self._install_insecure_adapter()
             self.session.verify = False
             for ua in self.user_agents:
-                headers = {
-                    "User-Agent": ua,
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": self.base_url,
-                }
                 try:
                     response = self.session.get(
-                        url, headers=headers, timeout=self.timeout, verify=False
+                        url,
+                        headers=_build_headers(ua, json_variant=False),
+                        timeout=self.timeout,
+                        verify=False,
                     )
                 except SSLError as exc:
                     logging.error(
@@ -829,9 +869,32 @@ class OddsPortalFetcher:
                         url,
                         exc,
                     )
-                    continue
+                    response = None
                 except Exception:
                     logging.exception("OddsPortal request error for %s", url)
+                    response = None
+
+                if response is not None:
+                    result = self._process_oddsportal_response(response, url, insecure=True)
+                    if result is not None:
+                        return result
+
+                try:
+                    response = self.session.get(
+                        url,
+                        headers=_build_headers(ua, json_variant=True),
+                        timeout=self.timeout,
+                        verify=False,
+                    )
+                except SSLError as exc:
+                    logging.error(
+                        "OddsPortal SSL error persisted for %s (JSON variant) even with verification disabled: %s",
+                        url,
+                        exc,
+                    )
+                    continue
+                except Exception:
+                    logging.exception("OddsPortal JSON request error for %s", url)
                     continue
 
                 result = self._process_oddsportal_response(response, url, insecure=True)
@@ -1049,6 +1112,7 @@ class OddsPortalFetcher:
 
         html_bytes = len(html)
         legacy_nodes = modern_rows = participant_nodes = next_data_scripts = 0
+        json_like = False
 
         if BeautifulSoup is not None:
             try:
@@ -1067,9 +1131,17 @@ class OddsPortalFetcher:
                     soup.find_all(attrs={"data-testid": "event-participants"})
                 )
                 next_data_scripts = len(soup.find_all(id="__NEXT_DATA__"))
+                if not legacy_nodes and not modern_rows:
+                    snippet = html.lstrip()
+                    json_like = snippet.startswith("{") or snippet.startswith("[")
+                else:
+                    json_like = False
+        else:
+            snippet = html.lstrip()
+            json_like = snippet.startswith("{") or snippet.startswith("[")
 
         logging.info(
-            "OddsPortal parse diagnostics for %s -> %s: html_bytes=%d legacy_nodes=%d modern_rows=%d participant_nodes=%d next_data_scripts=%d",
+            "OddsPortal parse diagnostics for %s -> %s: html_bytes=%d legacy_nodes=%d modern_rows=%d participant_nodes=%d next_data_scripts=%d json_like=%s",
             slug,
             source_url,
             html_bytes,
@@ -1077,6 +1149,7 @@ class OddsPortalFetcher:
             modern_rows,
             participant_nodes,
             next_data_scripts,
+            json_like,
         )
 
         self._debug_dump_html(slug, source_url, html)
@@ -1395,6 +1468,10 @@ class OddsPortalFetcher:
         self, html: str, soup: Optional["BeautifulSoup"]
     ) -> List[str]:
         payloads: List[str] = []
+
+        stripped = html.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            payloads.append(stripped)
 
         if soup is not None:
             for script in soup.find_all("script"):
