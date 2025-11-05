@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
+from html import unescape
 
 import aiohttp
 import numpy as np
@@ -49,7 +50,9 @@ from requests import HTTPError
 from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
 from requests.exceptions import (
+    ConnectionError as RequestsConnectionError,
     JSONDecodeError as RequestsJSONDecodeError,
+    ReadTimeout,
     SSLError,
 )
 from http import HTTPStatus
@@ -104,12 +107,17 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from urllib.parse import urlencode, urljoin
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util import Retry
 
 try:  # Optional dependency used for HTML parsing when available
-    from bs4 import BeautifulSoup  # type: ignore
+    from bs4 import BeautifulSoup, Tag  # type: ignore
 except Exception:  # pragma: no cover - fallback when bs4 is absent
     BeautifulSoup = None  # type: ignore
+    Tag = None  # type: ignore
+
+_BEAUTIFULSOUP_WARNING_EMITTED = False
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -549,6 +557,41 @@ def _decimal_to_american(decimal: Optional[float]) -> Optional[int]:
         return None
 
 
+def _parse_moneyline_text(value: Optional[str]) -> Optional[int]:
+    """Parse an odds string expressed as either American or decimal prices."""
+
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    normalized = text.replace("\xa0", " ")
+    american_match = re.search(r"[+-]\d{2,4}", normalized)
+    if american_match:
+        try:
+            return int(american_match.group(0))
+        except ValueError:
+            return None
+
+    bare_match = re.search(r"\b\d{3,4}\b", normalized)
+    if bare_match:
+        try:
+            candidate = int(bare_match.group(0))
+        except ValueError:
+            candidate = None
+        else:
+            if candidate is not None and candidate >= 100:
+                return candidate
+
+    decimal = _parse_decimal_odds(normalized)
+    if decimal is not None:
+        return _decimal_to_american(decimal)
+
+    return None
+
+
 def _parse_oddsportal_datetime(
     date_text: Optional[str],
     time_text: Optional[str],
@@ -625,6 +668,41 @@ class OddsPortalFetcher:
         self._ssl_failure_logged = False
         self._insecure_adapter_installed = False
 
+        self._debug_dump_enabled = False
+        self._debug_dir: Optional[Path] = None
+        self._debug_dumped_sources: Set[str] = set()
+        self._debug_capture_logged: Set[str] = set()
+        self._no_rows_warned: Set[str] = set()
+
+        debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
+        if str(debug_flag).strip().lower() in {"1", "true", "yes", "on", "debug"}:
+            self._debug_dump_enabled = True
+            debug_dir = os.environ.get("NFL_ODDSPORTAL_DEBUG_DIR")
+            self._debug_dir = (
+                Path(debug_dir).expanduser()
+                if debug_dir
+                else SCRIPT_ROOT / "reports" / "oddsportal_debug"
+            )
+            try:
+                self._debug_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                logging.exception(
+                    "Unable to create OddsPortal debug directory at %s", self._debug_dir
+                )
+                self._debug_dump_enabled = False
+            else:
+                logging.warning(
+                    "NFL_ODDSPORTAL_DEBUG_HTML enabled; raw OddsPortal pages will be written to %s",
+                    self._debug_dir,
+                )
+
+        if BeautifulSoup is None:
+            raise RuntimeError(
+                "The beautifulsoup4 package is required to scrape OddsPortal closing odds. "
+                "Install it with 'pip install beautifulsoup4' inside your environment or disable "
+                "OddsPortal scraping in your configuration if you do not need closing odds."
+            )
+
     def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
         frames: List[pd.DataFrame] = []
         for season in seasons:
@@ -680,6 +758,8 @@ class OddsPortalFetcher:
         parsed = self._parse_results_page(html, season_label)
         if not _is_effectively_empty_df(parsed):
             frames.append(parsed)
+        else:
+            self._debug_capture_failure(slug, html, source_url=url)
 
         for page_url in self._discover_additional_pages(url, html):
             page_html = self._request(page_url)
@@ -688,26 +768,73 @@ class OddsPortalFetcher:
             chunk = self._parse_results_page(page_html, season_label)
             if not _is_effectively_empty_df(chunk):
                 frames.append(chunk)
+            else:
+                self._debug_capture_failure(slug, page_html, source_url=page_url)
 
-        return safe_concat(frames, ignore_index=True)
+        result = safe_concat(frames, ignore_index=True)
+        if _is_effectively_empty_df(result):
+            self._debug_warn_no_rows(slug, season_label, url)
+        return result
 
     def _request(self, url: str) -> Optional[str]:
         attempt_insecure = False
 
+        base_headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Referer": self.base_url,
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+        def _build_headers(user_agent: str, *, json_variant: bool) -> Dict[str, str]:
+            headers = dict(base_headers)
+            headers["User-Agent"] = user_agent
+            if json_variant:
+                headers.update(
+                    {
+                        "Accept": "application/json, text/plain, */*",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "x-nextjs-data": "1",
+                    }
+                )
+            else:
+                headers.setdefault("Sec-Fetch-Site", "same-origin")
+                headers.setdefault("Sec-Fetch-Mode", "navigate")
+                headers.setdefault("Sec-Fetch-Dest", "document")
+            return headers
+
         for ua in self.user_agents:
-            headers = {
-                "User-Agent": ua,
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": self.base_url,
-            }
             try:
-                response = self.session.get(url, headers=headers, timeout=self.timeout)
+                response = self.session.get(
+                    url, headers=_build_headers(ua, json_variant=False), timeout=self.timeout
+                )
             except SSLError as exc:
                 logging.error("OddsPortal SSL error for %s: %s", url, exc)
                 attempt_insecure = True
                 break
             except Exception:
                 logging.exception("OddsPortal request error for %s", url)
+                response = None
+
+            if response is not None:
+                result = self._process_oddsportal_response(response, url, insecure=False)
+                if result is not None:
+                    return result
+
+            try:
+                response = self.session.get(
+                    url,
+                    headers=_build_headers(ua, json_variant=True),
+                    timeout=self.timeout,
+                )
+            except SSLError as exc:
+                logging.error("OddsPortal SSL error for %s (JSON variant): %s", url, exc)
+                attempt_insecure = True
+                break
+            except Exception:
+                logging.exception("OddsPortal JSON request error for %s", url)
                 continue
 
             result = self._process_oddsportal_response(response, url, insecure=False)
@@ -729,14 +856,12 @@ class OddsPortalFetcher:
             self._install_insecure_adapter()
             self.session.verify = False
             for ua in self.user_agents:
-                headers = {
-                    "User-Agent": ua,
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": self.base_url,
-                }
                 try:
                     response = self.session.get(
-                        url, headers=headers, timeout=self.timeout, verify=False
+                        url,
+                        headers=_build_headers(ua, json_variant=False),
+                        timeout=self.timeout,
+                        verify=False,
                     )
                 except SSLError as exc:
                     logging.error(
@@ -744,9 +869,32 @@ class OddsPortalFetcher:
                         url,
                         exc,
                     )
-                    continue
+                    response = None
                 except Exception:
                     logging.exception("OddsPortal request error for %s", url)
+                    response = None
+
+                if response is not None:
+                    result = self._process_oddsportal_response(response, url, insecure=True)
+                    if result is not None:
+                        return result
+
+                try:
+                    response = self.session.get(
+                        url,
+                        headers=_build_headers(ua, json_variant=True),
+                        timeout=self.timeout,
+                        verify=False,
+                    )
+                except SSLError as exc:
+                    logging.error(
+                        "OddsPortal SSL error persisted for %s (JSON variant) even with verification disabled: %s",
+                        url,
+                        exc,
+                    )
+                    continue
+                except Exception:
+                    logging.exception("OddsPortal JSON request error for %s", url)
                     continue
 
                 result = self._process_oddsportal_response(response, url, insecure=True)
@@ -782,9 +930,17 @@ class OddsPortalFetcher:
             allowed_methods=None,
         )
 
-        adapter = HTTPAdapter(max_retries=retry, ssl_context=context)
+        try:
+            adapter = HTTPAdapter(max_retries=retry, ssl_context=context)
+        except TypeError:
+            logging.debug(
+                "requests.HTTPAdapter does not support the ssl_context argument; "
+                "falling back to a legacy-compatible adapter"
+            )
+            adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        urllib3.disable_warnings(InsecureRequestWarning)
         self._insecure_adapter_installed = True
 
     def _process_oddsportal_response(
@@ -828,15 +984,26 @@ class OddsPortalFetcher:
         return sorted(pages)
 
     def _parse_results_page(self, html: str, season_label: str) -> pd.DataFrame:
+        global _BEAUTIFULSOUP_WARNING_EMITTED
         if BeautifulSoup is None:
-            logging.warning(
-                "BeautifulSoup is required to parse OddsPortal pages; install beautifulsoup4"
-            )
+            if not _BEAUTIFULSOUP_WARNING_EMITTED:
+                logging.warning(
+                    "BeautifulSoup is required to parse OddsPortal pages; install beautifulsoup4"
+                )
+                _BEAUTIFULSOUP_WARNING_EMITTED = True
             return pd.DataFrame()
 
         soup = BeautifulSoup(html, "html.parser")
-        table = soup.find("div", class_=re.compile("table-main"))
+        table = soup.find(class_=re.compile(r"\btable-main\b"))
         if table is None:
+            table = soup.find(id=re.compile("tournamentTable", re.IGNORECASE))
+        if table is None:
+            modern_rows = self._parse_modern_results(soup, season_label)
+            if not modern_rows.empty:
+                return modern_rows
+            state_rows = self._parse_embedded_state(html, season_label, soup=soup)
+            if not state_rows.empty:
+                return state_rows
             try:
                 frames = pd.read_html(io.StringIO(html))
             except Exception:
@@ -853,14 +1020,14 @@ class OddsPortalFetcher:
             return pd.DataFrame()
 
         rows: List[Dict[str, Any]] = []
-        current_date: Optional[str] = None
-        for node in table.find_all(recursive=False):
-            node_classes = node.get("class", [])
-            if any(cls.startswith("event__header") for cls in node_classes):
-                current_date = node.get_text(" ", strip=True)
-                continue
-            if not any(cls.startswith("event__match") for cls in node_classes):
-                continue
+        for node in table.find_all(class_=re.compile("event__match")):
+            header = node.find_previous(class_=re.compile("event__header"))
+            current_date = None
+            if header is not None:
+                for ancestor in header.parents:
+                    if ancestor is table:
+                        current_date = header.get_text(" ", strip=True)
+                        break
 
             home_node = node.find(class_=re.compile("event__participant--home"))
             away_node = node.find(class_=re.compile("event__participant--away"))
@@ -873,8 +1040,10 @@ class OddsPortalFetcher:
             scores_node = node.find(class_=re.compile("event__scores"))
             odds_nodes = node.find_all(class_=re.compile("(odd|odds)"))
 
-            kickoff = _parse_oddsportal_datetime(current_date, time_node.get_text(strip=True) if time_node else None)
-            kickoff_str = kickoff.isoformat() if kickoff is not None else ""
+            kickoff = _parse_oddsportal_datetime(
+                current_date,
+                time_node.get_text(strip=True) if time_node else None,
+            )
 
             home_score = away_score = np.nan
             if scores_node:
@@ -909,10 +1078,861 @@ class OddsPortalFetcher:
                 }
             )
 
+        if rows:
+            return pd.DataFrame(rows)
+
+        modern_rows = self._parse_modern_results(soup, season_label)
+        if not modern_rows.empty:
+            return modern_rows
+        state_rows = self._parse_embedded_state(html, season_label, soup=soup)
+        if not state_rows.empty:
+            return state_rows
+
+        try:
+            frames = pd.read_html(io.StringIO(html))
+        except Exception:
+            return pd.DataFrame()
+        for frame in frames:
+            if frame.empty:
+                continue
+            normalized = self._normalise_table(frame, season_label)
+            if not normalized.empty:
+                return normalized
+
+        return pd.DataFrame()
+
+    def _debug_capture_failure(self, slug: str, html: str, *, source_url: str) -> None:
+        if not html:
+            return
+
+        key = f"{slug}|{source_url}"
+        if key in self._debug_capture_logged:
+            return
+        self._debug_capture_logged.add(key)
+
+        html_bytes = len(html)
+        legacy_nodes = modern_rows = participant_nodes = next_data_scripts = 0
+        json_like = False
+
+        if BeautifulSoup is not None:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+            except Exception as exc:
+                logging.debug(
+                    "OddsPortal diagnostics unable to parse HTML for %s (%s): %s",
+                    source_url,
+                    slug,
+                    exc,
+                )
+            else:
+                legacy_nodes = len(soup.find_all(class_=re.compile("event__match")))
+                modern_rows = len(soup.find_all(attrs={"data-testid": "game-row"}))
+                participant_nodes = len(
+                    soup.find_all(attrs={"data-testid": "event-participants"})
+                )
+                next_data_scripts = len(soup.find_all(id="__NEXT_DATA__"))
+                if not legacy_nodes and not modern_rows:
+                    snippet = html.lstrip()
+                    json_like = snippet.startswith("{") or snippet.startswith("[")
+                else:
+                    json_like = False
+        else:
+            snippet = html.lstrip()
+            json_like = snippet.startswith("{") or snippet.startswith("[")
+
+        logging.info(
+            "OddsPortal parse diagnostics for %s -> %s: html_bytes=%d legacy_nodes=%d modern_rows=%d participant_nodes=%d next_data_scripts=%d json_like=%s",
+            slug,
+            source_url,
+            html_bytes,
+            legacy_nodes,
+            modern_rows,
+            participant_nodes,
+            next_data_scripts,
+            json_like,
+        )
+
+        self._debug_dump_html(slug, source_url, html)
+
+    def _debug_dump_html(self, slug: str, source_url: str, html: str) -> None:
+        if not self._debug_dump_enabled or not html or self._debug_dir is None:
+            return
+
+        key = f"{slug}|{source_url}"
+        if key in self._debug_dumped_sources:
+            return
+        self._debug_dumped_sources.add(key)
+
+        timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        safe_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/")) or "root"
+        filename = f"{timestamp}_{safe_slug}.html"
+        path = self._debug_dir / filename
+
+        try:
+            path.write_text(html, encoding="utf-8")
+        except Exception:
+            logging.exception("Failed to write OddsPortal debug HTML to %s", path)
+            self._debug_dump_enabled = False
+            return
+
+        logging.warning(
+            "Saved OddsPortal HTML snapshot to %s for slug %s (%s). Share this file if parsing remains empty.",
+            path,
+            slug,
+            source_url,
+        )
+
+    def _debug_warn_no_rows(self, slug: str, season_label: str, source_url: str) -> None:
+        key = f"{season_label}|{slug}"
+        if key in self._no_rows_warned:
+            return
+
+        self._no_rows_warned.add(key)
+        logging.warning(
+            "OddsPortal parser did not find closing odds for slug %s (season %s, url=%s). Set NFL_ODDSPORTAL_DEBUG_HTML=1 and rerun to capture the raw HTML for troubleshooting.",
+            slug,
+            season_label,
+            source_url,
+        )
+
+    def _parse_modern_results(self, soup: "BeautifulSoup", season_label: str) -> pd.DataFrame:
+        if Tag is None:
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+
+        for node in soup.find_all(attrs={"data-testid": "game-row"}):
+            if not isinstance(node, Tag):
+                continue
+            if node.find_parent(attrs={"data-testid": "game-row"}) is not None:
+                continue
+
+            container = node if node.name != "a" else node.parent
+            if not isinstance(container, Tag):
+                container = node
+
+            participants = container.find(attrs={"data-testid": "event-participants"})
+            if not isinstance(participants, Tag):
+                continue
+
+            score_pattern = re.compile(r"^-?\d+$")
+
+            def _extract_team(tag: "Tag") -> Tuple[str, Optional[float]]:
+                raw_name = (tag.get("title") or "").strip()
+                if not raw_name:
+                    name_node = tag.find(class_=re.compile("participant-name"))
+                    if isinstance(name_node, Tag):
+                        raw_name = name_node.get_text(" ", strip=True)
+                    elif tag.name == "p" and re.search("participant-name", " ".join(tag.get("class", []))):
+                        raw_name = tag.get_text(" ", strip=True)
+                    else:
+                        raw_name = tag.get_text(" ", strip=True)
+
+                team = normalize_team_abbr(raw_name)
+                if not team:
+                    return "", None
+
+                score_value: Optional[float] = None
+                for candidate in tag.find_all(True):
+                    if not isinstance(candidate, Tag):
+                        continue
+                    text = candidate.get_text("", strip=True)
+                    if score_pattern.fullmatch(text):
+                        try:
+                            score_value = float(text)
+                        except ValueError:
+                            score_value = None
+                        break
+                if score_value is None:
+                    for token in tag.stripped_strings:
+                        text = token.strip()
+                        if score_pattern.fullmatch(text):
+                            try:
+                                score_value = float(text)
+                            except ValueError:
+                                score_value = None
+                            break
+
+                if score_value is None:
+                    sibling = tag
+                    for _ in range(3):
+                        sibling = getattr(sibling, "next_sibling", None)
+                        while isinstance(sibling, str) and not sibling.strip():
+                            sibling = getattr(sibling, "next_sibling", None)
+                        if not isinstance(sibling, Tag):
+                            continue
+                        text = sibling.get_text("", strip=True)
+                        if score_pattern.fullmatch(text):
+                            try:
+                                score_value = float(text)
+                            except ValueError:
+                                score_value = None
+                            break
+                        for token in sibling.stripped_strings:
+                            t = token.strip()
+                            if score_pattern.fullmatch(t):
+                                try:
+                                    score_value = float(t)
+                                except ValueError:
+                                    score_value = None
+                                break
+                        if score_value is not None:
+                            break
+
+                return team, score_value
+
+            teams: List[Tuple[str, Optional[float]]] = []
+            for link in participants.find_all("a"):
+                if not isinstance(link, Tag):
+                    continue
+                team, score = _extract_team(link)
+                if not team:
+                    continue
+                teams.append((team, score))
+                if len(teams) >= 2:
+                    break
+
+            if len(teams) < 2:
+                for name_node in participants.find_all(class_=re.compile("participant-name")):
+                    if not isinstance(name_node, Tag):
+                        continue
+                    team, score = _extract_team(name_node)
+                    if not team:
+                        continue
+                    teams.append((team, score))
+                    if len(teams) >= 2:
+                        break
+
+            if len(teams) < 2:
+                continue
+
+            away_team, away_score = teams[0]
+            home_team, home_score = teams[1]
+
+            if not away_team or not home_team:
+                continue
+
+            time_node = container.find(attrs={"data-testid": "time-item"})
+            time_text = (
+                time_node.get_text(" ", strip=True)
+                if isinstance(time_node, Tag)
+                else None
+            )
+
+            date_text = self._find_associated_date(container)
+            kickoff = _parse_oddsportal_datetime(date_text, time_text)
+
+            odds_values: List[int] = []
+            for odd_container in container.find_all(
+                attrs={"data-testid": re.compile("^odd-container", re.IGNORECASE)}
+            ):
+                if not isinstance(odd_container, Tag):
+                    continue
+                price = _parse_moneyline_text(odd_container.get_text(" ", strip=True))
+                if price is None:
+                    continue
+                odds_values.append(price)
+                if len(odds_values) >= 2:
+                    break
+
+            away_moneyline = odds_values[0] if odds_values else None
+            home_moneyline = odds_values[1] if len(odds_values) > 1 else None
+
+            rows.append(
+                {
+                    "season": season_label,
+                    "week": np.nan,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_closing_moneyline": home_moneyline,
+                    "away_closing_moneyline": away_moneyline,
+                    "closing_bookmaker": "OddsPortal",
+                    "closing_line_time": kickoff,
+                    "kickoff_utc": kickoff,
+                    "kickoff_date": kickoff.strftime("%Y-%m-%d") if kickoff else "",
+                    "kickoff_weekday": kickoff.strftime("%a") if kickoff else "",
+                    "home_score": home_score if home_score is not None else np.nan,
+                    "away_score": away_score if away_score is not None else np.nan,
+                }
+            )
+
+        if not rows:
+            return pd.DataFrame()
+
         return pd.DataFrame(rows)
+
+    def _parse_embedded_state(
+        self,
+        html: str,
+        season_label: str,
+        *,
+        soup: Optional["BeautifulSoup"] = None,
+    ) -> pd.DataFrame:
+        if BeautifulSoup is None:
+            return pd.DataFrame()
+
+        if soup is None:
+            soup = BeautifulSoup(html, "html.parser")
+
+        payloads = self._extract_json_payloads(html, soup)
+        if not payloads:
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+        seen: Set[Tuple[Any, ...]] = set()
+
+        for payload in payloads:
+            data = self._safe_json_loads(payload)
+            if data is None:
+                continue
+
+            name_cache: Dict[int, Optional[str]] = {}
+            for ancestors, _, participant_list in self._iter_json_candidate_lists(
+                data, name_cache
+            ):
+                normalized = self._normalise_json_participants(participant_list, name_cache)
+                if len(normalized) < 2:
+                    continue
+
+                valid_entries = [entry for entry in normalized if entry.get("team")]
+                if len({entry["team"] for entry in valid_entries}) < 2:
+                    continue
+
+                has_odds = any(entry.get("moneyline") is not None for entry in valid_entries)
+                if not has_odds:
+                    continue
+
+                home_entry = next((e for e in valid_entries if e.get("is_home") is True), None)
+                away_entry = next((e for e in valid_entries if e.get("is_home") is False), None)
+
+                if home_entry is None or away_entry is None:
+                    ordered = sorted(
+                        valid_entries,
+                        key=lambda item: (
+                            0 if item.get("is_home") is False else 1 if item.get("is_home") is True else 2,
+                            item.get("index", 0),
+                        ),
+                    )
+                    if len(ordered) >= 2:
+                        away_entry, home_entry = ordered[0], ordered[1]
+                    else:
+                        continue
+
+                kickoff = self._extract_json_kickoff(ancestors)
+
+                key = (
+                    home_entry.get("team"),
+                    away_entry.get("team"),
+                    kickoff.isoformat() if isinstance(kickoff, pd.Timestamp) else kickoff,
+                    home_entry.get("moneyline"),
+                    away_entry.get("moneyline"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                rows.append(
+                    {
+                        "season": season_label,
+                        "week": np.nan,
+                        "home_team": home_entry.get("team"),
+                        "away_team": away_entry.get("team"),
+                        "home_closing_moneyline": home_entry.get("moneyline"),
+                        "away_closing_moneyline": away_entry.get("moneyline"),
+                        "closing_bookmaker": "OddsPortal",
+                        "closing_line_time": kickoff,
+                        "kickoff_utc": kickoff,
+                        "kickoff_date": kickoff.strftime("%Y-%m-%d") if isinstance(kickoff, pd.Timestamp) else "",
+                        "kickoff_weekday": kickoff.strftime("%a") if isinstance(kickoff, pd.Timestamp) else "",
+                        "home_score": home_entry.get("score", np.nan),
+                        "away_score": away_entry.get("score", np.nan),
+                    }
+                )
+
+        if not rows:
+            return pd.DataFrame()
+
+        frame = pd.DataFrame(rows)
+        frame["kickoff_utc"] = pd.to_datetime(frame["kickoff_utc"], utc=True, errors="coerce")
+        frame["closing_line_time"] = frame["kickoff_utc"]
+        frame["kickoff_date"] = frame["kickoff_utc"].dt.strftime("%Y-%m-%d").fillna("")
+        frame["kickoff_weekday"] = frame["kickoff_utc"].dt.strftime("%a").fillna("")
+        frame["home_score"] = pd.to_numeric(frame["home_score"], errors="coerce")
+        frame["away_score"] = pd.to_numeric(frame["away_score"], errors="coerce")
+        frame["home_score"] = frame["home_score"].where(frame["home_score"].notna(), np.nan)
+        frame["away_score"] = frame["away_score"].where(frame["away_score"].notna(), np.nan)
+
+        return frame.reset_index(drop=True)
+
+    def _extract_json_payloads(
+        self, html: str, soup: Optional["BeautifulSoup"]
+    ) -> List[str]:
+        payloads: List[str] = []
+
+        stripped = html.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            payloads.append(stripped)
+
+        if soup is not None:
+            for script in soup.find_all("script"):
+                text = script.string or script.get_text()
+                if not text:
+                    continue
+                if script.get("id") == "__NEXT_DATA__":
+                    payloads.append(text)
+                    continue
+                snippet = text.strip()
+                if any(token in snippet for token in ("__NEXT_DATA__", "__NUXT__", "eventGroup")):
+                    payloads.append(snippet)
+
+        patterns = [
+            r"<script[^>]+id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>",
+            r"window\.__NEXT_DATA__\s*=\s*(\{.*?\})\s*;",
+            r"window\.__NUXT__\s*=\s*(\{.*?\})\s*;",
+            r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;",
+            r"data-state=(?:\"|\')(\{.*?\})(?:\"|\')",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, html, flags=re.DOTALL):
+                payloads.append(match.group(1))
+
+        unique: List[str] = []
+        seen: Set[str] = set()
+        for payload in payloads:
+            if not payload:
+                continue
+            cleaned = unescape(payload).strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            unique.append(cleaned)
+
+        return unique
+
+    def _safe_json_loads(self, payload: str) -> Optional[Any]:
+        text = (payload or "").strip()
+        if not text:
+            return None
+
+        text = unescape(text)
+        text = text.strip()
+
+        for prefix in ("window.__NEXT_DATA__", "window.__NUXT__", "window.__INITIAL_STATE__"):
+            if text.startswith(prefix):
+                parts = text.split("=", 1)
+                text = parts[1] if len(parts) == 2 else ""
+                break
+
+        text = text.strip()
+        if text.startswith("export default"):
+            text = text[len("export default") :].strip()
+
+        if text.startswith("const ") or text.startswith("var "):
+            parts = text.split("=", 1)
+            text = parts[1] if len(parts) == 2 else ""
+
+        text = text.strip()
+        if text.endswith(";"):
+            text = text[:-1]
+
+        text = text.strip()
+        if not text:
+            return None
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            sanitized = re.sub(r"//.*?$", "", text, flags=re.MULTILINE).strip()
+            sanitized = sanitized.strip(";")
+            if not sanitized:
+                return None
+            try:
+                return json.loads(sanitized)
+            except json.JSONDecodeError:
+                return None
+
+    def _iter_json_candidate_lists(
+        self, data: Any, name_cache: Dict[int, Optional[str]]
+    ) -> Iterable[Tuple[List[Dict[str, Any]], Optional[str], List[Dict[str, Any]]]]:
+        if not isinstance(data, (dict, list)):
+            return []
+
+        visited_lists: Set[int] = set()
+        stack: List[Tuple[List[Dict[str, Any]], Any]] = [([], data)]
+
+        while stack:
+            ancestors, node = stack.pop()
+
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if isinstance(value, list):
+                        if id(value) not in visited_lists:
+                            visited_lists.add(id(value))
+                            if self._looks_like_participant_list(value, name_cache):
+                                yield ancestors + [node], key, value  # type: ignore[arg-type]
+                            stack.append((ancestors + [node], value))
+                    elif isinstance(value, (dict, list)):
+                        stack.append((ancestors + [node], value))
+            elif isinstance(node, list):
+                for item in node:
+                    stack.append((ancestors, item))
+
+    def _looks_like_participant_list(
+        self, value: Sequence[Any], name_cache: Dict[int, Optional[str]]
+    ) -> bool:
+        if not isinstance(value, Sequence) or len(value) < 2:
+            return False
+
+        dict_count = sum(1 for item in value if isinstance(item, dict))
+        if dict_count < 2:
+            return False
+
+        identified = 0
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            name = self._extract_json_team_name(item, name_cache)
+            if name:
+                identified += 1
+            if identified >= 2:
+                return True
+
+        return False
+
+    def _normalise_json_participants(
+        self, entries: Sequence[Any], name_cache: Dict[int, Optional[str]]
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+
+            name = self._extract_json_team_name(entry, name_cache)
+            if not name:
+                continue
+
+            team = normalize_team_abbr(name)
+            if not team:
+                continue
+
+            normalized.append(
+                {
+                    "team": team,
+                    "is_home": self._infer_json_home_indicator(entry),
+                    "moneyline": self._extract_json_odds(entry),
+                    "score": self._extract_json_score(entry),
+                    "index": index,
+                }
+            )
+
+        return normalized
+
+    def _extract_json_team_name(
+        self, node: Any, cache: Dict[int, Optional[str]]
+    ) -> Optional[str]:
+        queue: List[Any] = [node]
+        seen: Set[int] = set()
+
+        while queue:
+            current = queue.pop(0)
+            node_id = id(current)
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+
+            if node_id in cache:
+                cached = cache[node_id]
+                if cached:
+                    return cached
+                continue
+
+            if isinstance(current, dict):
+                for key, value in current.items():
+                    lower = str(key).lower()
+                    if any(
+                        token in lower
+                        for token in (
+                            "name",
+                            "team",
+                            "participant",
+                            "competitor",
+                            "club",
+                            "title",
+                            "slug",
+                            "abbr",
+                            "abbreviation",
+                        )
+                    ):
+                        if isinstance(value, str):
+                            cleaned = value.strip()
+                            if cleaned and any(ch.isalpha() for ch in cleaned):
+                                cache[node_id] = cleaned
+                                return cleaned
+                        elif isinstance(value, (dict, list)):
+                            queue.append(value)
+                            continue
+                    if isinstance(value, (dict, list)):
+                        queue.append(value)
+
+                cache[node_id] = None
+
+            elif isinstance(current, list):
+                queue.extend(current)
+
+        return None
+
+    def _infer_json_home_indicator(self, entry: Dict[str, Any]) -> Optional[bool]:
+        for key, value in entry.items():
+            lower = str(key).lower()
+            if lower in {"ishome", "home"}:
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    if value == 1:
+                        return True
+                    if value == 0 or value == -1:
+                        return False
+                if isinstance(value, str):
+                    token = value.strip().lower()
+                    if token.startswith("home") or token in {"h", "host"}:
+                        return True
+                    if token.startswith("away") or token in {"a", "visitor", "road", "guest"}:
+                        return False
+
+        for key in (
+            "homeAway",
+            "home_away",
+            "homeAwayTeam",
+            "qualifier",
+            "alignment",
+            "side",
+            "designation",
+            "teamType",
+            "teamRole",
+            "venueType",
+        ):
+            if key not in entry:
+                continue
+            value = entry[key]
+            if isinstance(value, str):
+                token = value.strip().lower()
+                if "home" in token and "away" not in token:
+                    return True
+                if any(tag in token for tag in ("away", "road", "guest", "visitor")):
+                    return False
+            elif isinstance(value, dict):
+                nested = value.get("value") or value.get("label") or value.get("name")
+                if isinstance(nested, str):
+                    nested_token = nested.strip().lower()
+                    if "home" in nested_token and "away" not in nested_token:
+                        return True
+                    if any(tag in nested_token for tag in ("away", "road", "guest", "visitor")):
+                        return False
+
+        indicator = entry.get("isHome")
+        if isinstance(indicator, bool):
+            return indicator
+
+        return None
+
+    def _extract_json_odds(self, entry: Dict[str, Any]) -> Optional[int]:
+        candidates: List[Tuple[bool, Optional[int]]] = []
+
+        def visit(node: Any, *, keyed: bool = False) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    is_odds_key = any(
+                        token in lower
+                        for token in (
+                            "american",
+                            "moneyline",
+                            "money_line",
+                            "price",
+                            "odds",
+                            "us",
+                        )
+                    )
+                    if isinstance(value, (str, int, float)) and is_odds_key:
+                        price = _parse_moneyline_text(str(value))
+                        candidates.append((True, price))
+                    elif isinstance(value, (dict, list)):
+                        visit(value, keyed=is_odds_key or keyed)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item, keyed=keyed)
+            elif keyed and isinstance(node, (str, int, float)):
+                price = _parse_moneyline_text(str(node))
+                candidates.append((False, price))
+
+        visit(entry)
+
+        for keyed, price in candidates:
+            if price is not None:
+                return price
+
+        return None
+
+    def _extract_json_score(self, entry: Dict[str, Any]) -> Optional[float]:
+        values: List[float] = []
+
+        def visit(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    if any(token in lower for token in ("score", "points", "result")):
+                        if isinstance(value, (int, float)):
+                            values.append(float(value))
+                        elif isinstance(value, str):
+                            match = re.search(r"-?\d+(?:\.\d+)?", value)
+                            if match:
+                                try:
+                                    values.append(float(match.group(0)))
+                                except ValueError:
+                                    pass
+                        elif isinstance(value, (dict, list)):
+                            visit(value)
+                    elif isinstance(value, (dict, list)):
+                        visit(value)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item)
+
+        visit(entry)
+
+        return values[0] if values else None
+
+    def _extract_json_kickoff(self, ancestors: Sequence[Dict[str, Any]]) -> Optional[pd.Timestamp]:
+        for container in reversed(ancestors):
+            if not isinstance(container, dict):
+                continue
+            for key, value in container.items():
+                lower = str(key).lower()
+                if any(
+                    token in lower
+                    for token in (
+                        "start",
+                        "kickoff",
+                        "commence",
+                        "date",
+                        "time",
+                        "begin",
+                        "eventtime",
+                        "timestamp",
+                    )
+                ):
+                    timestamp = self._convert_json_datetime(value)
+                    if timestamp is not None:
+                        return timestamp
+
+        return None
+
+    def _convert_json_datetime(self, value: Any) -> Optional[pd.Timestamp]:
+        if value is None:
+            return None
+
+        if isinstance(value, pd.Timestamp):
+            return value.tz_convert("UTC") if value.tzinfo else value.tz_localize("UTC")
+
+        if isinstance(value, (int, float)):
+            if value > 1e12:
+                timestamp = pd.to_datetime(value, unit="ms", utc=True, errors="coerce")
+            else:
+                timestamp = pd.to_datetime(value, unit="s", utc=True, errors="coerce")
+            if pd.notna(timestamp):
+                return timestamp
+            return None
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                timestamp = pd.to_datetime(text, utc=True, errors="coerce")
+            except Exception:
+                timestamp = pd.NaT
+            if pd.notna(timestamp):
+                return timestamp
+            digits = re.sub(r"\D", "", text)
+            if digits:
+                try:
+                    numeric = int(digits)
+                except ValueError:
+                    numeric = None
+                if numeric is not None:
+                    if len(digits) >= 13:
+                        timestamp = pd.to_datetime(numeric, unit="ms", utc=True, errors="coerce")
+                    else:
+                        timestamp = pd.to_datetime(numeric, unit="s", utc=True, errors="coerce")
+                    if pd.notna(timestamp):
+                        return timestamp
+
+        if isinstance(value, dict):
+            for key in ("iso", "utc", "value", "timestamp"):
+                if key in value:
+                    candidate = self._convert_json_datetime(value[key])
+                    if candidate is not None:
+                        return candidate
+
+        return None
+
+    def _find_associated_date(self, node: "Tag") -> Optional[str]:
+        if Tag is None:
+            return None
+
+        date_pattern = re.compile(r"(date|day|header)", re.IGNORECASE)
+        month_pattern = re.compile(
+            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)", re.IGNORECASE
+        )
+
+        current: Optional[Tag] = node
+        while current is not None:
+            sibling = current.previous_sibling
+            while sibling is not None:
+                if isinstance(sibling, Tag):
+                    if sibling.has_attr("data-testid") and date_pattern.search(
+                        str(sibling["data-testid"])
+                    ):
+                        text = sibling.get_text(" ", strip=True)
+                        if text:
+                            return text
+                    if sibling.get("class") and any(
+                        date_pattern.search(str(cls)) for cls in sibling.get("class", [])
+                    ):
+                        text = sibling.get_text(" ", strip=True)
+                        if text:
+                            return text
+                    text = sibling.get_text(" ", strip=True)
+                    if text and (
+                        month_pattern.search(text)
+                        or re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", text)
+                    ):
+                        return text
+                sibling = getattr(sibling, "previous_sibling", None)
+            current = current.parent if isinstance(getattr(current, "parent", None), Tag) else None
+
+        for candidate in node.find_all_previous(True, limit=25):
+            if not isinstance(candidate, Tag):
+                continue
+            text = candidate.get_text(" ", strip=True)
+            if not text:
+                continue
+            if month_pattern.search(text) or re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", text):
+                return text
+
+        return None
 
     def _normalise_table(self, frame: pd.DataFrame, season_label: str) -> pd.DataFrame:
         frame = frame.copy()
+        if isinstance(frame.columns, pd.MultiIndex):
+            frame.columns = [
+                " ".join(str(part) for part in col if str(part) != "nan").strip()
+                for col in frame.columns
+            ]
+        frame = frame.loc[:, ~frame.columns.astype(str).str.contains(r"^Unnamed", case=False)]
+        frame.columns = [str(col).strip() for col in frame.columns]
+
         lower_cols = {col.lower(): col for col in frame.columns}
         home_col = None
         away_col = None
@@ -924,8 +1944,39 @@ class OddsPortalFetcher:
             if key in lower_cols:
                 away_col = lower_cols[key]
                 break
+
+        match_col = None
         if not home_col or not away_col:
-            return pd.DataFrame()
+            for key in ("match", "event", "teams", "matchup", "home - away"):
+                if key in lower_cols:
+                    match_col = lower_cols[key]
+                    break
+            if match_col is None:
+                for col in frame.columns:
+                    sample = (
+                        frame[col]
+                        .astype(str)
+                        .str.contains(r"\b(vs|vs\.|@| - | – | v )\b", case=False, regex=True)
+                    )
+                    if sample.any():
+                        match_col = col
+                        break
+
+        odds_columns: List[str] = []
+        for col in frame.columns:
+            parsed = frame[col].apply(lambda val: _parse_decimal_odds(str(val)))
+            if parsed.notna().sum() >= max(1, int(len(frame) * 0.4)):
+                odds_columns.append(col)
+        if not odds_columns:
+            odds_columns = [
+                col
+                for col in frame.columns
+                if frame[col]
+                .astype(str)
+                .str.contains(r"\d\.\d", regex=True)
+                .sum()
+                >= max(1, int(len(frame) * 0.4))
+            ]
 
         home_decimal = None
         away_decimal = None
@@ -938,29 +1989,68 @@ class OddsPortalFetcher:
                 away_decimal = lower_cols[key]
                 break
 
+        if home_decimal is None and odds_columns:
+            home_decimal = odds_columns[0]
+        if away_decimal is None and len(odds_columns) >= 2:
+            away_decimal = odds_columns[1]
+
+        def _split_teams(value: Any) -> Tuple[str, str]:
+            text = str(value or "").strip()
+            separators = [" - ", " – ", " vs ", " vs. ", " v ", " @ "]
+            for sep in separators:
+                if sep in text:
+                    parts = [part.strip() for part in text.split(sep, 1)]
+                    if len(parts) == 2:
+                        return parts[0], parts[1]
+            tokens = re.split(r"\s+vs\.?\s+|\s+@\s+", text, maxsplit=1, flags=re.IGNORECASE)
+            if len(tokens) == 2:
+                return tokens[0].strip(), tokens[1].strip()
+            return "", ""
+
+        if match_col and (not home_col or not away_col):
+            extracted = frame[match_col].apply(_split_teams)
+            frame["__home"] = extracted.apply(lambda pair: pair[0])
+            frame["__away"] = extracted.apply(lambda pair: pair[1])
+            home_col = home_col or "__home"
+            away_col = away_col or "__away"
+
+        if not home_col or not away_col:
+            return pd.DataFrame()
+
         result = pd.DataFrame()
         result["season"] = season_label
         result["week"] = np.nan
         result["home_team"] = frame[home_col].apply(normalize_team_abbr)
         result["away_team"] = frame[away_col].apply(normalize_team_abbr)
-        if home_decimal and home_decimal in frame.columns:
-            result["home_closing_moneyline"] = frame[home_decimal].apply(
+
+        def _convert_series(col: Optional[str]) -> pd.Series:
+            if not col or col not in frame.columns:
+                return pd.Series(np.nan, index=frame.index)
+            return frame[col].apply(
                 lambda val: _decimal_to_american(_parse_decimal_odds(str(val)))
             )
-        else:
-            result["home_closing_moneyline"] = np.nan
-        if away_decimal and away_decimal in frame.columns:
-            result["away_closing_moneyline"] = frame[away_decimal].apply(
-                lambda val: _decimal_to_american(_parse_decimal_odds(str(val)))
-            )
-        else:
-            result["away_closing_moneyline"] = np.nan
+
+        result["home_closing_moneyline"] = _convert_series(home_decimal)
+        result["away_closing_moneyline"] = _convert_series(away_decimal)
         result["closing_bookmaker"] = "OddsPortal"
         result["closing_line_time"] = pd.NaT
         result["kickoff_utc"] = pd.NaT
         result["kickoff_date"] = ""
         result["kickoff_weekday"] = ""
-        return result
+        result["home_score"] = np.nan
+        result["away_score"] = np.nan
+
+        score_col = None
+        for key in ("score", "result", "ft", "full time"):
+            if key in lower_cols:
+                score_col = lower_cols[key]
+                break
+        if score_col and score_col in frame.columns:
+            scores = frame[score_col].astype(str).apply(lambda text: re.findall(r"\d+", text))
+            result["home_score"] = scores.apply(lambda vals: float(vals[0]) if len(vals) >= 1 else np.nan)
+            result["away_score"] = scores.apply(lambda vals: float(vals[1]) if len(vals) >= 2 else np.nan)
+
+        return result.reset_index(drop=True)
 
 
 def _season_param_from_label(label: str) -> Optional[str]:
@@ -5477,7 +6567,18 @@ class MySportsFeedsClient:
     def _request(self, endpoint: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{API_PREFIX_NFL}/{endpoint}"
         logging.debug("Requesting MySportsFeeds endpoint %s", url)
-        resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
+        try:
+            resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
+        except ReadTimeout:
+            logging.warning(
+                "MySportsFeeds request to %s timed out after %ss; returning empty payload",
+                url,
+                self.timeout,
+            )
+            return {}
+        except RequestsConnectionError as exc:
+            logging.warning("MySportsFeeds request to %s failed: %s", url, exc)
+            return {}
         resp.raise_for_status()
         try:
             return resp.json()
