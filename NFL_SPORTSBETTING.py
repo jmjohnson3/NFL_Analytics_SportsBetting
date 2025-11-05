@@ -1126,10 +1126,8 @@ class OddsPortalFetcher:
                 )
             else:
                 legacy_nodes = len(soup.find_all(class_=re.compile("event__match")))
-                modern_rows = len(soup.find_all(attrs={"data-testid": "game-row"}))
-                participant_nodes = len(
-                    soup.find_all(attrs={"data-testid": "event-participants"})
-                )
+                modern_rows = len(self._find_by_testid(soup, "game-row"))
+                participant_nodes = len(self._find_by_testid(soup, "event-participants"))
                 next_data_scripts = len(soup.find_all(id="__NEXT_DATA__"))
                 if not legacy_nodes and not modern_rows:
                     snippet = html.lstrip()
@@ -1195,23 +1193,98 @@ class OddsPortalFetcher:
             source_url,
         )
 
+    def _tag_testid_values(self, tag: "Tag") -> Sequence[str]:
+        values: List[str] = []
+        if not isinstance(tag, Tag):
+            return values
+
+        for attr, raw_value in tag.attrs.items():
+            try:
+                attr_name = str(attr).lower()
+            except Exception:
+                continue
+
+            if not attr_name.startswith("data-test"):
+                continue
+
+            def _append(value: Any) -> None:
+                if value is None:
+                    return
+                if isinstance(value, (list, tuple, set)):
+                    for item in value:
+                        _append(item)
+                else:
+                    try:
+                        values.append(str(value))
+                    except Exception:
+                        pass
+
+            _append(raw_value)
+
+        return values
+
+    def _tag_has_testid(self, tag: "Tag", targets: Sequence[str]) -> bool:
+        if not isinstance(tag, Tag):
+            return False
+
+        normalized_targets = [t.strip().lower() for t in targets if t]
+        if not normalized_targets:
+            return False
+
+        for value in self._tag_testid_values(tag):
+            token = value.strip().lower()
+            if not token:
+                continue
+            for target in normalized_targets:
+                if not target:
+                    continue
+                if token == target:
+                    return True
+                if token.startswith(target):
+                    return True
+                if target in token:
+                    return True
+        return False
+
+    def _find_by_testid(self, root: "BeautifulSoup", *targets: str) -> List["Tag"]:
+        if BeautifulSoup is None or Tag is None:
+            return []
+
+        normalized_targets = [t for t in targets if t]
+
+        def matcher(node: Any) -> bool:
+            return self._tag_has_testid(node, normalized_targets)
+
+        return list(root.find_all(matcher)) if normalized_targets else []
+
     def _parse_modern_results(self, soup: "BeautifulSoup", season_label: str) -> pd.DataFrame:
         if Tag is None:
             return pd.DataFrame()
 
         rows: List[Dict[str, Any]] = []
 
-        for node in soup.find_all(attrs={"data-testid": "game-row"}):
+        for node in self._find_by_testid(soup, "game-row"):
             if not isinstance(node, Tag):
                 continue
-            if node.find_parent(attrs={"data-testid": "game-row"}) is not None:
+
+            parent = node.parent
+            skip = False
+            while isinstance(parent, Tag):
+                if self._tag_has_testid(parent, ["game-row"]):
+                    skip = True
+                    break
+                parent = parent.parent
+            if skip:
                 continue
 
             container = node if node.name != "a" else node.parent
             if not isinstance(container, Tag):
                 container = node
 
-            participants = container.find(attrs={"data-testid": "event-participants"})
+            participants = None
+            for candidate in self._find_by_testid(container, "event-participants"):
+                participants = candidate
+                break
             if not isinstance(participants, Tag):
                 continue
 
@@ -1312,7 +1385,10 @@ class OddsPortalFetcher:
             if not away_team or not home_team:
                 continue
 
-            time_node = container.find(attrs={"data-testid": "time-item"})
+            time_node: Optional[Tag] = None
+            for candidate in self._find_by_testid(container, "time-item"):
+                time_node = candidate
+                break
             time_text = (
                 time_node.get_text(" ", strip=True)
                 if isinstance(time_node, Tag)
@@ -1323,10 +1399,16 @@ class OddsPortalFetcher:
             kickoff = _parse_oddsportal_datetime(date_text, time_text)
 
             odds_values: List[int] = []
-            for odd_container in container.find_all(
-                attrs={"data-testid": re.compile("^odd-container", re.IGNORECASE)}
-            ):
+            for odd_container in container.find_all(True):
                 if not isinstance(odd_container, Tag):
+                    continue
+                if not (
+                    self._tag_has_testid(odd_container, ["odd-container"])
+                    or any(
+                        str(attr or "").lower().startswith("data-odd-container")
+                        for attr in odd_container.attrs.keys()
+                    )
+                ):
                     continue
                 price = _parse_moneyline_text(odd_container.get_text(" ", strip=True))
                 if price is None:
@@ -1891,9 +1973,17 @@ class OddsPortalFetcher:
             sibling = current.previous_sibling
             while sibling is not None:
                 if isinstance(sibling, Tag):
-                    if sibling.has_attr("data-testid") and date_pattern.search(
-                        str(sibling["data-testid"])
-                    ):
+                    match_found = False
+                    if sibling.has_attr("data-testid"):
+                        attr_val = str(sibling.get("data-testid", ""))
+                        if date_pattern.search(attr_val):
+                            match_found = True
+                    if not match_found:
+                        for value in self._tag_testid_values(sibling):
+                            if date_pattern.search(value):
+                                match_found = True
+                                break
+                    if match_found:
                         text = sibling.get_text(" ", strip=True)
                         if text:
                             return text
