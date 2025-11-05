@@ -199,7 +199,14 @@ AWAY_TEAM_COLUMN_CANDIDATES = [
 ]
 TEAM_COLUMN_CANDIDATES = ["team", "team_name", "club", "squad"]
 OPPONENT_COLUMN_CANDIDATES = ["opponent", "opp", "opp_name", "opponent_name"]
-SITE_COLUMN_CANDIDATES = ["site", "homeaway", "home_away", "ha", "venue_type"]
+SITE_COLUMN_CANDIDATES = [
+    "site",
+    "homeaway",
+    "home_away",
+    "ha",
+    "venue_type",
+    "location",
+]
 DATE_COLUMN_CANDIDATES = ["date", "game_date", "start_date", "schedule_date"]
 TIME_COLUMN_CANDIDATES = ["time", "start_time", "game_time", "kickoff", "kickoff_time"]
 HOME_MONEYLINE_COLUMN_CANDIDATES = [
@@ -230,6 +237,7 @@ AWAY_MONEYLINE_COLUMN_CANDIDATES = [
 TEAM_MONEYLINE_COLUMN_CANDIDATES = [
     "ml",
     "moneyline",
+    "money_line",
     "close_ml",
     "team_ml",
     "team_moneyline",
@@ -492,6 +500,86 @@ def _normalize_historical_closing_frame(
 
 
 
+def _infer_regular_season_label_from_timestamp(value: Any) -> Optional[str]:
+    """Infer an NFL regular-season label (e.g. ``2025-regular``) from a date."""
+
+    if value is None:
+        return None
+
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if isinstance(timestamp, pd.DatetimeIndex):
+        if len(timestamp) == 0:
+            return None
+        timestamp = timestamp[0]
+    if pd.isna(timestamp):
+        return None
+
+    try:
+        year = int(timestamp.year)
+        month = int(timestamp.month)
+    except Exception:
+        return None
+
+    if month < 8:
+        year -= 1
+
+    return f"{year}-regular"
+
+
+def _standardize_closing_odds_frame(
+    frame: pd.DataFrame,
+    provider_name: str,
+    season_hint: Optional[str] = None,
+) -> pd.DataFrame:
+    """Normalize arbitrary historical closing odds layouts into a standard frame."""
+
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    working = frame.copy()
+    columns = {_canonicalize_column_name(col): col for col in working.columns}
+
+    season_col = _match_column(columns, SEASON_COLUMN_CANDIDATES)
+    if not season_col:
+        date_col = _match_column(columns, DATE_COLUMN_CANDIDATES)
+        if date_col:
+            inferred = pd.to_datetime(working[date_col], errors="coerce")
+            working["season"] = inferred.apply(_infer_regular_season_label_from_timestamp)
+            season_col = "season"
+        elif season_hint:
+            working["season"] = season_hint
+            season_col = "season"
+
+    if season_col and season_col != "season":
+        working = working.rename(columns={season_col: "season"})
+
+    normalized = _normalize_historical_closing_frame(
+        working, provider_name, season_hint
+    )
+    if normalized.empty:
+        return pd.DataFrame()
+
+    normalized = normalized.copy()
+    normalized["season"] = normalized["season"].astype(str)
+    if "week" in normalized.columns:
+        normalized["week"] = pd.to_numeric(normalized["week"], errors="coerce")
+    if "closing_line_time" in normalized.columns:
+        normalized["closing_line_time"] = pd.to_datetime(
+            normalized["closing_line_time"], errors="coerce", utc=True
+        )
+    else:
+        normalized["closing_line_time"] = pd.NaT
+
+    if "closing_bookmaker" in normalized.columns:
+        normalized["closing_bookmaker"] = normalized["closing_bookmaker"].fillna(
+            provider_name
+        )
+    else:
+        normalized["closing_bookmaker"] = provider_name
+
+    return normalized
+
+
 def _oddsportal_slug_candidates(season_label: str) -> List[str]:
     """Return likely OddsPortal result slugs for a given season label."""
     default_slug = "nfl/results/"
@@ -625,6 +713,55 @@ def _parse_oddsportal_datetime(
         except Exception:
             pass
     return parsed
+
+
+class LocalClosingOddsFetcher:
+    """Load pre-downloaded closing odds from a local CSV file."""
+
+    def __init__(self, csv_path: Optional[str]) -> None:
+        self.csv_path = Path(csv_path).expanduser() if csv_path else None
+
+    def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
+        if not self.csv_path:
+            logging.warning(
+                "Local closing odds path not configured; set NFL_CLOSING_ODDS_PATH to a CSV file"
+            )
+            return pd.DataFrame()
+
+        try:
+            if not self.csv_path.exists():
+                logging.warning("Local closing odds file %s not found", self.csv_path)
+                return pd.DataFrame()
+        except OSError:
+            logging.exception(
+                "Unable to access local closing odds file at %s", self.csv_path
+            )
+            return pd.DataFrame()
+
+        try:
+            raw = pd.read_csv(self.csv_path)
+        except Exception:
+            logging.exception(
+                "Failed to read closing odds CSV from %s", self.csv_path
+            )
+            return pd.DataFrame()
+
+        normalized = _standardize_closing_odds_frame(raw, "Local CSV")
+        if normalized.empty:
+            logging.warning(
+                "Local closing odds file %s did not produce any usable rows", self.csv_path
+            )
+            return normalized
+
+        normalized = normalized.copy()
+        normalized["season"] = normalized["season"].astype(str)
+        if seasons:
+            wanted = {str(season) for season in seasons}
+            normalized = normalized[normalized["season"].isin(wanted)]
+        if "week" in normalized.columns:
+            normalized["week"] = pd.to_numeric(normalized["week"], errors="coerce")
+
+        return normalized.reset_index(drop=True)
 
 
 class OddsPortalFetcher:
@@ -2322,7 +2459,13 @@ class ClosingOddsArchiveSyncer:
         try:
             seasons = [str(season) for season in self.config.seasons]
 
-            if provider in {"oddsportal", "odds-portal", "op"}:
+            local_provider = False
+
+            if provider in {"local", "csv", "file", "history", "offline"}:
+                fetcher = LocalClosingOddsFetcher(self.config.closing_odds_history_path)
+                provider_name = "Local CSV"
+                local_provider = True
+            elif provider in {"oddsportal", "odds-portal", "op"}:
                 fetcher = OddsPortalFetcher(
                     self.session,
                     base_url=self.config.oddsportal_base_url,
@@ -2357,7 +2500,12 @@ class ClosingOddsArchiveSyncer:
 
             archive = self._attach_game_ids(archive)
             archive = self._finalize_probabilities(archive)
-            self._write_history(provider_name, archive)
+            if local_provider:
+                logging.info(
+                    "Loaded %d closing odds rows from %s", len(archive), self.config.closing_odds_history_path
+                )
+            else:
+                self._write_history(provider_name, archive)
         finally:
             self.session.close()
 
@@ -5630,49 +5778,67 @@ class SupplementalDataLoader:
     def _build_closing_odds_frame(
         self, records: List[Dict[str, Any]]
     ) -> pd.DataFrame:
-        if not records:
-            return pd.DataFrame(
-                columns=[
-                    "game_id",
-                    "season",
-                    "week",
-                    "home_team",
-                    "away_team",
-                    "home_closing_moneyline",
-                    "away_closing_moneyline",
-                    "home_closing_implied_prob",
-                    "away_closing_implied_prob",
-                    "closing_bookmaker",
-                    "closing_line_time",
-                ]
-            )
-
-        frame = pd.DataFrame(records)
-        for col in ["game_id", "season", "week"]:
-            if col not in frame.columns:
-                frame[col] = None
-        frame["home_team"] = frame["home_team"].apply(normalize_team_abbr)
-        frame["away_team"] = frame["away_team"].apply(normalize_team_abbr)
-        frame["season"] = frame["season"].astype(str)
-        if "week" in frame.columns:
-            frame["week"] = frame["week"].apply(lambda x: int(x) if pd.notna(x) else None)
-        numeric_cols = [
+        columns = [
+            "game_id",
+            "season",
+            "week",
+            "home_team",
+            "away_team",
             "home_closing_moneyline",
             "away_closing_moneyline",
             "home_closing_implied_prob",
             "away_closing_implied_prob",
+            "closing_bookmaker",
+            "closing_line_time",
         ]
-        for col in numeric_cols:
-            if col in frame.columns:
-                frame[col] = pd.to_numeric(frame[col], errors="coerce")
-        if "closing_line_time" in frame.columns:
-            frame["closing_line_time"] = pd.to_datetime(
-                frame["closing_line_time"], errors="coerce", utc=True
+
+        if not records:
+            return pd.DataFrame(columns=columns)
+
+        frame = pd.DataFrame(records)
+        normalized = _standardize_closing_odds_frame(frame, "Local CSV")
+        if normalized.empty:
+            return pd.DataFrame(columns=columns)
+
+        result = normalized.copy()
+        result["home_team"] = result["home_team"].apply(normalize_team_abbr)
+        result["away_team"] = result["away_team"].apply(normalize_team_abbr)
+        result["season"] = result["season"].astype(str)
+        if "week" in result.columns:
+            result["week"] = result["week"].apply(
+                lambda x: int(x) if pd.notna(x) else None
             )
         else:
-            frame["closing_line_time"] = pd.NaT
-        frame["closing_bookmaker"] = frame.get("closing_bookmaker", "").fillna("")
-        return frame
+            result["week"] = None
+
+        for side in ("home", "away"):
+            ml_col = f"{side}_closing_moneyline"
+            prob_col = f"{side}_closing_implied_prob"
+            result[ml_col] = pd.to_numeric(result.get(ml_col), errors="coerce")
+            result[prob_col] = result[ml_col].apply(
+                lambda val: odds_american_to_prob(float(val)) if pd.notna(val) else np.nan
+            )
+
+        if "closing_bookmaker" in result.columns:
+            result["closing_bookmaker"] = result["closing_bookmaker"].fillna("Local CSV")
+        else:
+            result["closing_bookmaker"] = "Local CSV"
+
+        if "closing_line_time" in result.columns:
+            result["closing_line_time"] = pd.to_datetime(
+                result["closing_line_time"], errors="coerce", utc=True
+            )
+        else:
+            result["closing_line_time"] = pd.NaT
+
+        if "game_id" not in result.columns:
+            result["game_id"] = None
+
+        missing_cols = [col for col in columns if col not in result.columns]
+        for col in missing_cols:
+            result[col] = pd.NaT if col.endswith("time") else None
+
+        return result[columns]
 
     def _build_travel_context_frame(
         self, records: List[Dict[str, Any]]
@@ -6106,7 +6272,7 @@ class NFLConfig:
     paper_trade_edge_threshold: float = 0.02
     paper_trade_bankroll: float = 1_000.0
     paper_trade_max_fraction: float = 0.05
-    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER") or "oddsportal"
+    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER") or "local"
     closing_odds_timeout: int = int(os.getenv("NFL_CLOSING_ODDS_TIMEOUT", "45"))
     closing_odds_download_dir: Optional[str] = os.getenv("NFL_CLOSING_ODDS_DOWNLOAD_DIR")
     oddsportal_base_url: str = os.getenv(
