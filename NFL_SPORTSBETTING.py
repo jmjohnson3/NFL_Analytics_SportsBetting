@@ -169,7 +169,7 @@ def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-MONEYLINE_PATTERN = re.compile(r"[-+]?\d+")
+MONEYLINE_PATTERN = re.compile(r"([-+]?\d+)")
 
 SEASON_COLUMN_CANDIDATES = ["season", "yr", "year"]
 WEEK_COLUMN_CANDIDATES = ["week", "wk", "weeknum", "week_no", "game_week"]
