@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
+from html import unescape
 
 import aiohttp
 import numpy as np
@@ -49,7 +50,9 @@ from requests import HTTPError
 from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
 from requests.exceptions import (
+    ConnectionError as RequestsConnectionError,
     JSONDecodeError as RequestsJSONDecodeError,
+    ReadTimeout,
     SSLError,
 )
 from http import HTTPStatus
@@ -104,12 +107,17 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from urllib.parse import urlencode, urljoin
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util import Retry
 
 try:  # Optional dependency used for HTML parsing when available
-    from bs4 import BeautifulSoup  # type: ignore
+    from bs4 import BeautifulSoup, Tag  # type: ignore
 except Exception:  # pragma: no cover - fallback when bs4 is absent
     BeautifulSoup = None  # type: ignore
+    Tag = None  # type: ignore
+
+_BEAUTIFULSOUP_WARNING_EMITTED = False
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -161,7 +169,7 @@ def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-MONEYLINE_PATTERN = re.compile(r"[-+]?\d+")
+MONEYLINE_PATTERN = re.compile(r"([-+]?\d+)")
 
 SEASON_COLUMN_CANDIDATES = ["season", "yr", "year"]
 WEEK_COLUMN_CANDIDATES = ["week", "wk", "weeknum", "week_no", "game_week"]
@@ -191,7 +199,14 @@ AWAY_TEAM_COLUMN_CANDIDATES = [
 ]
 TEAM_COLUMN_CANDIDATES = ["team", "team_name", "club", "squad"]
 OPPONENT_COLUMN_CANDIDATES = ["opponent", "opp", "opp_name", "opponent_name"]
-SITE_COLUMN_CANDIDATES = ["site", "homeaway", "home_away", "ha", "venue_type"]
+SITE_COLUMN_CANDIDATES = [
+    "site",
+    "homeaway",
+    "home_away",
+    "ha",
+    "venue_type",
+    "location",
+]
 DATE_COLUMN_CANDIDATES = ["date", "game_date", "start_date", "schedule_date"]
 TIME_COLUMN_CANDIDATES = ["time", "start_time", "game_time", "kickoff", "kickoff_time"]
 HOME_MONEYLINE_COLUMN_CANDIDATES = [
@@ -203,6 +218,7 @@ HOME_MONEYLINE_COLUMN_CANDIDATES = [
     "home_close_ml",
     "home_close_moneyline",
     "home_closing_ml",
+    "home_closing_moneyline",
     "home_close",
 ]
 AWAY_MONEYLINE_COLUMN_CANDIDATES = [
@@ -218,10 +234,12 @@ AWAY_MONEYLINE_COLUMN_CANDIDATES = [
     "vis_ml",
     "away_close_ml",
     "away_close_moneyline",
+    "away_closing_moneyline",
 ]
 TEAM_MONEYLINE_COLUMN_CANDIDATES = [
     "ml",
     "moneyline",
+    "money_line",
     "close_ml",
     "team_ml",
     "team_moneyline",
@@ -284,6 +302,198 @@ def _combine_date_time(
     return date_values
 
 
+def _reshape_team_based_closing_rows(
+    frame: pd.DataFrame,
+    provider_name: str,
+    *,
+    season_hint: Optional[str],
+    season_col: Optional[str],
+    week_col: Optional[str],
+    date_col: Optional[str],
+    time_col: Optional[str],
+    site_col: Optional[str],
+    team_col: Optional[str],
+    opp_col: Optional[str],
+    ml_col: Optional[str],
+    book_col: Optional[str],
+) -> pd.DataFrame:
+    if not all([team_col, opp_col, ml_col]):
+        logging.warning(
+            "%s dataset is missing explicit team/opponent columns and cannot be reshaped",
+            provider_name,
+        )
+        return pd.DataFrame()
+
+    working = frame.copy()
+    working["_team"] = working[team_col].apply(normalize_team_abbr)
+    working["_opp"] = working[opp_col].apply(normalize_team_abbr)
+    working["_ml"] = _parse_moneyline_series(working[ml_col])
+
+    if site_col:
+        site_values = (
+            working[site_col].astype(str).str.strip().str.upper()
+        )
+    else:
+        site_values = pd.Series("", index=working.index)
+    working["_site"] = site_values
+    working["_is_home"] = working["_site"].str.startswith("H")
+    working["_is_away"] = working["_site"].str.startswith("A")
+
+    if season_col:
+        working["_season"] = working[season_col]
+    else:
+        working["_season"] = season_hint
+
+    if week_col:
+        working["_week"] = pd.to_numeric(working[week_col], errors="coerce")
+    else:
+        working["_week"] = np.nan
+
+    kickoff_series = _combine_date_time(
+        working[date_col] if date_col else None,
+        working[time_col] if time_col else None,
+    )
+    working["_kickoff"] = kickoff_series
+
+    working["_key"] = working.apply(
+        lambda row: _compose_game_key(
+            row.get("_season"),
+            row.get("_week"),
+            row.get("_kickoff"),
+            row.get("_team"),
+            row.get("_opp"),
+        ),
+        axis=1,
+    )
+
+    records: List[Dict[str, Any]] = []
+    for _key, group in working.groupby("_key"):
+        group = group.dropna(subset=["_team", "_opp"])
+        if group.empty:
+            continue
+
+        home_row = group[group["_is_home"]].head(1)
+        away_row = group[group["_is_away"]].head(1)
+
+        chosen_home: Optional[pd.Series] = home_row.iloc[0] if not home_row.empty else None
+        chosen_away: Optional[pd.Series] = None
+
+        if chosen_home is not None:
+            counterpart = group[group["_team"] == chosen_home["_opp"]]
+            if not counterpart.empty:
+                chosen_away = counterpart.iloc[0]
+
+        if chosen_home is None and not away_row.empty:
+            candidate_away = away_row.iloc[0]
+            counterpart = group[group["_team"] == candidate_away["_opp"]]
+            if not counterpart.empty:
+                chosen_home = counterpart.iloc[0]
+                chosen_away = candidate_away
+
+        if chosen_home is None or chosen_away is None:
+            pair_found = False
+            for _, row in group.iterrows():
+                counterpart = group[group["_team"] == row["_opp"]]
+                if counterpart.empty:
+                    continue
+                other = counterpart.iloc[0]
+                candidate_home, candidate_away = row, other
+                if candidate_home["_is_away"] and not candidate_away["_is_away"]:
+                    candidate_home, candidate_away = candidate_away, candidate_home
+                elif candidate_away["_is_home"] and not candidate_home["_is_home"]:
+                    candidate_home, candidate_away = candidate_away, candidate_home
+                chosen_home = candidate_home
+                chosen_away = candidate_away
+                pair_found = True
+                break
+            if not pair_found:
+                logging.warning(
+                    "%s dataset could not resolve complementary home/away rows for game %s",
+                    provider_name,
+                    _key,
+                )
+                continue
+
+        if chosen_home is None or chosen_away is None:
+            continue
+
+        home_team = chosen_home.get("_team")
+        away_team = chosen_away.get("_team")
+        home_ml = chosen_home.get("_ml")
+        away_ml = chosen_away.get("_ml")
+
+        if pd.isna(home_team) or pd.isna(away_team):
+            continue
+        if pd.isna(home_ml) and pd.isna(away_ml):
+            continue
+
+        if pd.isna(home_ml) and not pd.isna(away_ml):
+            logging.debug(
+                "%s dataset is missing a home moneyline for matchup %s; skipping",
+                provider_name,
+                _key,
+            )
+            continue
+        if pd.isna(away_ml) and not pd.isna(home_ml):
+            logging.debug(
+                "%s dataset is missing an away moneyline for matchup %s; skipping",
+                provider_name,
+                _key,
+            )
+            continue
+
+        season_value = chosen_home.get("_season")
+        week_value = _safe_week_value(chosen_home.get("_week"))
+        kickoff_value = chosen_home.get("_kickoff")
+        if (kickoff_value is None or pd.isna(kickoff_value)) and chosen_away is not None:
+            alt_kickoff = chosen_away.get("_kickoff")
+            if alt_kickoff is not None and not pd.isna(alt_kickoff):
+                kickoff_value = alt_kickoff
+
+        def _resolve_season(candidate: Any) -> str:
+            if candidate is not None and not (
+                isinstance(candidate, float) and math.isnan(candidate)
+            ):
+                text = str(candidate).strip()
+                if text and text.lower() not in {"nan", "none", "null"}:
+                    return text
+            inferred = _infer_regular_season_label_from_timestamp(kickoff_value)
+            if inferred:
+                return inferred
+            if season_hint:
+                return str(season_hint)
+            return ""
+
+        season_label = _resolve_season(season_value)
+
+        bookmaker_value: Optional[str] = None
+        if book_col:
+            home_book = chosen_home.get(book_col)
+            away_book = chosen_away.get(book_col)
+            if isinstance(home_book, str) and home_book.strip():
+                bookmaker_value = home_book.strip()
+            elif isinstance(away_book, str) and away_book.strip():
+                bookmaker_value = away_book.strip()
+
+        records.append(
+            {
+                "season": season_label,
+                "week": week_value,
+                "home_team": home_team,
+                "away_team": away_team,
+                "home_closing_moneyline": home_ml,
+                "away_closing_moneyline": away_ml,
+                "closing_line_time": kickoff_value,
+                "closing_bookmaker": bookmaker_value or provider_name,
+            }
+        )
+
+    if not records:
+        return pd.DataFrame()
+
+    return pd.DataFrame.from_records(records)
+
+
 def _safe_week_value(value: Any) -> Optional[int]:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return None
@@ -331,120 +541,39 @@ def _normalize_historical_closing_frame(
     date_col = _match_column(columns, DATE_COLUMN_CANDIDATES)
     time_col = _match_column(columns, TIME_COLUMN_CANDIDATES)
 
-    if not home_col or not away_col:
-        team_col = _match_column(columns, TEAM_COLUMN_CANDIDATES)
-        opp_col = _match_column(columns, OPPONENT_COLUMN_CANDIDATES)
-        site_col = _match_column(columns, SITE_COLUMN_CANDIDATES)
-        ml_col = _match_column(columns, TEAM_MONEYLINE_COLUMN_CANDIDATES)
-        if not all([team_col, opp_col, site_col, ml_col]):
-            logging.warning(
-                "%s dataset is missing explicit home/away columns and cannot be reshaped",
-                provider_name,
-            )
-            return pd.DataFrame()
-
-        working = frame.copy()
-        working["_team"] = working[team_col].apply(normalize_team_abbr)
-        working["_opp"] = working[opp_col].apply(normalize_team_abbr)
-        working["_site"] = working[site_col].astype(str).str.strip().str.upper()
-        working["_is_home"] = working["_site"].str.startswith("H")
-        working["_is_away"] = working["_site"].str.startswith("A")
-        if not working["_is_home"].any() or not working["_is_away"].any():
-            logging.warning(
-                "%s dataset did not contain both home and away rows after site parsing",
-                provider_name,
-            )
-            return pd.DataFrame()
-
-        if season_col:
-            working["_season"] = working[season_col]
-        else:
-            working["_season"] = season_hint
-        if week_col:
-            working["_week"] = pd.to_numeric(working[week_col], errors="coerce")
-        else:
-            working["_week"] = np.nan
-
-        kickoff_series = _combine_date_time(
-            working[date_col] if date_col else None,
-            working[time_col] if time_col else None,
-        )
-        working["_kickoff"] = kickoff_series
-        working["_ml"] = _parse_moneyline_series(working[ml_col])
-
-        home_rows = working[working["_is_home"]].copy()
-        away_rows = working[working["_is_away"]].copy()
-        if home_rows.empty or away_rows.empty:
-            logging.warning(
-                "%s dataset did not provide complementary home/away rows after filtering",
-                provider_name,
-            )
-            return pd.DataFrame()
-
-        home_rows["_key"] = home_rows.apply(
-            lambda row: _compose_game_key(
-                row["_season"],
-                row["_week"],
-                row.get("_kickoff"),
-                row.get("_team"),
-                row.get("_opp"),
-            ),
-            axis=1,
-        )
-        away_rows["_key"] = away_rows.apply(
-            lambda row: _compose_game_key(
-                row["_season"],
-                row["_week"],
-                row.get("_kickoff"),
-                row.get("_opp"),
-                row.get("_team"),
-            ),
-            axis=1,
-        )
-
-        away_subset = away_rows[["_key", "_team", "_ml"]].rename(
-            columns={"_team": "_away_team", "_ml": "_away_ml"}
-        )
-        merged = home_rows.merge(away_subset, on="_key", how="inner")
-        if merged.empty:
-            logging.warning(
-                "%s dataset failed to merge complementary home/away rows",
-                provider_name,
-            )
-            return pd.DataFrame()
-
-        merged["home_team"] = merged["_team"]
-        merged["away_team"] = merged["_away_team"].combine_first(merged["_opp"])
-        merged["home_closing_moneyline"] = merged["_ml"]
-        merged["away_closing_moneyline"] = merged["_away_ml"]
-        merged["season"] = (
-            merged["_season"].fillna(season_hint).astype(str)
-            if season_col
-            else str(season_hint) if season_hint else merged["_season"].astype(str)
-        )
-        merged["week"] = merged["_week"]
-        merged["closing_line_time"] = merged["_kickoff"]
-        if book_col:
-            merged["closing_bookmaker"] = merged[book_col].astype(str).fillna("")
-        else:
-            merged["closing_bookmaker"] = provider_name
-
-        result = merged[
-            [
-                "season",
-                "week",
-                "home_team",
-                "away_team",
-                "home_closing_moneyline",
-                "away_closing_moneyline",
-                "closing_line_time",
-                "closing_bookmaker",
-            ]
-        ].copy()
-        return result
+    team_col = _match_column(columns, TEAM_COLUMN_CANDIDATES)
+    opp_col = _match_column(columns, OPPONENT_COLUMN_CANDIDATES)
+    site_col = _match_column(columns, SITE_COLUMN_CANDIDATES)
+    ml_col = _match_column(columns, TEAM_MONEYLINE_COLUMN_CANDIDATES)
 
     home_ml_col = _match_column(columns, HOME_MONEYLINE_COLUMN_CANDIDATES)
     away_ml_col = _match_column(columns, AWAY_MONEYLINE_COLUMN_CANDIDATES)
+
+    if team_col and opp_col and ml_col:
+        needs_reshape = False
+        if not home_col or not away_col:
+            needs_reshape = True
+        elif not home_ml_col or not away_ml_col:
+            needs_reshape = True
+
+        if needs_reshape:
+            reshaped = _reshape_team_based_closing_rows(
+                frame,
+                provider_name,
+                season_hint=season_hint,
+                season_col=season_col,
+                week_col=week_col,
+                date_col=date_col,
+                time_col=time_col,
+                site_col=site_col,
+                team_col=team_col,
+                opp_col=opp_col,
+                ml_col=ml_col,
+                book_col=book_col,
+            )
+            if not reshaped.empty:
+                return reshaped
+
     if not home_ml_col or not away_ml_col:
         logging.warning(
             "%s dataset is missing moneyline columns and cannot be imported",
@@ -452,9 +581,19 @@ def _normalize_historical_closing_frame(
         )
         return pd.DataFrame()
 
-    season_series = (
-        frame[season_col].fillna(season_hint) if season_col else season_hint
-    )
+    if season_col and season_col in frame.columns:
+        season_series: Union[pd.Series, Any] = frame[season_col]
+        if isinstance(season_series, pd.Series) and season_hint is not None:
+            season_series = season_series.fillna(season_hint)
+    else:
+        season_series = pd.Series(season_hint, index=frame.index)
+    if not isinstance(season_series, pd.Series):
+        season_series = pd.Series(
+            [season_series] * len(frame), index=frame.index, dtype=object
+        )
+    else:
+        season_series = season_series.astype(object)
+
     week_series = (
         pd.to_numeric(frame[week_col], errors="coerce") if week_col else np.nan
     )
@@ -463,12 +602,34 @@ def _normalize_historical_closing_frame(
         frame[time_col] if time_col else None,
     )
 
-    result = pd.DataFrame()
-    result["season"] = (
-        season_series.astype(str)
-        if isinstance(season_series, pd.Series)
-        else str(season_series) if season_series else str(season_hint or "")
+    inferred_season = kickoff_series.apply(
+        _infer_regular_season_label_from_timestamp
     )
+    if season_hint is not None:
+        inferred_season = inferred_season.fillna(season_hint)
+
+    def _normalize_season_value(raw_val: Any, inferred_val: Optional[str]) -> str:
+        candidate: Optional[str]
+        if raw_val is None or (isinstance(raw_val, float) and math.isnan(raw_val)):
+            candidate = None
+        else:
+            text = str(raw_val).strip()
+            candidate = (
+                text
+                if text and text.lower() not in {"nan", "none", "null"}
+                else None
+            )
+        if not candidate:
+            candidate = inferred_val
+        if not candidate and season_hint:
+            candidate = str(season_hint)
+        return str(candidate or "")
+
+    result = pd.DataFrame(index=frame.index)
+    result["season"] = [
+        _normalize_season_value(raw_val, inferred_val)
+        for raw_val, inferred_val in zip(season_series, inferred_season)
+    ]
     result["week"] = week_series
     result["home_team"] = frame[home_col].apply(normalize_team_abbr)
     result["away_team"] = frame[away_col].apply(normalize_team_abbr)
@@ -482,6 +643,86 @@ def _normalize_historical_closing_frame(
 
     return result
 
+
+
+def _infer_regular_season_label_from_timestamp(value: Any) -> Optional[str]:
+    """Infer an NFL regular-season label (e.g. ``2025-regular``) from a date."""
+
+    if value is None:
+        return None
+
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if isinstance(timestamp, pd.DatetimeIndex):
+        if len(timestamp) == 0:
+            return None
+        timestamp = timestamp[0]
+    if pd.isna(timestamp):
+        return None
+
+    try:
+        year = int(timestamp.year)
+        month = int(timestamp.month)
+    except Exception:
+        return None
+
+    if month < 8:
+        year -= 1
+
+    return f"{year}-regular"
+
+
+def _standardize_closing_odds_frame(
+    frame: pd.DataFrame,
+    provider_name: str,
+    season_hint: Optional[str] = None,
+) -> pd.DataFrame:
+    """Normalize arbitrary historical closing odds layouts into a standard frame."""
+
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    working = frame.copy()
+    columns = {_canonicalize_column_name(col): col for col in working.columns}
+
+    season_col = _match_column(columns, SEASON_COLUMN_CANDIDATES)
+    if not season_col:
+        date_col = _match_column(columns, DATE_COLUMN_CANDIDATES)
+        if date_col:
+            inferred = pd.to_datetime(working[date_col], errors="coerce")
+            working["season"] = inferred.apply(_infer_regular_season_label_from_timestamp)
+            season_col = "season"
+        elif season_hint:
+            working["season"] = season_hint
+            season_col = "season"
+
+    if season_col and season_col != "season":
+        working = working.rename(columns={season_col: "season"})
+
+    normalized = _normalize_historical_closing_frame(
+        working, provider_name, season_hint
+    )
+    if normalized.empty:
+        return pd.DataFrame()
+
+    normalized = normalized.copy()
+    normalized["season"] = normalized["season"].astype(str)
+    if "week" in normalized.columns:
+        normalized["week"] = pd.to_numeric(normalized["week"], errors="coerce")
+    if "closing_line_time" in normalized.columns:
+        normalized["closing_line_time"] = pd.to_datetime(
+            normalized["closing_line_time"], errors="coerce", utc=True
+        )
+    else:
+        normalized["closing_line_time"] = pd.NaT
+
+    if "closing_bookmaker" in normalized.columns:
+        normalized["closing_bookmaker"] = normalized["closing_bookmaker"].fillna(
+            provider_name
+        )
+    else:
+        normalized["closing_bookmaker"] = provider_name
+
+    return normalized
 
 
 def _oddsportal_slug_candidates(season_label: str) -> List[str]:
@@ -549,6 +790,41 @@ def _decimal_to_american(decimal: Optional[float]) -> Optional[int]:
         return None
 
 
+def _parse_moneyline_text(value: Optional[str]) -> Optional[int]:
+    """Parse an odds string expressed as either American or decimal prices."""
+
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    normalized = text.replace("\xa0", " ")
+    american_match = re.search(r"[+-]\d{2,4}", normalized)
+    if american_match:
+        try:
+            return int(american_match.group(0))
+        except ValueError:
+            return None
+
+    bare_match = re.search(r"\b\d{3,4}\b", normalized)
+    if bare_match:
+        try:
+            candidate = int(bare_match.group(0))
+        except ValueError:
+            candidate = None
+        else:
+            if candidate is not None and candidate >= 100:
+                return candidate
+
+    decimal = _parse_decimal_odds(normalized)
+    if decimal is not None:
+        return _decimal_to_american(decimal)
+
+    return None
+
+
 def _parse_oddsportal_datetime(
     date_text: Optional[str],
     time_text: Optional[str],
@@ -582,6 +858,55 @@ def _parse_oddsportal_datetime(
         except Exception:
             pass
     return parsed
+
+
+class LocalClosingOddsFetcher:
+    """Load pre-downloaded closing odds from a local CSV file."""
+
+    def __init__(self, csv_path: Optional[str]) -> None:
+        self.csv_path = Path(csv_path).expanduser() if csv_path else None
+
+    def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
+        if not self.csv_path:
+            logging.warning(
+                "Local closing odds path not configured; set NFL_CLOSING_ODDS_PATH to a CSV file"
+            )
+            return pd.DataFrame()
+
+        try:
+            if not self.csv_path.exists():
+                logging.warning("Local closing odds file %s not found", self.csv_path)
+                return pd.DataFrame()
+        except OSError:
+            logging.exception(
+                "Unable to access local closing odds file at %s", self.csv_path
+            )
+            return pd.DataFrame()
+
+        try:
+            raw = pd.read_csv(self.csv_path)
+        except Exception:
+            logging.exception(
+                "Failed to read closing odds CSV from %s", self.csv_path
+            )
+            return pd.DataFrame()
+
+        normalized = _standardize_closing_odds_frame(raw, "Local CSV")
+        if normalized.empty:
+            logging.warning(
+                "Local closing odds file %s did not produce any usable rows", self.csv_path
+            )
+            return normalized
+
+        normalized = normalized.copy()
+        normalized["season"] = normalized["season"].astype(str)
+        if seasons:
+            wanted = {str(season) for season in seasons}
+            normalized = normalized[normalized["season"].isin(wanted)]
+        if "week" in normalized.columns:
+            normalized["week"] = pd.to_numeric(normalized["week"], errors="coerce")
+
+        return normalized.reset_index(drop=True)
 
 
 class OddsPortalFetcher:
@@ -624,6 +949,41 @@ class OddsPortalFetcher:
         self._insecure_success_logged = False
         self._ssl_failure_logged = False
         self._insecure_adapter_installed = False
+
+        self._debug_dump_enabled = False
+        self._debug_dir: Optional[Path] = None
+        self._debug_dumped_sources: Set[str] = set()
+        self._debug_capture_logged: Set[str] = set()
+        self._no_rows_warned: Set[str] = set()
+
+        debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
+        if str(debug_flag).strip().lower() in {"1", "true", "yes", "on", "debug"}:
+            self._debug_dump_enabled = True
+            debug_dir = os.environ.get("NFL_ODDSPORTAL_DEBUG_DIR")
+            self._debug_dir = (
+                Path(debug_dir).expanduser()
+                if debug_dir
+                else SCRIPT_ROOT / "reports" / "oddsportal_debug"
+            )
+            try:
+                self._debug_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                logging.exception(
+                    "Unable to create OddsPortal debug directory at %s", self._debug_dir
+                )
+                self._debug_dump_enabled = False
+            else:
+                logging.warning(
+                    "NFL_ODDSPORTAL_DEBUG_HTML enabled; raw OddsPortal pages will be written to %s",
+                    self._debug_dir,
+                )
+
+        if BeautifulSoup is None:
+            raise RuntimeError(
+                "The beautifulsoup4 package is required to scrape OddsPortal closing odds. "
+                "Install it with 'pip install beautifulsoup4' inside your environment or disable "
+                "OddsPortal scraping in your configuration if you do not need closing odds."
+            )
 
     def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
         frames: List[pd.DataFrame] = []
@@ -680,6 +1040,8 @@ class OddsPortalFetcher:
         parsed = self._parse_results_page(html, season_label)
         if not _is_effectively_empty_df(parsed):
             frames.append(parsed)
+        else:
+            self._debug_capture_failure(slug, html, source_url=url)
 
         for page_url in self._discover_additional_pages(url, html):
             page_html = self._request(page_url)
@@ -688,26 +1050,73 @@ class OddsPortalFetcher:
             chunk = self._parse_results_page(page_html, season_label)
             if not _is_effectively_empty_df(chunk):
                 frames.append(chunk)
+            else:
+                self._debug_capture_failure(slug, page_html, source_url=page_url)
 
-        return safe_concat(frames, ignore_index=True)
+        result = safe_concat(frames, ignore_index=True)
+        if _is_effectively_empty_df(result):
+            self._debug_warn_no_rows(slug, season_label, url)
+        return result
 
     def _request(self, url: str) -> Optional[str]:
         attempt_insecure = False
 
+        base_headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Referer": self.base_url,
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+        def _build_headers(user_agent: str, *, json_variant: bool) -> Dict[str, str]:
+            headers = dict(base_headers)
+            headers["User-Agent"] = user_agent
+            if json_variant:
+                headers.update(
+                    {
+                        "Accept": "application/json, text/plain, */*",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "x-nextjs-data": "1",
+                    }
+                )
+            else:
+                headers.setdefault("Sec-Fetch-Site", "same-origin")
+                headers.setdefault("Sec-Fetch-Mode", "navigate")
+                headers.setdefault("Sec-Fetch-Dest", "document")
+            return headers
+
         for ua in self.user_agents:
-            headers = {
-                "User-Agent": ua,
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": self.base_url,
-            }
             try:
-                response = self.session.get(url, headers=headers, timeout=self.timeout)
+                response = self.session.get(
+                    url, headers=_build_headers(ua, json_variant=False), timeout=self.timeout
+                )
             except SSLError as exc:
                 logging.error("OddsPortal SSL error for %s: %s", url, exc)
                 attempt_insecure = True
                 break
             except Exception:
                 logging.exception("OddsPortal request error for %s", url)
+                response = None
+
+            if response is not None:
+                result = self._process_oddsportal_response(response, url, insecure=False)
+                if result is not None:
+                    return result
+
+            try:
+                response = self.session.get(
+                    url,
+                    headers=_build_headers(ua, json_variant=True),
+                    timeout=self.timeout,
+                )
+            except SSLError as exc:
+                logging.error("OddsPortal SSL error for %s (JSON variant): %s", url, exc)
+                attempt_insecure = True
+                break
+            except Exception:
+                logging.exception("OddsPortal JSON request error for %s", url)
                 continue
 
             result = self._process_oddsportal_response(response, url, insecure=False)
@@ -729,14 +1138,12 @@ class OddsPortalFetcher:
             self._install_insecure_adapter()
             self.session.verify = False
             for ua in self.user_agents:
-                headers = {
-                    "User-Agent": ua,
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": self.base_url,
-                }
                 try:
                     response = self.session.get(
-                        url, headers=headers, timeout=self.timeout, verify=False
+                        url,
+                        headers=_build_headers(ua, json_variant=False),
+                        timeout=self.timeout,
+                        verify=False,
                     )
                 except SSLError as exc:
                     logging.error(
@@ -744,9 +1151,32 @@ class OddsPortalFetcher:
                         url,
                         exc,
                     )
-                    continue
+                    response = None
                 except Exception:
                     logging.exception("OddsPortal request error for %s", url)
+                    response = None
+
+                if response is not None:
+                    result = self._process_oddsportal_response(response, url, insecure=True)
+                    if result is not None:
+                        return result
+
+                try:
+                    response = self.session.get(
+                        url,
+                        headers=_build_headers(ua, json_variant=True),
+                        timeout=self.timeout,
+                        verify=False,
+                    )
+                except SSLError as exc:
+                    logging.error(
+                        "OddsPortal SSL error persisted for %s (JSON variant) even with verification disabled: %s",
+                        url,
+                        exc,
+                    )
+                    continue
+                except Exception:
+                    logging.exception("OddsPortal JSON request error for %s", url)
                     continue
 
                 result = self._process_oddsportal_response(response, url, insecure=True)
@@ -782,9 +1212,17 @@ class OddsPortalFetcher:
             allowed_methods=None,
         )
 
-        adapter = HTTPAdapter(max_retries=retry, ssl_context=context)
+        try:
+            adapter = HTTPAdapter(max_retries=retry, ssl_context=context)
+        except TypeError:
+            logging.debug(
+                "requests.HTTPAdapter does not support the ssl_context argument; "
+                "falling back to a legacy-compatible adapter"
+            )
+            adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        urllib3.disable_warnings(InsecureRequestWarning)
         self._insecure_adapter_installed = True
 
     def _process_oddsportal_response(
@@ -828,15 +1266,26 @@ class OddsPortalFetcher:
         return sorted(pages)
 
     def _parse_results_page(self, html: str, season_label: str) -> pd.DataFrame:
+        global _BEAUTIFULSOUP_WARNING_EMITTED
         if BeautifulSoup is None:
-            logging.warning(
-                "BeautifulSoup is required to parse OddsPortal pages; install beautifulsoup4"
-            )
+            if not _BEAUTIFULSOUP_WARNING_EMITTED:
+                logging.warning(
+                    "BeautifulSoup is required to parse OddsPortal pages; install beautifulsoup4"
+                )
+                _BEAUTIFULSOUP_WARNING_EMITTED = True
             return pd.DataFrame()
 
         soup = BeautifulSoup(html, "html.parser")
-        table = soup.find("div", class_=re.compile("table-main"))
+        table = soup.find(class_=re.compile(r"\btable-main\b"))
         if table is None:
+            table = soup.find(id=re.compile("tournamentTable", re.IGNORECASE))
+        if table is None:
+            modern_rows = self._parse_modern_results(soup, season_label)
+            if not modern_rows.empty:
+                return modern_rows
+            state_rows = self._parse_embedded_state(html, season_label, soup=soup)
+            if not state_rows.empty:
+                return state_rows
             try:
                 frames = pd.read_html(io.StringIO(html))
             except Exception:
@@ -853,14 +1302,14 @@ class OddsPortalFetcher:
             return pd.DataFrame()
 
         rows: List[Dict[str, Any]] = []
-        current_date: Optional[str] = None
-        for node in table.find_all(recursive=False):
-            node_classes = node.get("class", [])
-            if any(cls.startswith("event__header") for cls in node_classes):
-                current_date = node.get_text(" ", strip=True)
-                continue
-            if not any(cls.startswith("event__match") for cls in node_classes):
-                continue
+        for node in table.find_all(class_=re.compile("event__match")):
+            header = node.find_previous(class_=re.compile("event__header"))
+            current_date = None
+            if header is not None:
+                for ancestor in header.parents:
+                    if ancestor is table:
+                        current_date = header.get_text(" ", strip=True)
+                        break
 
             home_node = node.find(class_=re.compile("event__participant--home"))
             away_node = node.find(class_=re.compile("event__participant--away"))
@@ -873,8 +1322,10 @@ class OddsPortalFetcher:
             scores_node = node.find(class_=re.compile("event__scores"))
             odds_nodes = node.find_all(class_=re.compile("(odd|odds)"))
 
-            kickoff = _parse_oddsportal_datetime(current_date, time_node.get_text(strip=True) if time_node else None)
-            kickoff_str = kickoff.isoformat() if kickoff is not None else ""
+            kickoff = _parse_oddsportal_datetime(
+                current_date,
+                time_node.get_text(strip=True) if time_node else None,
+            )
 
             home_score = away_score = np.nan
             if scores_node:
@@ -909,10 +1360,951 @@ class OddsPortalFetcher:
                 }
             )
 
+        if rows:
+            return pd.DataFrame(rows)
+
+        modern_rows = self._parse_modern_results(soup, season_label)
+        if not modern_rows.empty:
+            return modern_rows
+        state_rows = self._parse_embedded_state(html, season_label, soup=soup)
+        if not state_rows.empty:
+            return state_rows
+
+        try:
+            frames = pd.read_html(io.StringIO(html))
+        except Exception:
+            return pd.DataFrame()
+        for frame in frames:
+            if frame.empty:
+                continue
+            normalized = self._normalise_table(frame, season_label)
+            if not normalized.empty:
+                return normalized
+
+        return pd.DataFrame()
+
+    def _debug_capture_failure(self, slug: str, html: str, *, source_url: str) -> None:
+        if not html:
+            return
+
+        key = f"{slug}|{source_url}"
+        if key in self._debug_capture_logged:
+            return
+        self._debug_capture_logged.add(key)
+
+        html_bytes = len(html)
+        legacy_nodes = modern_rows = participant_nodes = next_data_scripts = 0
+        json_like = False
+
+        if BeautifulSoup is not None:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+            except Exception as exc:
+                logging.debug(
+                    "OddsPortal diagnostics unable to parse HTML for %s (%s): %s",
+                    source_url,
+                    slug,
+                    exc,
+                )
+            else:
+                legacy_nodes = len(soup.find_all(class_=re.compile("event__match")))
+                modern_rows = len(self._find_by_testid(soup, "game-row"))
+                participant_nodes = len(self._find_by_testid(soup, "event-participants"))
+                next_data_scripts = len(soup.find_all(id="__NEXT_DATA__"))
+                if not legacy_nodes and not modern_rows:
+                    snippet = html.lstrip()
+                    json_like = snippet.startswith("{") or snippet.startswith("[")
+                else:
+                    json_like = False
+        else:
+            snippet = html.lstrip()
+            json_like = snippet.startswith("{") or snippet.startswith("[")
+
+        logging.info(
+            "OddsPortal parse diagnostics for %s -> %s: html_bytes=%d legacy_nodes=%d modern_rows=%d participant_nodes=%d next_data_scripts=%d json_like=%s",
+            slug,
+            source_url,
+            html_bytes,
+            legacy_nodes,
+            modern_rows,
+            participant_nodes,
+            next_data_scripts,
+            json_like,
+        )
+
+        self._debug_dump_html(slug, source_url, html)
+
+    def _debug_dump_html(self, slug: str, source_url: str, html: str) -> None:
+        if not self._debug_dump_enabled or not html or self._debug_dir is None:
+            return
+
+        key = f"{slug}|{source_url}"
+        if key in self._debug_dumped_sources:
+            return
+        self._debug_dumped_sources.add(key)
+
+        timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        safe_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/")) or "root"
+        filename = f"{timestamp}_{safe_slug}.html"
+        path = self._debug_dir / filename
+
+        try:
+            path.write_text(html, encoding="utf-8")
+        except Exception:
+            logging.exception("Failed to write OddsPortal debug HTML to %s", path)
+            self._debug_dump_enabled = False
+            return
+
+        logging.warning(
+            "Saved OddsPortal HTML snapshot to %s for slug %s (%s). Share this file if parsing remains empty.",
+            path,
+            slug,
+            source_url,
+        )
+
+    def _debug_warn_no_rows(self, slug: str, season_label: str, source_url: str) -> None:
+        key = f"{season_label}|{slug}"
+        if key in self._no_rows_warned:
+            return
+
+        self._no_rows_warned.add(key)
+        logging.warning(
+            "OddsPortal parser did not find closing odds for slug %s (season %s, url=%s). Set NFL_ODDSPORTAL_DEBUG_HTML=1 and rerun to capture the raw HTML for troubleshooting.",
+            slug,
+            season_label,
+            source_url,
+        )
+
+    def _tag_testid_values(self, tag: "Tag") -> Sequence[str]:
+        values: List[str] = []
+        if not isinstance(tag, Tag):
+            return values
+
+        for attr, raw_value in tag.attrs.items():
+            try:
+                attr_name = str(attr).lower()
+            except Exception:
+                continue
+
+            if not attr_name.startswith("data-test"):
+                continue
+
+            def _append(value: Any) -> None:
+                if value is None:
+                    return
+                if isinstance(value, (list, tuple, set)):
+                    for item in value:
+                        _append(item)
+                else:
+                    try:
+                        values.append(str(value))
+                    except Exception:
+                        pass
+
+            _append(raw_value)
+
+        return values
+
+    def _tag_has_testid(self, tag: "Tag", targets: Sequence[str]) -> bool:
+        if not isinstance(tag, Tag):
+            return False
+
+        normalized_targets = [t.strip().lower() for t in targets if t]
+        if not normalized_targets:
+            return False
+
+        for value in self._tag_testid_values(tag):
+            token = value.strip().lower()
+            if not token:
+                continue
+            for target in normalized_targets:
+                if not target:
+                    continue
+                if token == target:
+                    return True
+                if token.startswith(target):
+                    return True
+                if target in token:
+                    return True
+        return False
+
+    def _find_by_testid(self, root: "BeautifulSoup", *targets: str) -> List["Tag"]:
+        if BeautifulSoup is None or Tag is None:
+            return []
+
+        normalized_targets = [t for t in targets if t]
+
+        def matcher(node: Any) -> bool:
+            return self._tag_has_testid(node, normalized_targets)
+
+        return list(root.find_all(matcher)) if normalized_targets else []
+
+    def _parse_modern_results(self, soup: "BeautifulSoup", season_label: str) -> pd.DataFrame:
+        if Tag is None:
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+
+        for node in self._find_by_testid(soup, "game-row"):
+            if not isinstance(node, Tag):
+                continue
+
+            parent = node.parent
+            skip = False
+            while isinstance(parent, Tag):
+                if self._tag_has_testid(parent, ["game-row"]):
+                    skip = True
+                    break
+                parent = parent.parent
+            if skip:
+                continue
+
+            container = node if node.name != "a" else node.parent
+            if not isinstance(container, Tag):
+                container = node
+
+            participants = None
+            for candidate in self._find_by_testid(container, "event-participants"):
+                participants = candidate
+                break
+            if not isinstance(participants, Tag):
+                continue
+
+            score_pattern = re.compile(r"^-?\d+$")
+
+            def _extract_team(tag: "Tag") -> Tuple[str, Optional[float]]:
+                raw_name = (tag.get("title") or "").strip()
+                if not raw_name:
+                    name_node = tag.find(class_=re.compile("participant-name"))
+                    if isinstance(name_node, Tag):
+                        raw_name = name_node.get_text(" ", strip=True)
+                    elif tag.name == "p" and re.search("participant-name", " ".join(tag.get("class", []))):
+                        raw_name = tag.get_text(" ", strip=True)
+                    else:
+                        raw_name = tag.get_text(" ", strip=True)
+
+                team = normalize_team_abbr(raw_name)
+                if not team:
+                    return "", None
+
+                score_value: Optional[float] = None
+                for candidate in tag.find_all(True):
+                    if not isinstance(candidate, Tag):
+                        continue
+                    text = candidate.get_text("", strip=True)
+                    if score_pattern.fullmatch(text):
+                        try:
+                            score_value = float(text)
+                        except ValueError:
+                            score_value = None
+                        break
+                if score_value is None:
+                    for token in tag.stripped_strings:
+                        text = token.strip()
+                        if score_pattern.fullmatch(text):
+                            try:
+                                score_value = float(text)
+                            except ValueError:
+                                score_value = None
+                            break
+
+                if score_value is None:
+                    sibling = tag
+                    for _ in range(3):
+                        sibling = getattr(sibling, "next_sibling", None)
+                        while isinstance(sibling, str) and not sibling.strip():
+                            sibling = getattr(sibling, "next_sibling", None)
+                        if not isinstance(sibling, Tag):
+                            continue
+                        text = sibling.get_text("", strip=True)
+                        if score_pattern.fullmatch(text):
+                            try:
+                                score_value = float(text)
+                            except ValueError:
+                                score_value = None
+                            break
+                        for token in sibling.stripped_strings:
+                            t = token.strip()
+                            if score_pattern.fullmatch(t):
+                                try:
+                                    score_value = float(t)
+                                except ValueError:
+                                    score_value = None
+                                break
+                        if score_value is not None:
+                            break
+
+                return team, score_value
+
+            teams: List[Tuple[str, Optional[float]]] = []
+            for link in participants.find_all("a"):
+                if not isinstance(link, Tag):
+                    continue
+                team, score = _extract_team(link)
+                if not team:
+                    continue
+                teams.append((team, score))
+                if len(teams) >= 2:
+                    break
+
+            if len(teams) < 2:
+                for name_node in participants.find_all(class_=re.compile("participant-name")):
+                    if not isinstance(name_node, Tag):
+                        continue
+                    team, score = _extract_team(name_node)
+                    if not team:
+                        continue
+                    teams.append((team, score))
+                    if len(teams) >= 2:
+                        break
+
+            if len(teams) < 2:
+                continue
+
+            away_team, away_score = teams[0]
+            home_team, home_score = teams[1]
+
+            if not away_team or not home_team:
+                continue
+
+            time_node: Optional[Tag] = None
+            for candidate in self._find_by_testid(container, "time-item"):
+                time_node = candidate
+                break
+            time_text = (
+                time_node.get_text(" ", strip=True)
+                if isinstance(time_node, Tag)
+                else None
+            )
+
+            date_text = self._find_associated_date(container)
+            kickoff = _parse_oddsportal_datetime(date_text, time_text)
+
+            odds_values: List[int] = []
+            for odd_container in container.find_all(True):
+                if not isinstance(odd_container, Tag):
+                    continue
+                if not (
+                    self._tag_has_testid(odd_container, ["odd-container"])
+                    or any(
+                        str(attr or "").lower().startswith("data-odd-container")
+                        for attr in odd_container.attrs.keys()
+                    )
+                ):
+                    continue
+                price = _parse_moneyline_text(odd_container.get_text(" ", strip=True))
+                if price is None:
+                    continue
+                odds_values.append(price)
+                if len(odds_values) >= 2:
+                    break
+
+            away_moneyline = odds_values[0] if odds_values else None
+            home_moneyline = odds_values[1] if len(odds_values) > 1 else None
+
+            rows.append(
+                {
+                    "season": season_label,
+                    "week": np.nan,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_closing_moneyline": home_moneyline,
+                    "away_closing_moneyline": away_moneyline,
+                    "closing_bookmaker": "OddsPortal",
+                    "closing_line_time": kickoff,
+                    "kickoff_utc": kickoff,
+                    "kickoff_date": kickoff.strftime("%Y-%m-%d") if kickoff else "",
+                    "kickoff_weekday": kickoff.strftime("%a") if kickoff else "",
+                    "home_score": home_score if home_score is not None else np.nan,
+                    "away_score": away_score if away_score is not None else np.nan,
+                }
+            )
+
+        if not rows:
+            return pd.DataFrame()
+
         return pd.DataFrame(rows)
+
+    def _parse_embedded_state(
+        self,
+        html: str,
+        season_label: str,
+        *,
+        soup: Optional["BeautifulSoup"] = None,
+    ) -> pd.DataFrame:
+        if BeautifulSoup is None:
+            return pd.DataFrame()
+
+        if soup is None:
+            soup = BeautifulSoup(html, "html.parser")
+
+        payloads = self._extract_json_payloads(html, soup)
+        if not payloads:
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+        seen: Set[Tuple[Any, ...]] = set()
+
+        for payload in payloads:
+            data = self._safe_json_loads(payload)
+            if data is None:
+                continue
+
+            name_cache: Dict[int, Optional[str]] = {}
+            for ancestors, _, participant_list in self._iter_json_candidate_lists(
+                data, name_cache
+            ):
+                normalized = self._normalise_json_participants(participant_list, name_cache)
+                if len(normalized) < 2:
+                    continue
+
+                valid_entries = [entry for entry in normalized if entry.get("team")]
+                if len({entry["team"] for entry in valid_entries}) < 2:
+                    continue
+
+                has_odds = any(entry.get("moneyline") is not None for entry in valid_entries)
+                if not has_odds:
+                    continue
+
+                home_entry = next((e for e in valid_entries if e.get("is_home") is True), None)
+                away_entry = next((e for e in valid_entries if e.get("is_home") is False), None)
+
+                if home_entry is None or away_entry is None:
+                    ordered = sorted(
+                        valid_entries,
+                        key=lambda item: (
+                            0 if item.get("is_home") is False else 1 if item.get("is_home") is True else 2,
+                            item.get("index", 0),
+                        ),
+                    )
+                    if len(ordered) >= 2:
+                        away_entry, home_entry = ordered[0], ordered[1]
+                    else:
+                        continue
+
+                kickoff = self._extract_json_kickoff(ancestors)
+
+                key = (
+                    home_entry.get("team"),
+                    away_entry.get("team"),
+                    kickoff.isoformat() if isinstance(kickoff, pd.Timestamp) else kickoff,
+                    home_entry.get("moneyline"),
+                    away_entry.get("moneyline"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                rows.append(
+                    {
+                        "season": season_label,
+                        "week": np.nan,
+                        "home_team": home_entry.get("team"),
+                        "away_team": away_entry.get("team"),
+                        "home_closing_moneyline": home_entry.get("moneyline"),
+                        "away_closing_moneyline": away_entry.get("moneyline"),
+                        "closing_bookmaker": "OddsPortal",
+                        "closing_line_time": kickoff,
+                        "kickoff_utc": kickoff,
+                        "kickoff_date": kickoff.strftime("%Y-%m-%d") if isinstance(kickoff, pd.Timestamp) else "",
+                        "kickoff_weekday": kickoff.strftime("%a") if isinstance(kickoff, pd.Timestamp) else "",
+                        "home_score": home_entry.get("score", np.nan),
+                        "away_score": away_entry.get("score", np.nan),
+                    }
+                )
+
+        if not rows:
+            return pd.DataFrame()
+
+        frame = pd.DataFrame(rows)
+        frame["kickoff_utc"] = pd.to_datetime(frame["kickoff_utc"], utc=True, errors="coerce")
+        frame["closing_line_time"] = frame["kickoff_utc"]
+        frame["kickoff_date"] = frame["kickoff_utc"].dt.strftime("%Y-%m-%d").fillna("")
+        frame["kickoff_weekday"] = frame["kickoff_utc"].dt.strftime("%a").fillna("")
+        frame["home_score"] = pd.to_numeric(frame["home_score"], errors="coerce")
+        frame["away_score"] = pd.to_numeric(frame["away_score"], errors="coerce")
+        frame["home_score"] = frame["home_score"].where(frame["home_score"].notna(), np.nan)
+        frame["away_score"] = frame["away_score"].where(frame["away_score"].notna(), np.nan)
+
+        return frame.reset_index(drop=True)
+
+    def _extract_json_payloads(
+        self, html: str, soup: Optional["BeautifulSoup"]
+    ) -> List[str]:
+        payloads: List[str] = []
+
+        stripped = html.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            payloads.append(stripped)
+
+        if soup is not None:
+            for script in soup.find_all("script"):
+                text = script.string or script.get_text()
+                if not text:
+                    continue
+                if script.get("id") == "__NEXT_DATA__":
+                    payloads.append(text)
+                    continue
+                snippet = text.strip()
+                if any(token in snippet for token in ("__NEXT_DATA__", "__NUXT__", "eventGroup")):
+                    payloads.append(snippet)
+
+        patterns = [
+            r"<script[^>]+id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>",
+            r"window\.__NEXT_DATA__\s*=\s*(\{.*?\})\s*;",
+            r"window\.__NUXT__\s*=\s*(\{.*?\})\s*;",
+            r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;",
+            r"data-state=(?:\"|\')(\{.*?\})(?:\"|\')",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, html, flags=re.DOTALL):
+                payloads.append(match.group(1))
+
+        unique: List[str] = []
+        seen: Set[str] = set()
+        for payload in payloads:
+            if not payload:
+                continue
+            cleaned = unescape(payload).strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            unique.append(cleaned)
+
+        return unique
+
+    def _safe_json_loads(self, payload: str) -> Optional[Any]:
+        text = (payload or "").strip()
+        if not text:
+            return None
+
+        text = unescape(text)
+        text = text.strip()
+
+        for prefix in ("window.__NEXT_DATA__", "window.__NUXT__", "window.__INITIAL_STATE__"):
+            if text.startswith(prefix):
+                parts = text.split("=", 1)
+                text = parts[1] if len(parts) == 2 else ""
+                break
+
+        text = text.strip()
+        if text.startswith("export default"):
+            text = text[len("export default") :].strip()
+
+        if text.startswith("const ") or text.startswith("var "):
+            parts = text.split("=", 1)
+            text = parts[1] if len(parts) == 2 else ""
+
+        text = text.strip()
+        if text.endswith(";"):
+            text = text[:-1]
+
+        text = text.strip()
+        if not text:
+            return None
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            sanitized = re.sub(r"//.*?$", "", text, flags=re.MULTILINE).strip()
+            sanitized = sanitized.strip(";")
+            if not sanitized:
+                return None
+            try:
+                return json.loads(sanitized)
+            except json.JSONDecodeError:
+                return None
+
+    def _iter_json_candidate_lists(
+        self, data: Any, name_cache: Dict[int, Optional[str]]
+    ) -> Iterable[Tuple[List[Dict[str, Any]], Optional[str], List[Dict[str, Any]]]]:
+        if not isinstance(data, (dict, list)):
+            return []
+
+        visited_lists: Set[int] = set()
+        stack: List[Tuple[List[Dict[str, Any]], Any]] = [([], data)]
+
+        while stack:
+            ancestors, node = stack.pop()
+
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if isinstance(value, list):
+                        if id(value) not in visited_lists:
+                            visited_lists.add(id(value))
+                            if self._looks_like_participant_list(value, name_cache):
+                                yield ancestors + [node], key, value  # type: ignore[arg-type]
+                            stack.append((ancestors + [node], value))
+                    elif isinstance(value, (dict, list)):
+                        stack.append((ancestors + [node], value))
+            elif isinstance(node, list):
+                for item in node:
+                    stack.append((ancestors, item))
+
+    def _looks_like_participant_list(
+        self, value: Sequence[Any], name_cache: Dict[int, Optional[str]]
+    ) -> bool:
+        if not isinstance(value, Sequence) or len(value) < 2:
+            return False
+
+        dict_count = sum(1 for item in value if isinstance(item, dict))
+        if dict_count < 2:
+            return False
+
+        identified = 0
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            name = self._extract_json_team_name(item, name_cache)
+            if name:
+                identified += 1
+            if identified >= 2:
+                return True
+
+        return False
+
+    def _normalise_json_participants(
+        self, entries: Sequence[Any], name_cache: Dict[int, Optional[str]]
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+
+            name = self._extract_json_team_name(entry, name_cache)
+            if not name:
+                continue
+
+            team = normalize_team_abbr(name)
+            if not team:
+                continue
+
+            normalized.append(
+                {
+                    "team": team,
+                    "is_home": self._infer_json_home_indicator(entry),
+                    "moneyline": self._extract_json_odds(entry),
+                    "score": self._extract_json_score(entry),
+                    "index": index,
+                }
+            )
+
+        return normalized
+
+    def _extract_json_team_name(
+        self, node: Any, cache: Dict[int, Optional[str]]
+    ) -> Optional[str]:
+        queue: List[Any] = [node]
+        seen: Set[int] = set()
+
+        while queue:
+            current = queue.pop(0)
+            node_id = id(current)
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+
+            if node_id in cache:
+                cached = cache[node_id]
+                if cached:
+                    return cached
+                continue
+
+            if isinstance(current, dict):
+                for key, value in current.items():
+                    lower = str(key).lower()
+                    if any(
+                        token in lower
+                        for token in (
+                            "name",
+                            "team",
+                            "participant",
+                            "competitor",
+                            "club",
+                            "title",
+                            "slug",
+                            "abbr",
+                            "abbreviation",
+                        )
+                    ):
+                        if isinstance(value, str):
+                            cleaned = value.strip()
+                            if cleaned and any(ch.isalpha() for ch in cleaned):
+                                cache[node_id] = cleaned
+                                return cleaned
+                        elif isinstance(value, (dict, list)):
+                            queue.append(value)
+                            continue
+                    if isinstance(value, (dict, list)):
+                        queue.append(value)
+
+                cache[node_id] = None
+
+            elif isinstance(current, list):
+                queue.extend(current)
+
+        return None
+
+    def _infer_json_home_indicator(self, entry: Dict[str, Any]) -> Optional[bool]:
+        for key, value in entry.items():
+            lower = str(key).lower()
+            if lower in {"ishome", "home"}:
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    if value == 1:
+                        return True
+                    if value == 0 or value == -1:
+                        return False
+                if isinstance(value, str):
+                    token = value.strip().lower()
+                    if token.startswith("home") or token in {"h", "host"}:
+                        return True
+                    if token.startswith("away") or token in {"a", "visitor", "road", "guest"}:
+                        return False
+
+        for key in (
+            "homeAway",
+            "home_away",
+            "homeAwayTeam",
+            "qualifier",
+            "alignment",
+            "side",
+            "designation",
+            "teamType",
+            "teamRole",
+            "venueType",
+        ):
+            if key not in entry:
+                continue
+            value = entry[key]
+            if isinstance(value, str):
+                token = value.strip().lower()
+                if "home" in token and "away" not in token:
+                    return True
+                if any(tag in token for tag in ("away", "road", "guest", "visitor")):
+                    return False
+            elif isinstance(value, dict):
+                nested = value.get("value") or value.get("label") or value.get("name")
+                if isinstance(nested, str):
+                    nested_token = nested.strip().lower()
+                    if "home" in nested_token and "away" not in nested_token:
+                        return True
+                    if any(tag in nested_token for tag in ("away", "road", "guest", "visitor")):
+                        return False
+
+        indicator = entry.get("isHome")
+        if isinstance(indicator, bool):
+            return indicator
+
+        return None
+
+    def _extract_json_odds(self, entry: Dict[str, Any]) -> Optional[int]:
+        candidates: List[Tuple[bool, Optional[int]]] = []
+
+        def visit(node: Any, *, keyed: bool = False) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    is_odds_key = any(
+                        token in lower
+                        for token in (
+                            "american",
+                            "moneyline",
+                            "money_line",
+                            "price",
+                            "odds",
+                            "us",
+                        )
+                    )
+                    if isinstance(value, (str, int, float)) and is_odds_key:
+                        price = _parse_moneyline_text(str(value))
+                        candidates.append((True, price))
+                    elif isinstance(value, (dict, list)):
+                        visit(value, keyed=is_odds_key or keyed)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item, keyed=keyed)
+            elif keyed and isinstance(node, (str, int, float)):
+                price = _parse_moneyline_text(str(node))
+                candidates.append((False, price))
+
+        visit(entry)
+
+        for keyed, price in candidates:
+            if price is not None:
+                return price
+
+        return None
+
+    def _extract_json_score(self, entry: Dict[str, Any]) -> Optional[float]:
+        values: List[float] = []
+
+        def visit(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    if any(token in lower for token in ("score", "points", "result")):
+                        if isinstance(value, (int, float)):
+                            values.append(float(value))
+                        elif isinstance(value, str):
+                            match = re.search(r"-?\d+(?:\.\d+)?", value)
+                            if match:
+                                try:
+                                    values.append(float(match.group(0)))
+                                except ValueError:
+                                    pass
+                        elif isinstance(value, (dict, list)):
+                            visit(value)
+                    elif isinstance(value, (dict, list)):
+                        visit(value)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item)
+
+        visit(entry)
+
+        return values[0] if values else None
+
+    def _extract_json_kickoff(self, ancestors: Sequence[Dict[str, Any]]) -> Optional[pd.Timestamp]:
+        for container in reversed(ancestors):
+            if not isinstance(container, dict):
+                continue
+            for key, value in container.items():
+                lower = str(key).lower()
+                if any(
+                    token in lower
+                    for token in (
+                        "start",
+                        "kickoff",
+                        "commence",
+                        "date",
+                        "time",
+                        "begin",
+                        "eventtime",
+                        "timestamp",
+                    )
+                ):
+                    timestamp = self._convert_json_datetime(value)
+                    if timestamp is not None:
+                        return timestamp
+
+        return None
+
+    def _convert_json_datetime(self, value: Any) -> Optional[pd.Timestamp]:
+        if value is None:
+            return None
+
+        if isinstance(value, pd.Timestamp):
+            return value.tz_convert("UTC") if value.tzinfo else value.tz_localize("UTC")
+
+        if isinstance(value, (int, float)):
+            if value > 1e12:
+                timestamp = pd.to_datetime(value, unit="ms", utc=True, errors="coerce")
+            else:
+                timestamp = pd.to_datetime(value, unit="s", utc=True, errors="coerce")
+            if pd.notna(timestamp):
+                return timestamp
+            return None
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                timestamp = pd.to_datetime(text, utc=True, errors="coerce")
+            except Exception:
+                timestamp = pd.NaT
+            if pd.notna(timestamp):
+                return timestamp
+            digits = re.sub(r"\D", "", text)
+            if digits:
+                try:
+                    numeric = int(digits)
+                except ValueError:
+                    numeric = None
+                if numeric is not None:
+                    if len(digits) >= 13:
+                        timestamp = pd.to_datetime(numeric, unit="ms", utc=True, errors="coerce")
+                    else:
+                        timestamp = pd.to_datetime(numeric, unit="s", utc=True, errors="coerce")
+                    if pd.notna(timestamp):
+                        return timestamp
+
+        if isinstance(value, dict):
+            for key in ("iso", "utc", "value", "timestamp"):
+                if key in value:
+                    candidate = self._convert_json_datetime(value[key])
+                    if candidate is not None:
+                        return candidate
+
+        return None
+
+    def _find_associated_date(self, node: "Tag") -> Optional[str]:
+        if Tag is None:
+            return None
+
+        date_pattern = re.compile(r"(date|day|header)", re.IGNORECASE)
+        month_pattern = re.compile(
+            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)", re.IGNORECASE
+        )
+
+        current: Optional[Tag] = node
+        while current is not None:
+            sibling = current.previous_sibling
+            while sibling is not None:
+                if isinstance(sibling, Tag):
+                    match_found = False
+                    if sibling.has_attr("data-testid"):
+                        attr_val = str(sibling.get("data-testid", ""))
+                        if date_pattern.search(attr_val):
+                            match_found = True
+                    if not match_found:
+                        for value in self._tag_testid_values(sibling):
+                            if date_pattern.search(value):
+                                match_found = True
+                                break
+                    if match_found:
+                        text = sibling.get_text(" ", strip=True)
+                        if text:
+                            return text
+                    if sibling.get("class") and any(
+                        date_pattern.search(str(cls)) for cls in sibling.get("class", [])
+                    ):
+                        text = sibling.get_text(" ", strip=True)
+                        if text:
+                            return text
+                    text = sibling.get_text(" ", strip=True)
+                    if text and (
+                        month_pattern.search(text)
+                        or re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", text)
+                    ):
+                        return text
+                sibling = getattr(sibling, "previous_sibling", None)
+            current = current.parent if isinstance(getattr(current, "parent", None), Tag) else None
+
+        for candidate in node.find_all_previous(True, limit=25):
+            if not isinstance(candidate, Tag):
+                continue
+            text = candidate.get_text(" ", strip=True)
+            if not text:
+                continue
+            if month_pattern.search(text) or re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", text):
+                return text
+
+        return None
 
     def _normalise_table(self, frame: pd.DataFrame, season_label: str) -> pd.DataFrame:
         frame = frame.copy()
+        if isinstance(frame.columns, pd.MultiIndex):
+            frame.columns = [
+                " ".join(str(part) for part in col if str(part) != "nan").strip()
+                for col in frame.columns
+            ]
+        frame = frame.loc[:, ~frame.columns.astype(str).str.contains(r"^Unnamed", case=False)]
+        frame.columns = [str(col).strip() for col in frame.columns]
+
         lower_cols = {col.lower(): col for col in frame.columns}
         home_col = None
         away_col = None
@@ -924,8 +2316,39 @@ class OddsPortalFetcher:
             if key in lower_cols:
                 away_col = lower_cols[key]
                 break
+
+        match_col = None
         if not home_col or not away_col:
-            return pd.DataFrame()
+            for key in ("match", "event", "teams", "matchup", "home - away"):
+                if key in lower_cols:
+                    match_col = lower_cols[key]
+                    break
+            if match_col is None:
+                for col in frame.columns:
+                    sample = (
+                        frame[col]
+                        .astype(str)
+                        .str.contains(r"\b(vs|vs\.|@| - | – | v )\b", case=False, regex=True)
+                    )
+                    if sample.any():
+                        match_col = col
+                        break
+
+        odds_columns: List[str] = []
+        for col in frame.columns:
+            parsed = frame[col].apply(lambda val: _parse_decimal_odds(str(val)))
+            if parsed.notna().sum() >= max(1, int(len(frame) * 0.4)):
+                odds_columns.append(col)
+        if not odds_columns:
+            odds_columns = [
+                col
+                for col in frame.columns
+                if frame[col]
+                .astype(str)
+                .str.contains(r"\d\.\d", regex=True)
+                .sum()
+                >= max(1, int(len(frame) * 0.4))
+            ]
 
         home_decimal = None
         away_decimal = None
@@ -938,29 +2361,68 @@ class OddsPortalFetcher:
                 away_decimal = lower_cols[key]
                 break
 
+        if home_decimal is None and odds_columns:
+            home_decimal = odds_columns[0]
+        if away_decimal is None and len(odds_columns) >= 2:
+            away_decimal = odds_columns[1]
+
+        def _split_teams(value: Any) -> Tuple[str, str]:
+            text = str(value or "").strip()
+            separators = [" - ", " – ", " vs ", " vs. ", " v ", " @ "]
+            for sep in separators:
+                if sep in text:
+                    parts = [part.strip() for part in text.split(sep, 1)]
+                    if len(parts) == 2:
+                        return parts[0], parts[1]
+            tokens = re.split(r"\s+vs\.?\s+|\s+@\s+", text, maxsplit=1, flags=re.IGNORECASE)
+            if len(tokens) == 2:
+                return tokens[0].strip(), tokens[1].strip()
+            return "", ""
+
+        if match_col and (not home_col or not away_col):
+            extracted = frame[match_col].apply(_split_teams)
+            frame["__home"] = extracted.apply(lambda pair: pair[0])
+            frame["__away"] = extracted.apply(lambda pair: pair[1])
+            home_col = home_col or "__home"
+            away_col = away_col or "__away"
+
+        if not home_col or not away_col:
+            return pd.DataFrame()
+
         result = pd.DataFrame()
         result["season"] = season_label
         result["week"] = np.nan
         result["home_team"] = frame[home_col].apply(normalize_team_abbr)
         result["away_team"] = frame[away_col].apply(normalize_team_abbr)
-        if home_decimal and home_decimal in frame.columns:
-            result["home_closing_moneyline"] = frame[home_decimal].apply(
+
+        def _convert_series(col: Optional[str]) -> pd.Series:
+            if not col or col not in frame.columns:
+                return pd.Series(np.nan, index=frame.index)
+            return frame[col].apply(
                 lambda val: _decimal_to_american(_parse_decimal_odds(str(val)))
             )
-        else:
-            result["home_closing_moneyline"] = np.nan
-        if away_decimal and away_decimal in frame.columns:
-            result["away_closing_moneyline"] = frame[away_decimal].apply(
-                lambda val: _decimal_to_american(_parse_decimal_odds(str(val)))
-            )
-        else:
-            result["away_closing_moneyline"] = np.nan
+
+        result["home_closing_moneyline"] = _convert_series(home_decimal)
+        result["away_closing_moneyline"] = _convert_series(away_decimal)
         result["closing_bookmaker"] = "OddsPortal"
         result["closing_line_time"] = pd.NaT
         result["kickoff_utc"] = pd.NaT
         result["kickoff_date"] = ""
         result["kickoff_weekday"] = ""
-        return result
+        result["home_score"] = np.nan
+        result["away_score"] = np.nan
+
+        score_col = None
+        for key in ("score", "result", "ft", "full time"):
+            if key in lower_cols:
+                score_col = lower_cols[key]
+                break
+        if score_col and score_col in frame.columns:
+            scores = frame[score_col].astype(str).apply(lambda text: re.findall(r"\d+", text))
+            result["home_score"] = scores.apply(lambda vals: float(vals[0]) if len(vals) >= 1 else np.nan)
+            result["away_score"] = scores.apply(lambda vals: float(vals[1]) if len(vals) >= 2 else np.nan)
+
+        return result.reset_index(drop=True)
 
 
 def _season_param_from_label(label: str) -> Optional[str]:
@@ -1142,7 +2604,13 @@ class ClosingOddsArchiveSyncer:
         try:
             seasons = [str(season) for season in self.config.seasons]
 
-            if provider in {"oddsportal", "odds-portal", "op"}:
+            local_provider = False
+
+            if provider in {"local", "csv", "file", "history", "offline"}:
+                fetcher = LocalClosingOddsFetcher(self.config.closing_odds_history_path)
+                provider_name = "Local CSV"
+                local_provider = True
+            elif provider in {"oddsportal", "odds-portal", "op"}:
                 fetcher = OddsPortalFetcher(
                     self.session,
                     base_url=self.config.oddsportal_base_url,
@@ -1177,7 +2645,12 @@ class ClosingOddsArchiveSyncer:
 
             archive = self._attach_game_ids(archive)
             archive = self._finalize_probabilities(archive)
-            self._write_history(provider_name, archive)
+            if local_provider:
+                logging.info(
+                    "Loaded %d closing odds rows from %s", len(archive), self.config.closing_odds_history_path
+                )
+            else:
+                self._write_history(provider_name, archive)
         finally:
             self.session.close()
 
@@ -3861,6 +5334,37 @@ TEAM_NAME_TO_ABBR = {
     "st louis rams": "LA",
 }
 
+CITY_NAME_TO_ABBR = {
+    "arizona": "ARI",
+    "atlanta": "ATL",
+    "baltimore": "BAL",
+    "buffalo": "BUF",
+    "carolina": "CAR",
+    "chicago": "CHI",
+    "cincinnati": "CIN",
+    "cleveland": "CLE",
+    "dallas": "DAL",
+    "denver": "DEN",
+    "detroit": "DET",
+    "green bay": "GB",
+    "houston": "HOU",
+    "indianapolis": "IND",
+    "jacksonville": "JAX",
+    "kansas city": "KC",
+    "las vegas": "LV",
+    "miami": "MIA",
+    "minnesota": "MIN",
+    "new england": "NE",
+    "new orleans": "NO",
+    "philadelphia": "PHI",
+    "pittsburgh": "PIT",
+    "san francisco": "SF",
+    "seattle": "SEA",
+    "tampa bay": "TB",
+    "tennessee": "TEN",
+    "washington": "WAS",
+}
+
 TEAM_ABBR_CANONICAL = {
     "ARI": "arizona cardinals",
     "ATL": "atlanta falcons",
@@ -4021,6 +5525,9 @@ def normalize_team_abbr(value: Any) -> Optional[str]:
     if sanitized in TEAM_NAME_TO_ABBR:
         return TEAM_NAME_TO_ABBR[sanitized]
 
+    if sanitized in CITY_NAME_TO_ABBR:
+        return CITY_NAME_TO_ABBR[sanitized]
+
     sanitized_candidate = sanitized.replace(" ", "").upper()
     if sanitized_candidate in TEAM_ABBR_ALIASES:
         return TEAM_ABBR_ALIASES[sanitized_candidate]
@@ -4038,8 +5545,12 @@ def normalize_team_abbr(value: Any) -> Optional[str]:
     if sanitized in TEAM_MASCOT_TO_ABBR:
         return TEAM_MASCOT_TO_ABBR[sanitized]
 
-    # As a last resort, try to map by taking the first letter of each token
     tokens = sanitized.split()
+    for token in tokens:
+        if token in TEAM_MASCOT_TO_ABBR:
+            return TEAM_MASCOT_TO_ABBR[token]
+
+    # As a last resort, try to map by taking the first letter of each token
     if len(tokens) >= 2:
         initials = "".join(token[0] for token in tokens)
         if initials.upper() in TEAM_ABBR_CANONICAL:
@@ -4450,49 +5961,76 @@ class SupplementalDataLoader:
     def _build_closing_odds_frame(
         self, records: List[Dict[str, Any]]
     ) -> pd.DataFrame:
-        if not records:
-            return pd.DataFrame(
-                columns=[
-                    "game_id",
-                    "season",
-                    "week",
-                    "home_team",
-                    "away_team",
-                    "home_closing_moneyline",
-                    "away_closing_moneyline",
-                    "home_closing_implied_prob",
-                    "away_closing_implied_prob",
-                    "closing_bookmaker",
-                    "closing_line_time",
-                ]
-            )
-
-        frame = pd.DataFrame(records)
-        for col in ["game_id", "season", "week"]:
-            if col not in frame.columns:
-                frame[col] = None
-        frame["home_team"] = frame["home_team"].apply(normalize_team_abbr)
-        frame["away_team"] = frame["away_team"].apply(normalize_team_abbr)
-        frame["season"] = frame["season"].astype(str)
-        if "week" in frame.columns:
-            frame["week"] = frame["week"].apply(lambda x: int(x) if pd.notna(x) else None)
-        numeric_cols = [
+        columns = [
+            "game_id",
+            "season",
+            "week",
+            "home_team",
+            "away_team",
             "home_closing_moneyline",
             "away_closing_moneyline",
             "home_closing_implied_prob",
             "away_closing_implied_prob",
+            "closing_bookmaker",
+            "closing_line_time",
         ]
-        for col in numeric_cols:
-            if col in frame.columns:
-                frame[col] = pd.to_numeric(frame[col], errors="coerce")
-        if "closing_line_time" in frame.columns:
-            frame["closing_line_time"] = pd.to_datetime(
-                frame["closing_line_time"], errors="coerce", utc=True
+
+        if not records:
+            return pd.DataFrame(columns=columns)
+
+        frame = pd.DataFrame(records)
+        normalized = _standardize_closing_odds_frame(frame, "Local CSV")
+        if normalized.empty:
+            return pd.DataFrame(columns=columns)
+
+        result = normalized.copy()
+        result["season"] = result["season"].astype(str).str.strip()
+        result["home_team"] = result["home_team"].apply(normalize_team_abbr)
+        result["away_team"] = result["away_team"].apply(normalize_team_abbr)
+        if "week" in result.columns:
+            result["week"] = result["week"].apply(
+                lambda x: int(x) if pd.notna(x) else None
             )
         else:
-            frame["closing_line_time"] = pd.NaT
-        frame["closing_bookmaker"] = frame.get("closing_bookmaker", "").fillna("")
-        return frame
+            result["week"] = None
+
+        for side in ("home", "away"):
+            ml_col = f"{side}_closing_moneyline"
+            prob_col = f"{side}_closing_implied_prob"
+            result[ml_col] = pd.to_numeric(result.get(ml_col), errors="coerce")
+            result[prob_col] = result[ml_col].apply(
+                lambda val: odds_american_to_prob(float(val)) if pd.notna(val) else np.nan
+            )
+
+        if "closing_bookmaker" in result.columns:
+            result["closing_bookmaker"] = result["closing_bookmaker"].fillna("Local CSV")
+        else:
+            result["closing_bookmaker"] = "Local CSV"
+
+        if "closing_line_time" in result.columns:
+            result["closing_line_time"] = pd.to_datetime(
+                result["closing_line_time"], errors="coerce", utc=True
+            )
+        else:
+            result["closing_line_time"] = pd.NaT
+
+        if "game_id" not in result.columns:
+            result["game_id"] = None
+
+        # Drop rows that still lack a team mapping or both moneylines after normalization;
+        # these cannot be merged back to the schedule and only generate duplicates.
+        required_team_cols = ["home_team", "away_team"]
+        required_odds_cols = ["home_closing_moneyline", "away_closing_moneyline"]
+        drop_mask = result[required_team_cols].isna().any(axis=1)
+        drop_mask |= result[required_odds_cols].isna().all(axis=1)
+        if drop_mask.any():
+            result = result.loc[~drop_mask]
+
+        missing_cols = [col for col in columns if col not in result.columns]
+        for col in missing_cols:
+            result[col] = pd.NaT if col.endswith("time") else None
+
+        return result[columns]
 
     def _build_travel_context_frame(
         self, records: List[Dict[str, Any]]
@@ -4926,7 +6464,7 @@ class NFLConfig:
     paper_trade_edge_threshold: float = 0.02
     paper_trade_bankroll: float = 1_000.0
     paper_trade_max_fraction: float = 0.05
-    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER") or "oddsportal"
+    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER") or "local"
     closing_odds_timeout: int = int(os.getenv("NFL_CLOSING_ODDS_TIMEOUT", "45"))
     closing_odds_download_dir: Optional[str] = os.getenv("NFL_CLOSING_ODDS_DOWNLOAD_DIR")
     oddsportal_base_url: str = os.getenv(
@@ -5477,7 +7015,18 @@ class MySportsFeedsClient:
     def _request(self, endpoint: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{API_PREFIX_NFL}/{endpoint}"
         logging.debug("Requesting MySportsFeeds endpoint %s", url)
-        resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
+        try:
+            resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
+        except ReadTimeout:
+            logging.warning(
+                "MySportsFeeds request to %s timed out after %ss; returning empty payload",
+                url,
+                self.timeout,
+            )
+            return {}
+        except RequestsConnectionError as exc:
+            logging.warning("MySportsFeeds request to %s failed: %s", url, exc)
+            return {}
         resp.raise_for_status()
         try:
             return resp.json()
@@ -7956,6 +9505,8 @@ class FeatureBuilder:
             return games
 
         working = games.copy()
+        if "week" in working.columns:
+            working["week"] = pd.to_numeric(working["week"], errors="coerce")
         if "start_time" in working.columns:
             working["start_time"] = pd.to_datetime(working["start_time"], errors="coerce")
             working["_start_date"] = working["start_time"].dt.normalize()
@@ -8023,12 +9574,16 @@ class FeatureBuilder:
             supplemental_closing = getattr(loader, "closing_odds_frame", None)
         if supplemental_closing is not None and not supplemental_closing.empty:
             supplemental = supplemental_closing.copy()
+            if "week" in supplemental.columns:
+                supplemental["week"] = pd.to_numeric(supplemental["week"], errors="coerce")
             supplemental["season"] = supplemental["season"].astype(str)
             for col in ["home_team", "away_team"]:
                 if col in supplemental.columns:
                     supplemental[col] = supplemental[col].apply(normalize_team_abbr)
+
             merge_keys: List[str] = []
             temporary_game_id_key = None
+
             if "game_id" in supplemental.columns and "game_id" in working.columns:
                 # Avoid dtype mismatches (object vs. int64) when merging on game_id by
                 # materializing a temporary, normalized key in both frames.
@@ -8036,18 +9591,40 @@ class FeatureBuilder:
                 working[temporary_game_id_key] = working["game_id"].astype(str)
                 supplemental[temporary_game_id_key] = supplemental["game_id"].astype(str)
                 merge_keys = [temporary_game_id_key]
-            elif {
-                "season",
-                "week",
-                "home_team",
-                "away_team",
-            }.issubset(supplemental.columns) and {
-                "season",
-                "week",
-                "home_team",
-                "away_team",
-            }.issubset(working.columns):
-                merge_keys = ["season", "week", "home_team", "away_team"]
+            else:
+                season_team_keys = {"season", "home_team", "away_team"}
+                working_has_core = season_team_keys.issubset(working.columns)
+                supplemental_has_core = season_team_keys.issubset(supplemental.columns)
+                supplemental_has_week = (
+                    "week" in supplemental.columns
+                    and supplemental["week"].notna().any()
+                )
+                if (
+                    supplemental_has_week
+                    and {"week"}.union(season_team_keys).issubset(supplemental.columns)
+                    and {"week"}.union(season_team_keys).issubset(working.columns)
+                ):
+                    merge_keys = ["season", "week", "home_team", "away_team"]
+                elif supplemental_has_core and working_has_core:
+                    merge_keys = ["season", "home_team", "away_team"]
+
+                if not merge_keys:
+                    closing_time = pd.to_datetime(
+                        supplemental.get("closing_line_time"), errors="coerce"
+                    )
+                    if closing_time.notna().any() and working_has_core:
+                        supplemental["_merge_start_date"] = closing_time.dt.normalize()
+                        working["_merge_start_date"] = working.get("_start_date")
+                        if (
+                            "_merge_start_date" in supplemental.columns
+                            and "_merge_start_date" in working.columns
+                        ):
+                            merge_keys = [
+                                "home_team",
+                                "away_team",
+                                "_merge_start_date",
+                            ]
+
             if merge_keys:
                 supplement_cols = [
                     "home_closing_moneyline",
@@ -8062,10 +9639,12 @@ class FeatureBuilder:
                 ]
                 if available_cols:
                     rename_map = {col: f"{col}_supp" for col in available_cols}
-                    supplemental = supplemental[merge_keys + available_cols].rename(
+                    supplemental_subset = supplemental[merge_keys + available_cols].rename(
                         columns=rename_map
                     )
-                    working = working.merge(supplemental, on=merge_keys, how="left")
+                    working = working.merge(
+                        supplemental_subset, on=merge_keys, how="left"
+                    )
                     for col in available_cols:
                         supplemental_col = f"{col}_supp"
                         if supplemental_col in working.columns:
@@ -8074,9 +9653,175 @@ class FeatureBuilder:
                             )
                             working.drop(columns=[supplemental_col], inplace=True)
 
+                # If orientation is flipped (e.g., neutral-site listings) the direct merge above
+                # will not populate closing lines. Build an order-agnostic team key so we can
+                # realign supplemental rows to the schedule’s home/away designation.
+                if available_cols:
+                    def _team_pair(series: pd.Series) -> str:
+                        teams = [
+                            str(series.get("home_team", "") or "").strip(),
+                            str(series.get("away_team", "") or "").strip(),
+                        ]
+                        teams = [team for team in teams if team]
+                        return "|".join(sorted(teams)) if teams else ""
+
+                    supplemental["_team_pair"] = supplemental.apply(_team_pair, axis=1)
+                    working["_team_pair"] = working.apply(_team_pair, axis=1)
+
+                    pair_keys: List[str] = []
+                    if {
+                        "season",
+                        "week",
+                        "_team_pair",
+                    }.issubset(supplemental.columns) and {
+                        "season",
+                        "week",
+                        "_team_pair",
+                    }.issubset(working.columns):
+                        pair_keys = ["season", "week", "_team_pair"]
+                    elif {"season", "_team_pair"}.issubset(supplemental.columns) and {
+                        "season",
+                        "_team_pair",
+                    }.issubset(working.columns):
+                        pair_keys = ["season", "_team_pair"]
+                    elif {
+                        "_merge_start_date",
+                        "_team_pair",
+                    }.issubset(supplemental.columns) and {
+                        "_merge_start_date",
+                        "_team_pair",
+                    }.issubset(working.columns):
+                        pair_keys = ["_merge_start_date", "_team_pair"]
+
+                    if pair_keys:
+                        pair_subset = supplemental[
+                            pair_keys
+                            + ["home_team", "away_team"]
+                            + available_cols
+                        ].copy()
+                        pair_subset = pair_subset.dropna(
+                            subset=["home_team", "away_team", "_team_pair"]
+                        )
+                        pair_subset = pair_subset.rename(
+                            columns={
+                                "home_team": "home_team_pair",
+                                "away_team": "away_team_pair",
+                                **{col: f"{col}_pair" for col in available_cols},
+                            }
+                        )
+                        pair_subset = pair_subset.drop_duplicates(subset=pair_keys)
+
+                        working = working.merge(
+                            pair_subset, on=pair_keys, how="left"
+                        )
+
+                        same_orientation = (
+                            working.get("home_team_pair") == working.get("home_team")
+                        )
+                        swapped_orientation = (
+                            working.get("home_team_pair") == working.get("away_team")
+                        )
+
+                        if "home_closing_moneyline_pair" in working.columns:
+                            mask = (
+                                working["home_closing_moneyline"].isna()
+                                & same_orientation
+                                & working["home_closing_moneyline_pair"].notna()
+                            )
+                            working.loc[
+                                mask, "home_closing_moneyline"
+                            ] = working.loc[mask, "home_closing_moneyline_pair"]
+
+                            mask = (
+                                working["home_closing_moneyline"].isna()
+                                & swapped_orientation
+                                & working["away_closing_moneyline_pair"].notna()
+                            )
+                            working.loc[
+                                mask, "home_closing_moneyline"
+                            ] = working.loc[mask, "away_closing_moneyline_pair"]
+
+                        if "away_closing_moneyline_pair" in working.columns:
+                            mask = (
+                                working["away_closing_moneyline"].isna()
+                                & same_orientation
+                                & working["away_closing_moneyline_pair"].notna()
+                            )
+                            working.loc[
+                                mask, "away_closing_moneyline"
+                            ] = working.loc[mask, "away_closing_moneyline_pair"]
+
+                            mask = (
+                                working["away_closing_moneyline"].isna()
+                                & swapped_orientation
+                                & working["home_closing_moneyline_pair"].notna()
+                            )
+                            working.loc[
+                                mask, "away_closing_moneyline"
+                            ] = working.loc[mask, "home_closing_moneyline_pair"]
+
+                        if "home_closing_implied_prob_pair" in working.columns:
+                            mask = (
+                                working["home_closing_implied_prob"].isna()
+                                & same_orientation
+                                & working["home_closing_implied_prob_pair"].notna()
+                            )
+                            working.loc[
+                                mask, "home_closing_implied_prob"
+                            ] = working.loc[mask, "home_closing_implied_prob_pair"]
+
+                            mask = (
+                                working["home_closing_implied_prob"].isna()
+                                & swapped_orientation
+                                & working["away_closing_implied_prob_pair"].notna()
+                            )
+                            working.loc[
+                                mask, "home_closing_implied_prob"
+                            ] = working.loc[mask, "away_closing_implied_prob_pair"]
+
+                        if "away_closing_implied_prob_pair" in working.columns:
+                            mask = (
+                                working["away_closing_implied_prob"].isna()
+                                & same_orientation
+                                & working["away_closing_implied_prob_pair"].notna()
+                            )
+                            working.loc[
+                                mask, "away_closing_implied_prob"
+                            ] = working.loc[mask, "away_closing_implied_prob_pair"]
+
+                            mask = (
+                                working["away_closing_implied_prob"].isna()
+                                & swapped_orientation
+                                & working["home_closing_implied_prob_pair"].notna()
+                            )
+                            working.loc[
+                                mask, "away_closing_implied_prob"
+                            ] = working.loc[mask, "home_closing_implied_prob_pair"]
+
+                        for meta_col in ("closing_bookmaker", "closing_line_time"):
+                            pair_col = f"{meta_col}_pair"
+                            if pair_col in working.columns:
+                                mask = (
+                                    working[meta_col].isna()
+                                    & working[pair_col].notna()
+                                )
+                                working.loc[mask, meta_col] = working.loc[mask, pair_col]
+
+                        drop_cols = ["home_team_pair", "away_team_pair"]
+                        drop_cols.extend(f"{col}_pair" for col in available_cols)
+                        working.drop(columns=drop_cols, inplace=True, errors="ignore")
+
+                    working.drop(columns=["_team_pair"], inplace=True, errors="ignore")
+                    supplemental.drop(columns=["_team_pair"], inplace=True, errors="ignore")
+
+
                 if temporary_game_id_key is not None:
                     working.drop(columns=[temporary_game_id_key], inplace=True, errors="ignore")
                     supplemental.drop(columns=[temporary_game_id_key], inplace=True, errors="ignore")
+                if "_merge_start_date" in working.columns:
+                    working.drop(columns=["_merge_start_date"], inplace=True, errors="ignore")
+                if "_merge_start_date" in supplemental.columns:
+                    supplemental.drop(columns=["_merge_start_date"], inplace=True, errors="ignore")
 
         working.drop(columns=["_start_date"], inplace=True, errors="ignore")
 
