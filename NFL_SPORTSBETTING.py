@@ -2098,6 +2098,897 @@ class OddsPortalFetcher:
         if isinstance(indicator, bool):
             return indicator
 
+        try:
+            adapter = HTTPAdapter(max_retries=retry, ssl_context=context)
+        except TypeError:
+            logging.debug(
+                "requests.HTTPAdapter does not support the ssl_context argument; "
+                "falling back to a legacy-compatible adapter"
+            )
+            adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        urllib3.disable_warnings(InsecureRequestWarning)
+        self._insecure_adapter_installed = True
+
+    def _extract_json_odds(self, entry: Dict[str, Any]) -> Optional[int]:
+        candidates: List[Tuple[bool, Optional[int]]] = []
+
+        def visit(node: Any, *, keyed: bool = False) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    is_odds_key = any(
+                        token in lower
+                        for token in (
+                            "american",
+                            "moneyline",
+                            "money_line",
+                            "price",
+                            "odds",
+                            "us",
+                        )
+                    )
+                    self._insecure_success_logged = True
+                return text
+        elif response.status_code in {HTTPStatus.FORBIDDEN, HTTPStatus.NOT_FOUND}:
+            logging.warning(
+                "OddsPortal request for %s returned status %s", url, response.status_code
+            )
+            return None
+        else:
+            logging.debug(
+                "OddsPortal request for %s returned status %s", url, response.status_code
+            )
+        return None
+
+    def _discover_additional_pages(self, base_url: str, html: str) -> List[str]:
+        if BeautifulSoup is None:
+            return []
+        soup = BeautifulSoup(html, "html.parser")
+        pages: Set[str] = set()
+        for anchor in soup.find_all("a", href=True):
+            match = re.search(r"/page/(\d+)/", anchor["href"])
+            if not match:
+                continue
+            page = match.group(1)
+            candidate = urljoin(base_url, f"page/{page}/")
+            pages.add(candidate)
+        return sorted(pages)
+
+    def _parse_results_page(self, html: str, season_label: str) -> pd.DataFrame:
+        global _BEAUTIFULSOUP_WARNING_EMITTED
+        if BeautifulSoup is None:
+            if not _BEAUTIFULSOUP_WARNING_EMITTED:
+                logging.warning(
+                    "BeautifulSoup is required to parse OddsPortal pages; install beautifulsoup4"
+                )
+                _BEAUTIFULSOUP_WARNING_EMITTED = True
+            return pd.DataFrame()
+
+        soup = BeautifulSoup(html, "html.parser")
+        table = soup.find(class_=re.compile(r"\btable-main\b"))
+        if table is None:
+            table = soup.find(id=re.compile("tournamentTable", re.IGNORECASE))
+        if table is None:
+            modern_rows = self._parse_modern_results(soup, season_label)
+            if not modern_rows.empty:
+                return modern_rows
+            state_rows = self._parse_embedded_state(html, season_label, soup=soup)
+            if not state_rows.empty:
+                return state_rows
+            try:
+                frames = pd.read_html(io.StringIO(html))
+            except Exception:
+                frames = []
+            if not frames:
+                return pd.DataFrame()
+            # Fallback: attempt to normalise first readable table
+            for frame in frames:
+                if frame.empty:
+                    continue
+                normalized = self._normalise_table(frame, season_label)
+                if not normalized.empty:
+                    return normalized
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+        for node in table.find_all(class_=re.compile("event__match")):
+            header = node.find_previous(class_=re.compile("event__header"))
+            current_date = None
+            if header is not None:
+                for ancestor in header.parents:
+                    if ancestor is table:
+                        current_date = header.get_text(" ", strip=True)
+                        break
+
+            home_node = node.find(class_=re.compile("event__participant--home"))
+            away_node = node.find(class_=re.compile("event__participant--away"))
+            if home_node is None or away_node is None:
+                continue
+            home_team = normalize_team_abbr(home_node.get_text(" ", strip=True))
+            away_team = normalize_team_abbr(away_node.get_text(" ", strip=True))
+
+            time_node = node.find(class_=re.compile("event__time"))
+            scores_node = node.find(class_=re.compile("event__scores"))
+            odds_nodes = node.find_all(class_=re.compile("(odd|odds)"))
+
+            kickoff = _parse_oddsportal_datetime(
+                current_date,
+                time_node.get_text(strip=True) if time_node else None,
+            )
+
+            home_score = away_score = np.nan
+            if scores_node:
+                score_match = re.findall(r"\d+", scores_node.get_text(" ", strip=True))
+                if len(score_match) >= 2:
+                    home_score = float(score_match[0])
+                    away_score = float(score_match[1])
+
+            decimals: List[float] = []
+            for odds in odds_nodes:
+                value = _parse_decimal_odds(odds.get_text(" ", strip=True))
+                if value is not None:
+                    decimals.append(value)
+            home_decimal = decimals[0] if decimals else None
+            away_decimal = decimals[-1] if len(decimals) > 1 else None
+
+            rows.append(
+                {
+                    "season": season_label,
+                    "week": np.nan,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_closing_moneyline": _decimal_to_american(home_decimal),
+                    "away_closing_moneyline": _decimal_to_american(away_decimal),
+                    "closing_bookmaker": "OddsPortal",
+                    "closing_line_time": kickoff,
+                    "kickoff_utc": kickoff,
+                    "kickoff_date": kickoff.strftime("%Y-%m-%d") if kickoff else "",
+                    "kickoff_weekday": kickoff.strftime("%a") if kickoff else "",
+                    "home_score": home_score,
+                    "away_score": away_score,
+                }
+            )
+
+        if rows:
+            return pd.DataFrame(rows)
+
+        modern_rows = self._parse_modern_results(soup, season_label)
+        if not modern_rows.empty:
+            return modern_rows
+        state_rows = self._parse_embedded_state(html, season_label, soup=soup)
+        if not state_rows.empty:
+            return state_rows
+
+        try:
+            frames = pd.read_html(io.StringIO(html))
+        except Exception:
+            return pd.DataFrame()
+        for frame in frames:
+            if frame.empty:
+                continue
+            normalized = self._normalise_table(frame, season_label)
+            if not normalized.empty:
+                return normalized
+
+        return pd.DataFrame()
+
+    def _debug_capture_failure(self, slug: str, html: str, *, source_url: str) -> None:
+        if not html:
+            return
+
+        key = f"{slug}|{source_url}"
+        if key in self._debug_capture_logged:
+            return
+        self._debug_capture_logged.add(key)
+
+        html_bytes = len(html)
+        legacy_nodes = modern_rows = participant_nodes = next_data_scripts = 0
+        json_like = False
+
+        if BeautifulSoup is not None:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+            except Exception as exc:
+                logging.debug(
+                    "OddsPortal diagnostics unable to parse HTML for %s (%s): %s",
+                    source_url,
+                    slug,
+                    exc,
+                )
+            else:
+                legacy_nodes = len(soup.find_all(class_=re.compile("event__match")))
+                modern_rows = len(self._find_by_testid(soup, "game-row"))
+                participant_nodes = len(self._find_by_testid(soup, "event-participants"))
+                next_data_scripts = len(soup.find_all(id="__NEXT_DATA__"))
+                if not legacy_nodes and not modern_rows:
+                    snippet = html.lstrip()
+                    json_like = snippet.startswith("{") or snippet.startswith("[")
+                else:
+                    json_like = False
+        else:
+            snippet = html.lstrip()
+            json_like = snippet.startswith("{") or snippet.startswith("[")
+
+        logging.info(
+            "OddsPortal parse diagnostics for %s -> %s: html_bytes=%d legacy_nodes=%d modern_rows=%d participant_nodes=%d next_data_scripts=%d json_like=%s",
+            slug,
+            source_url,
+            html_bytes,
+            legacy_nodes,
+            modern_rows,
+            participant_nodes,
+            next_data_scripts,
+            json_like,
+        )
+
+        self._debug_dump_html(slug, source_url, html)
+
+    def _debug_dump_html(self, slug: str, source_url: str, html: str) -> None:
+        if not self._debug_dump_enabled or not html or self._debug_dir is None:
+            return
+
+        key = f"{slug}|{source_url}"
+        if key in self._debug_dumped_sources:
+            return
+        self._debug_dumped_sources.add(key)
+
+        timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        safe_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/")) or "root"
+        filename = f"{timestamp}_{safe_slug}.html"
+        path = self._debug_dir / filename
+
+        try:
+            path.write_text(html, encoding="utf-8")
+        except Exception:
+            logging.exception("Failed to write OddsPortal debug HTML to %s", path)
+            self._debug_dump_enabled = False
+            return
+
+        logging.warning(
+            "Saved OddsPortal HTML snapshot to %s for slug %s (%s). Share this file if parsing remains empty.",
+            path,
+            slug,
+            source_url,
+        )
+
+    def _debug_warn_no_rows(self, slug: str, season_label: str, source_url: str) -> None:
+        key = f"{season_label}|{slug}"
+        if key in self._no_rows_warned:
+            return
+
+        self._no_rows_warned.add(key)
+        logging.warning(
+            "OddsPortal parser did not find closing odds for slug %s (season %s, url=%s). Set NFL_ODDSPORTAL_DEBUG_HTML=1 and rerun to capture the raw HTML for troubleshooting.",
+            slug,
+            season_label,
+            source_url,
+        )
+
+    def _tag_testid_values(self, tag: "Tag") -> Sequence[str]:
+        values: List[str] = []
+        if not isinstance(tag, Tag):
+            return values
+
+        for attr, raw_value in tag.attrs.items():
+            try:
+                attr_name = str(attr).lower()
+            except Exception:
+                continue
+
+            if not attr_name.startswith("data-test"):
+                continue
+
+            def _append(value: Any) -> None:
+                if value is None:
+                    return
+                if isinstance(value, (list, tuple, set)):
+                    for item in value:
+                        _append(item)
+                else:
+                    try:
+                        values.append(str(value))
+                    except Exception:
+                        pass
+
+            _append(raw_value)
+
+        return values
+
+    def _tag_has_testid(self, tag: "Tag", targets: Sequence[str]) -> bool:
+        if not isinstance(tag, Tag):
+            return False
+
+        normalized_targets = [t.strip().lower() for t in targets if t]
+        if not normalized_targets:
+            return False
+
+        for value in self._tag_testid_values(tag):
+            token = value.strip().lower()
+            if not token:
+                continue
+            for target in normalized_targets:
+                if not target:
+                    continue
+                if token == target:
+                    return True
+                if token.startswith(target):
+                    return True
+                if target in token:
+                    return True
+        return False
+
+    def _find_by_testid(self, root: "BeautifulSoup", *targets: str) -> List["Tag"]:
+        if BeautifulSoup is None or Tag is None:
+            return []
+
+        normalized_targets = [t for t in targets if t]
+
+        def matcher(node: Any) -> bool:
+            return self._tag_has_testid(node, normalized_targets)
+
+        return list(root.find_all(matcher)) if normalized_targets else []
+
+    def _parse_modern_results(self, soup: "BeautifulSoup", season_label: str) -> pd.DataFrame:
+        if Tag is None:
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+
+        for node in self._find_by_testid(soup, "game-row"):
+            if not isinstance(node, Tag):
+                continue
+
+            parent = node.parent
+            skip = False
+            while isinstance(parent, Tag):
+                if self._tag_has_testid(parent, ["game-row"]):
+                    skip = True
+                    break
+                parent = parent.parent
+            if skip:
+                continue
+
+            container = node if node.name != "a" else node.parent
+            if not isinstance(container, Tag):
+                container = node
+
+            participants = None
+            for candidate in self._find_by_testid(container, "event-participants"):
+                participants = candidate
+                break
+            if not isinstance(participants, Tag):
+                continue
+
+            score_pattern = re.compile(r"^-?\d+$")
+
+            def _extract_team(tag: "Tag") -> Tuple[str, Optional[float]]:
+                raw_name = (tag.get("title") or "").strip()
+                if not raw_name:
+                    name_node = tag.find(class_=re.compile("participant-name"))
+                    if isinstance(name_node, Tag):
+                        raw_name = name_node.get_text(" ", strip=True)
+                    elif tag.name == "p" and re.search("participant-name", " ".join(tag.get("class", []))):
+                        raw_name = tag.get_text(" ", strip=True)
+                    else:
+                        raw_name = tag.get_text(" ", strip=True)
+
+                team = normalize_team_abbr(raw_name)
+                if not team:
+                    return "", None
+
+                score_value: Optional[float] = None
+                for candidate in tag.find_all(True):
+                    if not isinstance(candidate, Tag):
+                        continue
+                    text = candidate.get_text("", strip=True)
+                    if score_pattern.fullmatch(text):
+                        try:
+                            score_value = float(text)
+                        except ValueError:
+                            score_value = None
+                        break
+                if score_value is None:
+                    for token in tag.stripped_strings:
+                        text = token.strip()
+                        if score_pattern.fullmatch(text):
+                            try:
+                                score_value = float(text)
+                            except ValueError:
+                                score_value = None
+                            break
+
+                if score_value is None:
+                    sibling = tag
+                    for _ in range(3):
+                        sibling = getattr(sibling, "next_sibling", None)
+                        while isinstance(sibling, str) and not sibling.strip():
+                            sibling = getattr(sibling, "next_sibling", None)
+                        if not isinstance(sibling, Tag):
+                            continue
+                        text = sibling.get_text("", strip=True)
+                        if score_pattern.fullmatch(text):
+                            try:
+                                score_value = float(text)
+                            except ValueError:
+                                score_value = None
+                            break
+                        for token in sibling.stripped_strings:
+                            t = token.strip()
+                            if score_pattern.fullmatch(t):
+                                try:
+                                    score_value = float(t)
+                                except ValueError:
+                                    score_value = None
+                                break
+                        if score_value is not None:
+                            break
+
+                return team, score_value
+
+            teams: List[Tuple[str, Optional[float]]] = []
+            for link in participants.find_all("a"):
+                if not isinstance(link, Tag):
+                    continue
+                team, score = _extract_team(link)
+                if not team:
+                    continue
+                teams.append((team, score))
+                if len(teams) >= 2:
+                    break
+
+            if len(teams) < 2:
+                for name_node in participants.find_all(class_=re.compile("participant-name")):
+                    if not isinstance(name_node, Tag):
+                        continue
+                    team, score = _extract_team(name_node)
+                    if not team:
+                        continue
+                    teams.append((team, score))
+                    if len(teams) >= 2:
+                        break
+
+            if len(teams) < 2:
+                continue
+
+            away_team, away_score = teams[0]
+            home_team, home_score = teams[1]
+
+            if not away_team or not home_team:
+                continue
+
+            time_node: Optional[Tag] = None
+            for candidate in self._find_by_testid(container, "time-item"):
+                time_node = candidate
+                break
+            time_text = (
+                time_node.get_text(" ", strip=True)
+                if isinstance(time_node, Tag)
+                else None
+            )
+
+            date_text = self._find_associated_date(container)
+            kickoff = _parse_oddsportal_datetime(date_text, time_text)
+
+            odds_values: List[int] = []
+            for odd_container in container.find_all(True):
+                if not isinstance(odd_container, Tag):
+                    continue
+                if not (
+                    self._tag_has_testid(odd_container, ["odd-container"])
+                    or any(
+                        str(attr or "").lower().startswith("data-odd-container")
+                        for attr in odd_container.attrs.keys()
+                    )
+                ):
+                    continue
+                price = _parse_moneyline_text(odd_container.get_text(" ", strip=True))
+                if price is None:
+                    continue
+                odds_values.append(price)
+                if len(odds_values) >= 2:
+                    break
+
+            away_moneyline = odds_values[0] if odds_values else None
+            home_moneyline = odds_values[1] if len(odds_values) > 1 else None
+
+            rows.append(
+                {
+                    "season": season_label,
+                    "week": np.nan,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_closing_moneyline": home_moneyline,
+                    "away_closing_moneyline": away_moneyline,
+                    "closing_bookmaker": "OddsPortal",
+                    "closing_line_time": kickoff,
+                    "kickoff_utc": kickoff,
+                    "kickoff_date": kickoff.strftime("%Y-%m-%d") if kickoff else "",
+                    "kickoff_weekday": kickoff.strftime("%a") if kickoff else "",
+                    "home_score": home_score if home_score is not None else np.nan,
+                    "away_score": away_score if away_score is not None else np.nan,
+                }
+            )
+
+        if not rows:
+            return pd.DataFrame()
+
+        return pd.DataFrame(rows)
+
+    def _parse_embedded_state(
+        self,
+        html: str,
+        season_label: str,
+        *,
+        soup: Optional["BeautifulSoup"] = None,
+    ) -> pd.DataFrame:
+        if BeautifulSoup is None:
+            return pd.DataFrame()
+
+        if soup is None:
+            soup = BeautifulSoup(html, "html.parser")
+
+        payloads = self._extract_json_payloads(html, soup)
+        if not payloads:
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+        seen: Set[Tuple[Any, ...]] = set()
+
+        for payload in payloads:
+            data = self._safe_json_loads(payload)
+            if data is None:
+                continue
+
+            name_cache: Dict[int, Optional[str]] = {}
+            for ancestors, _, participant_list in self._iter_json_candidate_lists(
+                data, name_cache
+            ):
+                normalized = self._normalise_json_participants(participant_list, name_cache)
+                if len(normalized) < 2:
+                    continue
+
+                valid_entries = [entry for entry in normalized if entry.get("team")]
+                if len({entry["team"] for entry in valid_entries}) < 2:
+                    continue
+
+                has_odds = any(entry.get("moneyline") is not None for entry in valid_entries)
+                if not has_odds:
+                    continue
+
+                home_entry = next((e for e in valid_entries if e.get("is_home") is True), None)
+                away_entry = next((e for e in valid_entries if e.get("is_home") is False), None)
+
+                if home_entry is None or away_entry is None:
+                    ordered = sorted(
+                        valid_entries,
+                        key=lambda item: (
+                            0 if item.get("is_home") is False else 1 if item.get("is_home") is True else 2,
+                            item.get("index", 0),
+                        ),
+                    )
+                    if len(ordered) >= 2:
+                        away_entry, home_entry = ordered[0], ordered[1]
+                    else:
+                        continue
+
+                kickoff = self._extract_json_kickoff(ancestors)
+
+                key = (
+                    home_entry.get("team"),
+                    away_entry.get("team"),
+                    kickoff.isoformat() if isinstance(kickoff, pd.Timestamp) else kickoff,
+                    home_entry.get("moneyline"),
+                    away_entry.get("moneyline"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                rows.append(
+                    {
+                        "season": season_label,
+                        "week": np.nan,
+                        "home_team": home_entry.get("team"),
+                        "away_team": away_entry.get("team"),
+                        "home_closing_moneyline": home_entry.get("moneyline"),
+                        "away_closing_moneyline": away_entry.get("moneyline"),
+                        "closing_bookmaker": "OddsPortal",
+                        "closing_line_time": kickoff,
+                        "kickoff_utc": kickoff,
+                        "kickoff_date": kickoff.strftime("%Y-%m-%d") if isinstance(kickoff, pd.Timestamp) else "",
+                        "kickoff_weekday": kickoff.strftime("%a") if isinstance(kickoff, pd.Timestamp) else "",
+                        "home_score": home_entry.get("score", np.nan),
+                        "away_score": away_entry.get("score", np.nan),
+                    }
+                )
+
+        if not rows:
+            return pd.DataFrame()
+
+        frame = pd.DataFrame(rows)
+        frame["kickoff_utc"] = pd.to_datetime(frame["kickoff_utc"], utc=True, errors="coerce")
+        frame["closing_line_time"] = frame["kickoff_utc"]
+        frame["kickoff_date"] = frame["kickoff_utc"].dt.strftime("%Y-%m-%d").fillna("")
+        frame["kickoff_weekday"] = frame["kickoff_utc"].dt.strftime("%a").fillna("")
+        frame["home_score"] = pd.to_numeric(frame["home_score"], errors="coerce")
+        frame["away_score"] = pd.to_numeric(frame["away_score"], errors="coerce")
+        frame["home_score"] = frame["home_score"].where(frame["home_score"].notna(), np.nan)
+        frame["away_score"] = frame["away_score"].where(frame["away_score"].notna(), np.nan)
+
+        return frame.reset_index(drop=True)
+
+    def _extract_json_payloads(
+        self, html: str, soup: Optional["BeautifulSoup"]
+    ) -> List[str]:
+        payloads: List[str] = []
+
+        stripped = html.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            payloads.append(stripped)
+
+        if soup is not None:
+            for script in soup.find_all("script"):
+                text = script.string or script.get_text()
+                if not text:
+                    continue
+                if script.get("id") == "__NEXT_DATA__":
+                    payloads.append(text)
+                    continue
+                snippet = text.strip()
+                if any(token in snippet for token in ("__NEXT_DATA__", "__NUXT__", "eventGroup")):
+                    payloads.append(snippet)
+
+        patterns = [
+            r"<script[^>]+id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>",
+            r"window\.__NEXT_DATA__\s*=\s*(\{.*?\})\s*;",
+            r"window\.__NUXT__\s*=\s*(\{.*?\})\s*;",
+            r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;",
+            r"data-state=(?:\"|\')(\{.*?\})(?:\"|\')",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, html, flags=re.DOTALL):
+                payloads.append(match.group(1))
+
+        unique: List[str] = []
+        seen: Set[str] = set()
+        for payload in payloads:
+            if not payload:
+                continue
+            cleaned = unescape(payload).strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            unique.append(cleaned)
+
+        return unique
+
+    def _safe_json_loads(self, payload: str) -> Optional[Any]:
+        text = (payload or "").strip()
+        if not text:
+            return None
+
+        text = unescape(text)
+        text = text.strip()
+
+        for prefix in ("window.__NEXT_DATA__", "window.__NUXT__", "window.__INITIAL_STATE__"):
+            if text.startswith(prefix):
+                parts = text.split("=", 1)
+                text = parts[1] if len(parts) == 2 else ""
+                break
+
+        text = text.strip()
+        if text.startswith("export default"):
+            text = text[len("export default") :].strip()
+
+        if text.startswith("const ") or text.startswith("var "):
+            parts = text.split("=", 1)
+            text = parts[1] if len(parts) == 2 else ""
+
+        text = text.strip()
+        if text.endswith(";"):
+            text = text[:-1]
+
+        text = text.strip()
+        if not text:
+            return None
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            sanitized = re.sub(r"//.*?$", "", text, flags=re.MULTILINE).strip()
+            sanitized = sanitized.strip(";")
+            if not sanitized:
+                return None
+            try:
+                return json.loads(sanitized)
+            except json.JSONDecodeError:
+                return None
+
+    def _iter_json_candidate_lists(
+        self, data: Any, name_cache: Dict[int, Optional[str]]
+    ) -> Iterable[Tuple[List[Dict[str, Any]], Optional[str], List[Dict[str, Any]]]]:
+        if not isinstance(data, (dict, list)):
+            return []
+
+        visited_lists: Set[int] = set()
+        stack: List[Tuple[List[Dict[str, Any]], Any]] = [([], data)]
+
+        while stack:
+            ancestors, node = stack.pop()
+
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if isinstance(value, list):
+                        if id(value) not in visited_lists:
+                            visited_lists.add(id(value))
+                            if self._looks_like_participant_list(value, name_cache):
+                                yield ancestors + [node], key, value  # type: ignore[arg-type]
+                            stack.append((ancestors + [node], value))
+                    elif isinstance(value, (dict, list)):
+                        stack.append((ancestors + [node], value))
+            elif isinstance(node, list):
+                for item in node:
+                    stack.append((ancestors, item))
+
+    def _looks_like_participant_list(
+        self, value: Sequence[Any], name_cache: Dict[int, Optional[str]]
+    ) -> bool:
+        if not isinstance(value, Sequence) or len(value) < 2:
+            return False
+
+        dict_count = sum(1 for item in value if isinstance(item, dict))
+        if dict_count < 2:
+            return False
+
+        identified = 0
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            name = self._extract_json_team_name(item, name_cache)
+            if name:
+                identified += 1
+            if identified >= 2:
+                return True
+
+        return False
+
+    def _normalise_json_participants(
+        self, entries: Sequence[Any], name_cache: Dict[int, Optional[str]]
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+
+            name = self._extract_json_team_name(entry, name_cache)
+            if not name:
+                continue
+
+            team = normalize_team_abbr(name)
+            if not team:
+                continue
+
+            normalized.append(
+                {
+                    "team": team,
+                    "is_home": self._infer_json_home_indicator(entry),
+                    "moneyline": self._extract_json_odds(entry),
+                    "score": self._extract_json_score(entry),
+                    "index": index,
+                }
+            )
+
+        return normalized
+
+    def _extract_json_team_name(
+        self, node: Any, cache: Dict[int, Optional[str]]
+    ) -> Optional[str]:
+        queue: List[Any] = [node]
+        seen: Set[int] = set()
+
+        while queue:
+            current = queue.pop(0)
+            node_id = id(current)
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+
+            if node_id in cache:
+                cached = cache[node_id]
+                if cached:
+                    return cached
+                continue
+
+            if isinstance(current, dict):
+                for key, value in current.items():
+                    lower = str(key).lower()
+                    if any(
+                        token in lower
+                        for token in (
+                            "name",
+                            "team",
+                            "participant",
+                            "competitor",
+                            "club",
+                            "title",
+                            "slug",
+                            "abbr",
+                            "abbreviation",
+                        )
+                    ):
+                        if isinstance(value, str):
+                            cleaned = value.strip()
+                            if cleaned and any(ch.isalpha() for ch in cleaned):
+                                cache[node_id] = cleaned
+                                return cleaned
+                        elif isinstance(value, (dict, list)):
+                            queue.append(value)
+                            continue
+                    if isinstance(value, (dict, list)):
+                        queue.append(value)
+
+                cache[node_id] = None
+
+            elif isinstance(current, list):
+                queue.extend(current)
+
+        return None
+
+    def _infer_json_home_indicator(self, entry: Dict[str, Any]) -> Optional[bool]:
+        for key, value in entry.items():
+            lower = str(key).lower()
+            if lower in {"ishome", "home"}:
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    if value == 1:
+                        return True
+                    if value == 0 or value == -1:
+                        return False
+                if isinstance(value, str):
+                    token = value.strip().lower()
+                    if token.startswith("home") or token in {"h", "host"}:
+                        return True
+                    if token.startswith("away") or token in {"a", "visitor", "road", "guest"}:
+                        return False
+
+        for key in (
+            "homeAway",
+            "home_away",
+            "homeAwayTeam",
+            "qualifier",
+            "alignment",
+            "side",
+            "designation",
+            "teamType",
+            "teamRole",
+            "venueType",
+        ):
+            if key not in entry:
+                continue
+            value = entry[key]
+            if isinstance(value, str):
+                token = value.strip().lower()
+                if "home" in token and "away" not in token:
+                    return True
+                if any(tag in token for tag in ("away", "road", "guest", "visitor")):
+                    return False
+            elif isinstance(value, dict):
+                nested = value.get("value") or value.get("label") or value.get("name")
+                if isinstance(nested, str):
+                    nested_token = nested.strip().lower()
+                    if "home" in nested_token and "away" not in nested_token:
+                        return True
+                    if any(tag in nested_token for tag in ("away", "road", "guest", "visitor")):
+                        return False
+
+        indicator = entry.get("isHome")
+        if isinstance(indicator, bool):
+            return indicator
+
         return None
 
     def _extract_json_odds(self, entry: Dict[str, Any]) -> Optional[int]:
