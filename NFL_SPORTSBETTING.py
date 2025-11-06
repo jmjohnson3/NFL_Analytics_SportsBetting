@@ -5284,6 +5284,37 @@ TEAM_NAME_TO_ABBR = {
     "st louis rams": "LA",
 }
 
+CITY_NAME_TO_ABBR = {
+    "arizona": "ARI",
+    "atlanta": "ATL",
+    "baltimore": "BAL",
+    "buffalo": "BUF",
+    "carolina": "CAR",
+    "chicago": "CHI",
+    "cincinnati": "CIN",
+    "cleveland": "CLE",
+    "dallas": "DAL",
+    "denver": "DEN",
+    "detroit": "DET",
+    "green bay": "GB",
+    "houston": "HOU",
+    "indianapolis": "IND",
+    "jacksonville": "JAX",
+    "kansas city": "KC",
+    "las vegas": "LV",
+    "miami": "MIA",
+    "minnesota": "MIN",
+    "new england": "NE",
+    "new orleans": "NO",
+    "philadelphia": "PHI",
+    "pittsburgh": "PIT",
+    "san francisco": "SF",
+    "seattle": "SEA",
+    "tampa bay": "TB",
+    "tennessee": "TEN",
+    "washington": "WAS",
+}
+
 TEAM_ABBR_CANONICAL = {
     "ARI": "arizona cardinals",
     "ATL": "atlanta falcons",
@@ -5443,6 +5474,9 @@ def normalize_team_abbr(value: Any) -> Optional[str]:
 
     if sanitized in TEAM_NAME_TO_ABBR:
         return TEAM_NAME_TO_ABBR[sanitized]
+
+    if sanitized in CITY_NAME_TO_ABBR:
+        return CITY_NAME_TO_ABBR[sanitized]
 
     sanitized_candidate = sanitized.replace(" ", "").upper()
     if sanitized_candidate in TEAM_ABBR_ALIASES:
