@@ -1252,19 +1252,57 @@ class OddsPortalFetcher:
         )
         return None
 
-    def _discover_additional_pages(self, base_url: str, html: str) -> List[str]:
-        if BeautifulSoup is None:
-            return []
-        soup = BeautifulSoup(html, "html.parser")
-        pages: Set[str] = set()
-        for anchor in soup.find_all("a", href=True):
-            match = re.search(r"/page/(\d+)/", anchor["href"])
-            if not match:
+    def _extract_json_score(self, entry: Dict[str, Any]) -> Optional[float]:
+        values: List[float] = []
+
+        def visit(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    if any(token in lower for token in ("score", "points", "result")):
+                        if isinstance(value, (int, float)):
+                            values.append(float(value))
+                        elif isinstance(value, str):
+                            match = re.search(r"-?\d+(?:\.\d+)?", value)
+                            if match:
+                                try:
+                                    values.append(float(match.group(0)))
+                                except ValueError:
+                                    pass
+                        elif isinstance(value, (dict, list)):
+                            visit(value)
+                    elif isinstance(value, (dict, list)):
+                        visit(value)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item)
+
+        visit(entry)
+
+        return values[0] if values else None
+
+    def _extract_json_kickoff(self, ancestors: Sequence[Dict[str, Any]]) -> Optional[pd.Timestamp]:
+        for container in reversed(ancestors):
+            if not isinstance(container, dict):
                 continue
-            page = match.group(1)
-            candidate = urljoin(base_url, f"page/{page}/")
-            pages.add(candidate)
-        return sorted(pages)
+            for key, value in container.items():
+                lower = str(key).lower()
+                if any(
+                    token in lower
+                    for token in (
+                        "start",
+                        "kickoff",
+                        "commence",
+                        "date",
+                        "time",
+                        "begin",
+                        "eventtime",
+                        "timestamp",
+                    )
+                ):
+                    timestamp = self._convert_json_datetime(value)
+                    if timestamp is not None:
+                        return timestamp
 
     def _parse_results_page(self, html: str, season_label: str) -> pd.DataFrame:
         global _BEAUTIFULSOUP_WARNING_EMITTED
