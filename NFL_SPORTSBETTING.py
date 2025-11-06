@@ -300,6 +300,182 @@ def _combine_date_time(
     return date_values
 
 
+def _reshape_team_based_closing_rows(
+    frame: pd.DataFrame,
+    provider_name: str,
+    *,
+    season_hint: Optional[str],
+    season_col: Optional[str],
+    week_col: Optional[str],
+    date_col: Optional[str],
+    time_col: Optional[str],
+    site_col: Optional[str],
+    team_col: Optional[str],
+    opp_col: Optional[str],
+    ml_col: Optional[str],
+    book_col: Optional[str],
+) -> pd.DataFrame:
+    if not all([team_col, opp_col, ml_col]):
+        logging.warning(
+            "%s dataset is missing explicit team/opponent columns and cannot be reshaped",
+            provider_name,
+        )
+        return pd.DataFrame()
+
+    working = frame.copy()
+    working["_team"] = working[team_col].apply(normalize_team_abbr)
+    working["_opp"] = working[opp_col].apply(normalize_team_abbr)
+    working["_ml"] = _parse_moneyline_series(working[ml_col])
+
+    if site_col:
+        site_values = (
+            working[site_col].astype(str).str.strip().str.upper()
+        )
+    else:
+        site_values = pd.Series("", index=working.index)
+    working["_site"] = site_values
+    working["_is_home"] = working["_site"].str.startswith("H")
+    working["_is_away"] = working["_site"].str.startswith("A")
+
+    if season_col:
+        working["_season"] = working[season_col]
+    else:
+        working["_season"] = season_hint
+
+    if week_col:
+        working["_week"] = pd.to_numeric(working[week_col], errors="coerce")
+    else:
+        working["_week"] = np.nan
+
+    kickoff_series = _combine_date_time(
+        working[date_col] if date_col else None,
+        working[time_col] if time_col else None,
+    )
+    working["_kickoff"] = kickoff_series
+
+    working["_key"] = working.apply(
+        lambda row: _compose_game_key(
+            row.get("_season"),
+            row.get("_week"),
+            row.get("_kickoff"),
+            row.get("_team"),
+            row.get("_opp"),
+        ),
+        axis=1,
+    )
+
+    records: List[Dict[str, Any]] = []
+    for _key, group in working.groupby("_key"):
+        group = group.dropna(subset=["_team", "_opp"])
+        if group.empty:
+            continue
+
+        home_row = group[group["_is_home"]].head(1)
+        away_row = group[group["_is_away"]].head(1)
+
+        chosen_home: Optional[pd.Series] = home_row.iloc[0] if not home_row.empty else None
+        chosen_away: Optional[pd.Series] = None
+
+        if chosen_home is not None:
+            counterpart = group[group["_team"] == chosen_home["_opp"]]
+            if not counterpart.empty:
+                chosen_away = counterpart.iloc[0]
+
+        if chosen_home is None and not away_row.empty:
+            candidate_away = away_row.iloc[0]
+            counterpart = group[group["_team"] == candidate_away["_opp"]]
+            if not counterpart.empty:
+                chosen_home = counterpart.iloc[0]
+                chosen_away = candidate_away
+
+        if chosen_home is None or chosen_away is None:
+            pair_found = False
+            for _, row in group.iterrows():
+                counterpart = group[group["_team"] == row["_opp"]]
+                if counterpart.empty:
+                    continue
+                other = counterpart.iloc[0]
+                candidate_home, candidate_away = row, other
+                if candidate_home["_is_away"] and not candidate_away["_is_away"]:
+                    candidate_home, candidate_away = candidate_away, candidate_home
+                elif candidate_away["_is_home"] and not candidate_home["_is_home"]:
+                    candidate_home, candidate_away = candidate_away, candidate_home
+                chosen_home = candidate_home
+                chosen_away = candidate_away
+                pair_found = True
+                break
+            if not pair_found:
+                logging.warning(
+                    "%s dataset could not resolve complementary home/away rows for game %s",
+                    provider_name,
+                    _key,
+                )
+                continue
+
+        if chosen_home is None or chosen_away is None:
+            continue
+
+        home_team = chosen_home.get("_team")
+        away_team = chosen_away.get("_team")
+        home_ml = chosen_home.get("_ml")
+        away_ml = chosen_away.get("_ml")
+
+        if pd.isna(home_team) or pd.isna(away_team):
+            continue
+        if pd.isna(home_ml) and pd.isna(away_ml):
+            continue
+
+        if pd.isna(home_ml) and not pd.isna(away_ml):
+            logging.debug(
+                "%s dataset is missing a home moneyline for matchup %s; skipping",
+                provider_name,
+                _key,
+            )
+            continue
+        if pd.isna(away_ml) and not pd.isna(home_ml):
+            logging.debug(
+                "%s dataset is missing an away moneyline for matchup %s; skipping",
+                provider_name,
+                _key,
+            )
+            continue
+
+        season_value = chosen_home.get("_season")
+        week_value = chosen_home.get("_week")
+        kickoff_value = chosen_home.get("_kickoff")
+        if (kickoff_value is None or pd.isna(kickoff_value)) and chosen_away is not None:
+            alt_kickoff = chosen_away.get("_kickoff")
+            if alt_kickoff is not None and not pd.isna(alt_kickoff):
+                kickoff_value = alt_kickoff
+
+        bookmaker_value: Optional[str] = None
+        if book_col:
+            home_book = chosen_home.get(book_col)
+            away_book = chosen_away.get(book_col)
+            if isinstance(home_book, str) and home_book.strip():
+                bookmaker_value = home_book.strip()
+            elif isinstance(away_book, str) and away_book.strip():
+                bookmaker_value = away_book.strip()
+
+        records.append(
+            {
+                "season": str(season_value if season_value not in (None, "") else season_hint or ""),
+                "week": week_value,
+                "home_team": home_team,
+                "away_team": away_team,
+                "home_closing_moneyline": home_ml,
+                "away_closing_moneyline": away_ml,
+                "closing_line_time": kickoff_value,
+                "closing_bookmaker": bookmaker_value or provider_name,
+            }
+        )
+
+    if not records:
+        return pd.DataFrame()
+
+    return pd.DataFrame.from_records(records)
+
+
 def _safe_week_value(value: Any) -> Optional[int]:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return None
@@ -347,120 +523,39 @@ def _normalize_historical_closing_frame(
     date_col = _match_column(columns, DATE_COLUMN_CANDIDATES)
     time_col = _match_column(columns, TIME_COLUMN_CANDIDATES)
 
-    if not home_col or not away_col:
-        team_col = _match_column(columns, TEAM_COLUMN_CANDIDATES)
-        opp_col = _match_column(columns, OPPONENT_COLUMN_CANDIDATES)
-        site_col = _match_column(columns, SITE_COLUMN_CANDIDATES)
-        ml_col = _match_column(columns, TEAM_MONEYLINE_COLUMN_CANDIDATES)
-        if not all([team_col, opp_col, site_col, ml_col]):
-            logging.warning(
-                "%s dataset is missing explicit home/away columns and cannot be reshaped",
-                provider_name,
-            )
-            return pd.DataFrame()
-
-        working = frame.copy()
-        working["_team"] = working[team_col].apply(normalize_team_abbr)
-        working["_opp"] = working[opp_col].apply(normalize_team_abbr)
-        working["_site"] = working[site_col].astype(str).str.strip().str.upper()
-        working["_is_home"] = working["_site"].str.startswith("H")
-        working["_is_away"] = working["_site"].str.startswith("A")
-        if not working["_is_home"].any() or not working["_is_away"].any():
-            logging.warning(
-                "%s dataset did not contain both home and away rows after site parsing",
-                provider_name,
-            )
-            return pd.DataFrame()
-
-        if season_col:
-            working["_season"] = working[season_col]
-        else:
-            working["_season"] = season_hint
-        if week_col:
-            working["_week"] = pd.to_numeric(working[week_col], errors="coerce")
-        else:
-            working["_week"] = np.nan
-
-        kickoff_series = _combine_date_time(
-            working[date_col] if date_col else None,
-            working[time_col] if time_col else None,
-        )
-        working["_kickoff"] = kickoff_series
-        working["_ml"] = _parse_moneyline_series(working[ml_col])
-
-        home_rows = working[working["_is_home"]].copy()
-        away_rows = working[working["_is_away"]].copy()
-        if home_rows.empty or away_rows.empty:
-            logging.warning(
-                "%s dataset did not provide complementary home/away rows after filtering",
-                provider_name,
-            )
-            return pd.DataFrame()
-
-        home_rows["_key"] = home_rows.apply(
-            lambda row: _compose_game_key(
-                row["_season"],
-                row["_week"],
-                row.get("_kickoff"),
-                row.get("_team"),
-                row.get("_opp"),
-            ),
-            axis=1,
-        )
-        away_rows["_key"] = away_rows.apply(
-            lambda row: _compose_game_key(
-                row["_season"],
-                row["_week"],
-                row.get("_kickoff"),
-                row.get("_opp"),
-                row.get("_team"),
-            ),
-            axis=1,
-        )
-
-        away_subset = away_rows[["_key", "_team", "_ml"]].rename(
-            columns={"_team": "_away_team", "_ml": "_away_ml"}
-        )
-        merged = home_rows.merge(away_subset, on="_key", how="inner")
-        if merged.empty:
-            logging.warning(
-                "%s dataset failed to merge complementary home/away rows",
-                provider_name,
-            )
-            return pd.DataFrame()
-
-        merged["home_team"] = merged["_team"]
-        merged["away_team"] = merged["_away_team"].combine_first(merged["_opp"])
-        merged["home_closing_moneyline"] = merged["_ml"]
-        merged["away_closing_moneyline"] = merged["_away_ml"]
-        merged["season"] = (
-            merged["_season"].fillna(season_hint).astype(str)
-            if season_col
-            else str(season_hint) if season_hint else merged["_season"].astype(str)
-        )
-        merged["week"] = merged["_week"]
-        merged["closing_line_time"] = merged["_kickoff"]
-        if book_col:
-            merged["closing_bookmaker"] = merged[book_col].astype(str).fillna("")
-        else:
-            merged["closing_bookmaker"] = provider_name
-
-        result = merged[
-            [
-                "season",
-                "week",
-                "home_team",
-                "away_team",
-                "home_closing_moneyline",
-                "away_closing_moneyline",
-                "closing_line_time",
-                "closing_bookmaker",
-            ]
-        ].copy()
-        return result
+    team_col = _match_column(columns, TEAM_COLUMN_CANDIDATES)
+    opp_col = _match_column(columns, OPPONENT_COLUMN_CANDIDATES)
+    site_col = _match_column(columns, SITE_COLUMN_CANDIDATES)
+    ml_col = _match_column(columns, TEAM_MONEYLINE_COLUMN_CANDIDATES)
 
     home_ml_col = _match_column(columns, HOME_MONEYLINE_COLUMN_CANDIDATES)
     away_ml_col = _match_column(columns, AWAY_MONEYLINE_COLUMN_CANDIDATES)
+
+    if team_col and opp_col and ml_col:
+        needs_reshape = False
+        if not home_col or not away_col:
+            needs_reshape = True
+        elif not home_ml_col or not away_ml_col:
+            needs_reshape = True
+
+        if needs_reshape:
+            reshaped = _reshape_team_based_closing_rows(
+                frame,
+                provider_name,
+                season_hint=season_hint,
+                season_col=season_col,
+                week_col=week_col,
+                date_col=date_col,
+                time_col=time_col,
+                site_col=site_col,
+                team_col=team_col,
+                opp_col=opp_col,
+                ml_col=ml_col,
+                book_col=book_col,
+            )
+            if not reshaped.empty:
+                return reshaped
+
     if not home_ml_col or not away_ml_col:
         logging.warning(
             "%s dataset is missing moneyline columns and cannot be imported",
