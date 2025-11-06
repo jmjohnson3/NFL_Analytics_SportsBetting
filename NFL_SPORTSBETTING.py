@@ -218,6 +218,7 @@ HOME_MONEYLINE_COLUMN_CANDIDATES = [
     "home_close_ml",
     "home_close_moneyline",
     "home_closing_ml",
+    "home_closing_moneyline",
     "home_close",
 ]
 AWAY_MONEYLINE_COLUMN_CANDIDATES = [
@@ -233,6 +234,7 @@ AWAY_MONEYLINE_COLUMN_CANDIDATES = [
     "vis_ml",
     "away_close_ml",
     "away_close_moneyline",
+    "away_closing_moneyline",
 ]
 TEAM_MONEYLINE_COLUMN_CANDIDATES = [
     "ml",
