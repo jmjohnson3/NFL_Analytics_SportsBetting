@@ -565,9 +565,12 @@ def _normalize_historical_closing_frame(
         )
         return pd.DataFrame()
 
-    season_series = (
-        frame[season_col].fillna(season_hint) if season_col else season_hint
-    )
+    if season_col:
+        season_series = frame[season_col]
+        if season_hint is not None:
+            season_series = season_series.fillna(season_hint)
+    else:
+        season_series = season_hint
     week_series = (
         pd.to_numeric(frame[week_col], errors="coerce") if week_col else np.nan
     )
@@ -5497,8 +5500,12 @@ def normalize_team_abbr(value: Any) -> Optional[str]:
     if sanitized in TEAM_MASCOT_TO_ABBR:
         return TEAM_MASCOT_TO_ABBR[sanitized]
 
-    # As a last resort, try to map by taking the first letter of each token
     tokens = sanitized.split()
+    for token in tokens:
+        if token in TEAM_MASCOT_TO_ABBR:
+            return TEAM_MASCOT_TO_ABBR[token]
+
+    # As a last resort, try to map by taking the first letter of each token
     if len(tokens) >= 2:
         initials = "".join(token[0] for token in tokens)
         if initials.upper() in TEAM_ABBR_CANONICAL:
@@ -9444,6 +9451,8 @@ class FeatureBuilder:
             return games
 
         working = games.copy()
+        if "week" in working.columns:
+            working["week"] = pd.to_numeric(working["week"], errors="coerce")
         if "start_time" in working.columns:
             working["start_time"] = pd.to_datetime(working["start_time"], errors="coerce")
             working["_start_date"] = working["start_time"].dt.normalize()
@@ -9511,12 +9520,16 @@ class FeatureBuilder:
             supplemental_closing = getattr(loader, "closing_odds_frame", None)
         if supplemental_closing is not None and not supplemental_closing.empty:
             supplemental = supplemental_closing.copy()
+            if "week" in supplemental.columns:
+                supplemental["week"] = pd.to_numeric(supplemental["week"], errors="coerce")
             supplemental["season"] = supplemental["season"].astype(str)
             for col in ["home_team", "away_team"]:
                 if col in supplemental.columns:
                     supplemental[col] = supplemental[col].apply(normalize_team_abbr)
+
             merge_keys: List[str] = []
             temporary_game_id_key = None
+
             if "game_id" in supplemental.columns and "game_id" in working.columns:
                 # Avoid dtype mismatches (object vs. int64) when merging on game_id by
                 # materializing a temporary, normalized key in both frames.
@@ -9524,18 +9537,40 @@ class FeatureBuilder:
                 working[temporary_game_id_key] = working["game_id"].astype(str)
                 supplemental[temporary_game_id_key] = supplemental["game_id"].astype(str)
                 merge_keys = [temporary_game_id_key]
-            elif {
-                "season",
-                "week",
-                "home_team",
-                "away_team",
-            }.issubset(supplemental.columns) and {
-                "season",
-                "week",
-                "home_team",
-                "away_team",
-            }.issubset(working.columns):
-                merge_keys = ["season", "week", "home_team", "away_team"]
+            else:
+                season_team_keys = {"season", "home_team", "away_team"}
+                working_has_core = season_team_keys.issubset(working.columns)
+                supplemental_has_core = season_team_keys.issubset(supplemental.columns)
+                supplemental_has_week = (
+                    "week" in supplemental.columns
+                    and supplemental["week"].notna().any()
+                )
+                if (
+                    supplemental_has_week
+                    and {"week"}.union(season_team_keys).issubset(supplemental.columns)
+                    and {"week"}.union(season_team_keys).issubset(working.columns)
+                ):
+                    merge_keys = ["season", "week", "home_team", "away_team"]
+                elif supplemental_has_core and working_has_core:
+                    merge_keys = ["season", "home_team", "away_team"]
+
+                if not merge_keys:
+                    closing_time = pd.to_datetime(
+                        supplemental.get("closing_line_time"), errors="coerce"
+                    )
+                    if closing_time.notna().any() and working_has_core:
+                        supplemental["_merge_start_date"] = closing_time.dt.normalize()
+                        working["_merge_start_date"] = working.get("_start_date")
+                        if (
+                            "_merge_start_date" in supplemental.columns
+                            and "_merge_start_date" in working.columns
+                        ):
+                            merge_keys = [
+                                "home_team",
+                                "away_team",
+                                "_merge_start_date",
+                            ]
+
             if merge_keys:
                 supplement_cols = [
                     "home_closing_moneyline",
@@ -9550,10 +9585,12 @@ class FeatureBuilder:
                 ]
                 if available_cols:
                     rename_map = {col: f"{col}_supp" for col in available_cols}
-                    supplemental = supplemental[merge_keys + available_cols].rename(
+                    supplemental_subset = supplemental[merge_keys + available_cols].rename(
                         columns=rename_map
                     )
-                    working = working.merge(supplemental, on=merge_keys, how="left")
+                    working = working.merge(
+                        supplemental_subset, on=merge_keys, how="left"
+                    )
                     for col in available_cols:
                         supplemental_col = f"{col}_supp"
                         if supplemental_col in working.columns:
@@ -9565,6 +9602,10 @@ class FeatureBuilder:
                 if temporary_game_id_key is not None:
                     working.drop(columns=[temporary_game_id_key], inplace=True, errors="ignore")
                     supplemental.drop(columns=[temporary_game_id_key], inplace=True, errors="ignore")
+                if "_merge_start_date" in working.columns:
+                    working.drop(columns=["_merge_start_date"], inplace=True, errors="ignore")
+                if "_merge_start_date" in supplemental.columns:
+                    supplemental.drop(columns=["_merge_start_date"], inplace=True, errors="ignore")
 
         working.drop(columns=["_start_date"], inplace=True, errors="ignore")
 
