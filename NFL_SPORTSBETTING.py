@@ -15502,6 +15502,13 @@ def predict_upcoming_games(
     now_utc = dt.datetime.now(dt.timezone.utc)
     lookback = now_utc - pd.Timedelta(hours=12)
     lookahead = now_utc + pd.Timedelta(days=7, hours=12)
+
+    upcoming = upcoming[upcoming["start_time"] >= lookback].copy()
+    if upcoming.empty:
+        logging.warning(
+            "Upcoming schedule only contains games more than 12 hours in the past"
+        )
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
     in_window_mask = (upcoming["start_time"] >= lookback) & (
         upcoming["start_time"] <= lookahead
     )
