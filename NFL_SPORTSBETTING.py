@@ -15508,21 +15508,30 @@ def predict_upcoming_games(
     window_games = upcoming.loc[in_window_mask].copy()
 
     if window_games.empty:
-        earliest_start = upcoming["start_time"].min()
+        future_games = upcoming[upcoming["start_time"] >= now_utc]
+        use_future_window = not future_games.empty
+        search_frame = future_games if use_future_window else upcoming
+
+        earliest_start = search_frame["start_time"].min()
         if pd.isna(earliest_start):
             logging.warning("No upcoming games have a valid kickoff time available")
             return {"games": pd.DataFrame(), "players": pd.DataFrame()}
-        week_start = earliest_start.normalize() - pd.to_timedelta(earliest_start.weekday(), unit="D")
-        week_end = week_start + pd.Timedelta(days=7)
-        week_mask = (upcoming["start_time"] >= week_start) & (
-            upcoming["start_time"] <= week_end
+
+        week_start = earliest_start.normalize() - pd.to_timedelta(
+            earliest_start.weekday(), unit="D"
         )
-        window_games = upcoming.loc[week_mask].copy()
+        week_end = week_start + pd.Timedelta(days=7)
+        week_mask = (search_frame["start_time"] >= week_start) & (
+            search_frame["start_time"] <= week_end
+        )
+        window_games = search_frame.loc[week_mask].copy()
         if window_games.empty:
-            logging.warning("No upcoming games within the current week window")
+            logging.warning("No upcoming games within the fallback week window")
             return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+
         logging.info(
-            "Falling back to earliest scheduled week %s-%s with %d games",
+            "Falling back to %s scheduled week %s-%s with %d games",
+            "future" if use_future_window else "earliest",
             week_start.date(),
             week_end.date(),
             len(window_games),
@@ -16672,6 +16681,52 @@ def main() -> None:
     if games_frame is None:
         games_frame = pd.DataFrame()
 
+    coverage_frame = games_frame.copy()
+    if not coverage_frame.empty:
+        time_columns = [
+            col
+            for col in ("start_time", "game_start", "kickoff", "commence_time")
+            if col in coverage_frame.columns
+        ]
+        kickoff_utc = None
+        for col in time_columns:
+            parsed = pd.to_datetime(coverage_frame[col], errors="coerce", utc=True)
+            if parsed.notna().any():
+                kickoff_utc = parsed
+                break
+
+        if kickoff_utc is None:
+            kickoff_utc = pd.Series(pd.NaT, index=coverage_frame.index)
+
+        coverage_frame = coverage_frame.copy()
+        coverage_frame["_kickoff_utc"] = kickoff_utc
+
+        now_utc_coverage = dt.datetime.now(dt.timezone.utc)
+
+        completed_mask = kickoff_utc.notna() & (kickoff_utc <= now_utc_coverage)
+        if "status" in coverage_frame.columns:
+            statuses = coverage_frame["status"].astype(str).str.lower()
+            completed_statuses = {
+                "final",
+                "finished",
+                "complete",
+                "completed",
+                "closed",
+                "finalized",
+                "post",
+                "postponed",
+                "inprogress",
+                "in-progress",
+                "live",
+            }
+            upcoming_statuses = {"upcoming", "scheduled", "pre", "pregame"}
+            status_mask = statuses.isin(completed_statuses)
+            status_mask &= ~statuses.isin(upcoming_statuses)
+            completed_mask |= status_mask
+
+        coverage_frame = coverage_frame.loc[completed_mask].copy()
+        coverage_frame.drop(columns="_kickoff_utc", inplace=True, errors="ignore")
+
     def _coverage(frame: pd.DataFrame, columns: Sequence[str]) -> float:
         available_cols = [col for col in columns if col in frame.columns]
         if not available_cols or frame.empty:
@@ -16838,19 +16893,29 @@ def main() -> None:
 
         return summary_path
 
-    closing_coverage = _coverage(games_frame, ["home_closing_moneyline", "away_closing_moneyline"])
-    rest_coverage = _coverage(games_frame, ["home_rest_days", "away_rest_days"])
-    timezone_coverage = _coverage(
-        games_frame, ["home_timezone_diff_hours", "away_timezone_diff_hours"]
-    )
+    if coverage_frame.empty:
+        closing_coverage = 1.0
+        rest_coverage = 1.0
+        timezone_coverage = 1.0
+    else:
+        closing_coverage = _coverage(
+            coverage_frame, ["home_closing_moneyline", "away_closing_moneyline"]
+        )
+        rest_coverage = _coverage(
+            coverage_frame, ["home_rest_days", "away_rest_days"]
+        )
+        timezone_coverage = _coverage(
+            coverage_frame,
+            ["home_timezone_diff_hours", "away_timezone_diff_hours"],
+        )
 
     closing_gap_report: Optional[Path] = None
     closing_gap_summary: Optional[Path] = None
     closing_gap_report_logged = False
     closing_gap_summary_logged = False
     if closing_coverage < 1.0:
-        closing_gap_report = _emit_closing_gap_report(games_frame)
-        closing_gap_summary = _emit_closing_gap_summary(games_frame)
+        closing_gap_report = _emit_closing_gap_report(coverage_frame)
+        closing_gap_summary = _emit_closing_gap_summary(coverage_frame)
 
     def _log_gap_location() -> None:
         nonlocal closing_gap_report_logged
