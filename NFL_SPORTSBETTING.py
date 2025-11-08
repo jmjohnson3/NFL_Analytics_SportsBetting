@@ -15474,6 +15474,8 @@ def predict_upcoming_games(
         games_source["odds_updated"] = pd.NaT
 
     now_utc = dt.datetime.now(dt.timezone.utc)
+    lookback = now_utc - pd.Timedelta(hours=12)
+    lookahead = now_utc + pd.Timedelta(days=7, hours=12)
     eastern_zone = ZoneInfo("America/New_York")
     fallback_schedule_cache: Optional[pd.DataFrame] = None
     fallback_attempted = False
@@ -15637,57 +15639,54 @@ def predict_upcoming_games(
         else:
             working["day_of_week"] = working["local_day_of_week"]
 
+        status_series = working.get("status")
+        if status_series is not None:
+            working["status"] = status_series.fillna("scheduled").astype(str).str.lower()
+        else:
+            working["status"] = "scheduled"
+
+        if "odds_updated" not in working.columns:
+            working["odds_updated"] = pd.NaT
+
         return working
 
-    def _select_prediction_window(frame: pd.DataFrame, source_label: str) -> pd.DataFrame:
+    def _extract_upcoming(frame: pd.DataFrame, source_label: str) -> pd.DataFrame:
         if frame.empty:
             return frame
 
-        working = frame.copy()
-
-        lookback = now_utc - pd.Timedelta(hours=12)
-        lookahead = now_utc + pd.Timedelta(days=7, hours=12)
-
-        if "status" not in working.columns:
-            working["status"] = ""
-        if "home_score" not in working.columns:
-            working["home_score"] = np.nan
-
-        status_series = working["status"].astype(str).str.lower()
-        upcoming_mask = status_series.isin(
-            [
-                "upcoming",
-                "scheduled",
-                "inprogress",
-                "pre",
-                "pregame",
-                "pre-game",
-            ]
-        )
-        upcoming_mask |= working["home_score"].isna()
-        upcoming_mask |= working["start_time"] >= lookback
-
-        upcoming = working.loc[upcoming_mask].copy()
+        status_whitelist = {
+            "upcoming",
+            "scheduled",
+            "inprogress",
+            "pre",
+            "pregame",
+            "pre-game",
+            "tbd",
+        }
+        upcoming_mask = frame["status"].isin(status_whitelist)
+        upcoming_mask |= frame["home_score"].isna()
+        upcoming = frame.loc[upcoming_mask].copy()
         if upcoming.empty:
+            logging.warning("No upcoming games found for prediction (%s)", source_label)
             return pd.DataFrame()
 
-        upcoming_recent = upcoming[upcoming["start_time"] >= lookback].copy()
-        if upcoming_recent.empty:
+        upcoming = upcoming[upcoming["start_time"] >= lookback].copy()
+        if upcoming.empty:
             logging.warning(
                 "Upcoming schedule only contains games more than 12 hours in the past (%s)",
                 source_label,
             )
             return pd.DataFrame()
 
-        in_window_mask = (upcoming_recent["start_time"] >= lookback) & (
-            upcoming_recent["start_time"] <= lookahead
+        in_window_mask = (upcoming["start_time"] >= lookback) & (
+            upcoming["start_time"] <= lookahead
         )
-        window_games = upcoming_recent.loc[in_window_mask].copy()
+        window_games = upcoming.loc[in_window_mask].copy()
 
         if window_games.empty:
-            future_games = upcoming_recent[upcoming_recent["start_time"] >= now_utc]
+            future_games = upcoming[upcoming["start_time"] >= now_utc]
             use_future_window = not future_games.empty
-            search_frame = future_games if use_future_window else upcoming_recent
+            search_frame = future_games if use_future_window else upcoming
 
             earliest_start = search_frame["start_time"].min()
             if pd.isna(earliest_start):
@@ -15748,9 +15747,7 @@ def predict_upcoming_games(
 
     normalized_games = _prepare_upcoming_frame(games_source)
 
-    upcoming = _select_prediction_window(
-        normalized_games, "database schedule"
-    )
+    upcoming = _extract_upcoming(normalized_games, "database schedule")
 
     if upcoming.empty:
         fallback_frame = _fetch_msf_schedule(
@@ -15761,9 +15758,7 @@ def predict_upcoming_games(
             return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
         fallback_normalized = _prepare_upcoming_frame(fallback_frame)
-        upcoming = _select_prediction_window(
-            fallback_normalized, "MySportsFeeds fallback"
-        )
+        upcoming = _extract_upcoming(fallback_normalized, "MySportsFeeds fallback")
 
         if upcoming.empty:
             logging.warning(
