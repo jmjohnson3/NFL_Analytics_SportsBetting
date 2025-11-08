@@ -15645,21 +15645,31 @@ def predict_upcoming_games(
 
         working = frame.copy()
 
+        lookback = now_utc - pd.Timedelta(hours=12)
+        lookahead = now_utc + pd.Timedelta(days=7, hours=12)
+
         if "status" not in working.columns:
             working["status"] = ""
         if "home_score" not in working.columns:
             working["home_score"] = np.nan
 
         status_series = working["status"].astype(str).str.lower()
-        upcoming_mask = status_series.isin(["upcoming", "scheduled", "inprogress"])
+        upcoming_mask = status_series.isin(
+            [
+                "upcoming",
+                "scheduled",
+                "inprogress",
+                "pre",
+                "pregame",
+                "pre-game",
+            ]
+        )
         upcoming_mask |= working["home_score"].isna()
+        upcoming_mask |= working["start_time"] >= lookback
 
         upcoming = working.loc[upcoming_mask].copy()
         if upcoming.empty:
             return pd.DataFrame()
-
-        lookback = now_utc - pd.Timedelta(hours=12)
-        lookahead = now_utc + pd.Timedelta(days=7, hours=12)
 
         upcoming_recent = upcoming[upcoming["start_time"] >= lookback].copy()
         if upcoming_recent.empty:
@@ -15713,11 +15723,11 @@ def predict_upcoming_games(
 
         selection = window_games.copy()
 
-        desired_days = {"Thursday", "Sunday", "Monday"}
+        desired_days = {"Thursday", "Sunday", "Monday", "Saturday"}
         selection = selection[selection["local_day_of_week"].isin(desired_days)].copy()
         if selection.empty:
             logging.warning(
-                "No Thursday/Sunday/Monday games available for prediction (%s)",
+                "No Thursday/Saturday/Sunday/Monday games available for prediction (%s)",
                 source_label,
             )
             return pd.DataFrame()
