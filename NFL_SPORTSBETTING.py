@@ -15503,12 +15503,21 @@ def predict_upcoming_games(
     lookback = now_utc - pd.Timedelta(hours=12)
     lookahead = now_utc + pd.Timedelta(days=7, hours=12)
 
-    upcoming = upcoming[upcoming["start_time"] >= lookback].copy()
-    if upcoming.empty:
-        logging.warning(
-            "Upcoming schedule only contains games more than 12 hours in the past"
+    upcoming_recent = upcoming[upcoming["start_time"] >= lookback].copy()
+    if upcoming_recent.empty:
+        future_games = upcoming[upcoming["start_time"] >= now_utc].copy()
+        if future_games.empty:
+            logging.warning(
+                "Upcoming schedule only contains games more than 12 hours in the past"
+            )
+            return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+        logging.info(
+            "Upcoming schedule stale; falling back to %d future games beyond lookback",
+            len(future_games),
         )
-        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+        upcoming = future_games
+    else:
+        upcoming = upcoming_recent
     in_window_mask = (upcoming["start_time"] >= lookback) & (
         upcoming["start_time"] <= lookahead
     )
