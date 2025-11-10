@@ -15747,24 +15747,29 @@ def predict_upcoming_games(
 
     normalized_games = _prepare_upcoming_frame(games_source)
 
-    upcoming = _extract_upcoming(normalized_games, "database schedule")
+    fallback_frame = _fetch_msf_schedule("primary upcoming schedule refresh")
+    upcoming = pd.DataFrame()
+
+    if not fallback_frame.empty:
+        fallback_normalized = _prepare_upcoming_frame(fallback_frame)
+        upcoming = _extract_upcoming(fallback_normalized, "MySportsFeeds schedule")
 
     if upcoming.empty:
-        fallback_frame = _fetch_msf_schedule(
-            "database schedule returned no valid upcoming games"
-        )
         if fallback_frame.empty:
-            logging.warning("No upcoming games found for prediction")
-            return {"games": pd.DataFrame(), "players": pd.DataFrame()}
-
-        fallback_normalized = _prepare_upcoming_frame(fallback_frame)
-        upcoming = _extract_upcoming(fallback_normalized, "MySportsFeeds fallback")
-
-        if upcoming.empty:
             logging.warning(
-                "No upcoming games available even after MySportsFeeds fallback schedule refresh"
+                "MySportsFeeds schedule unavailable; falling back to database schedule"
             )
-            return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+        else:
+            logging.warning(
+                "MySportsFeeds schedule did not yield any upcoming games; "
+                "falling back to database schedule"
+            )
+
+        upcoming = _extract_upcoming(normalized_games, "database schedule")
+
+    if upcoming.empty:
+        logging.warning("No upcoming games found for prediction")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
     def _ensure_model_features(frame: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
         columns: Optional[Iterable[str]] = getattr(model, "feature_columns", None)
