@@ -15678,40 +15678,30 @@ def predict_upcoming_games(
 
         schedule = schedule.sort_values("start_time").reset_index(drop=True)
 
+        # Discard stale matchups before considering future slates so we never fall back to
+        # last season's schedule when the current slate fails to populate.
+        schedule = schedule[schedule["start_time"] >= lookback]
+        if schedule.empty:
+            logging.warning(
+                "No upcoming games remain after enforcing the prediction window lookback"
+            )
+            return pd.DataFrame()
+
         future_cutoff = now_utc - pd.Timedelta(hours=1)
         future_games = schedule[schedule["start_time"] >= future_cutoff].copy()
 
         if future_games.empty:
-            logging.warning(
-                "Upcoming schedule only contains games more than an hour in the past; "
-                "falling back to earliest available week"
-            )
-            future_candidates = schedule[schedule["start_time"] >= now_utc]
-            search_frame = future_candidates if not future_candidates.empty else schedule
-
-            earliest_start = search_frame["start_time"].min()
-            if pd.isna(earliest_start):
-                logging.warning("No upcoming games have a valid kickoff time available")
+            upcoming_only = schedule[schedule["start_time"] >= now_utc]
+            if upcoming_only.empty:
+                logging.warning(
+                    "Upcoming schedule is empty after filtering stale kickoffs; "
+                    "unable to produce forecasts"
+                )
                 return pd.DataFrame()
 
-            week_start = earliest_start.normalize() - pd.to_timedelta(
-                earliest_start.weekday(), unit="D"
-            )
-            week_end = week_start + pd.Timedelta(days=7)
-            selection = search_frame[
-                (search_frame["start_time"] >= week_start)
-                & (search_frame["start_time"] < week_end)
-            ].copy()
+            selection = upcoming_only[upcoming_only["start_time"] <= lookahead].copy()
             if selection.empty:
-                logging.warning("No upcoming games within the fallback week window")
-                return pd.DataFrame()
-
-            logging.info(
-                "Falling back to scheduled week %s-%s with %d games",
-                week_start.date(),
-                week_end.date(),
-                len(selection),
-            )
+                selection = upcoming_only.copy()
         else:
             selection = future_games[future_games["start_time"] <= lookahead].copy()
             if selection.empty:
