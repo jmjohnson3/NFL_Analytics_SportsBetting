@@ -15670,23 +15670,22 @@ def predict_upcoming_games(
             logging.warning("No upcoming games found for prediction (%s)", source_label)
             return pd.DataFrame()
 
-        upcoming = upcoming[upcoming["start_time"] >= lookback].copy()
-        if upcoming.empty:
+        recent_mask = upcoming["start_time"] >= lookback
+        if recent_mask.any():
+            window_source = upcoming.loc[recent_mask].copy()
+        else:
             logging.warning(
                 "Upcoming schedule only contains games more than 12 hours in the past (%s)",
                 source_label,
             )
-            return pd.DataFrame()
+            window_source = upcoming.copy()
 
-        in_window_mask = (upcoming["start_time"] >= lookback) & (
-            upcoming["start_time"] <= lookahead
-        )
-        window_games = upcoming.loc[in_window_mask].copy()
+        window_games = window_source[window_source["start_time"] <= lookahead].copy()
 
         if window_games.empty:
-            future_games = upcoming[upcoming["start_time"] >= now_utc]
+            future_games = window_source[window_source["start_time"] >= now_utc]
             use_future_window = not future_games.empty
-            search_frame = future_games if use_future_window else upcoming
+            search_frame = future_games if use_future_window else window_source
 
             earliest_start = search_frame["start_time"].min()
             if pd.isna(earliest_start):
@@ -15727,6 +15726,15 @@ def predict_upcoming_games(
         if selection.empty:
             logging.warning(
                 "No Thursday/Saturday/Sunday/Monday games available for prediction (%s)",
+                source_label,
+            )
+            return pd.DataFrame()
+
+        freshness_cutoff = now_utc - pd.Timedelta(hours=1)
+        selection = selection[selection["start_time"] >= freshness_cutoff].copy()
+        if selection.empty:
+            logging.warning(
+                "No upcoming games remain after filtering stale kickoffs (%s)",
                 source_label,
             )
             return pd.DataFrame()
