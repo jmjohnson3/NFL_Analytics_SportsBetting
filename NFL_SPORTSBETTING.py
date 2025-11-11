@@ -15921,24 +15921,22 @@ def predict_upcoming_games(
 
         schedule = schedule.sort_values("start_time").reset_index(drop=True)
 
-        upcoming = schedule[schedule["start_time"] >= lookback].copy()
+        future_mask = schedule["start_time"] >= now_utc
+        upcoming = schedule.loc[future_mask].copy()
+        if upcoming.empty:
+            upcoming = schedule[schedule["start_time"] >= lookback].copy()
+
         if upcoming.empty:
             logging.warning(
                 "Upcoming schedule only contains games more than 12 hours in the past"
             )
             return pd.DataFrame()
 
-        in_window_mask = (upcoming["start_time"] >= lookback) & (
-            upcoming["start_time"] <= lookahead
-        )
-        window_games = upcoming.loc[in_window_mask].copy()
+        window_mask = upcoming["start_time"] <= lookahead
+        window_games = upcoming.loc[window_mask].copy()
 
-        if window_games.empty:
-            future_games = upcoming[upcoming["start_time"] >= now_utc]
-            use_future_window = not future_games.empty
-            search_frame = future_games if use_future_window else upcoming
-
-            earliest_start = search_frame["start_time"].min()
+        if window_games.empty():
+            earliest_start = upcoming["start_time"].min()
             if pd.isna(earliest_start):
                 logging.warning("No upcoming games have a valid kickoff time available")
                 return pd.DataFrame()
@@ -15947,17 +15945,16 @@ def predict_upcoming_games(
                 earliest_start.weekday(), unit="D"
             )
             week_end = week_start + pd.Timedelta(days=7)
-            week_mask = (search_frame["start_time"] >= week_start) & (
-                search_frame["start_time"] <= week_end
+            week_mask = (upcoming["start_time"] >= week_start) & (
+                upcoming["start_time"] <= week_end
             )
-            window_games = search_frame.loc[week_mask].copy()
-            if window_games.empty:
+            window_games = upcoming.loc[week_mask].copy()
+            if window_games.empty():
                 logging.warning("No upcoming games within the fallback week window")
                 return pd.DataFrame()
 
             logging.info(
-                "Falling back to %s scheduled week %s-%s with %d games",
-                "future" if use_future_window else "earliest",
+                "Falling back to future scheduled week %s-%s with %d games",
                 week_start.date(),
                 week_end.date(),
                 len(window_games),
