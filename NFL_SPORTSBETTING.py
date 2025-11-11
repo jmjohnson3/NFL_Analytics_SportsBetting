@@ -15526,6 +15526,7 @@ def predict_upcoming_games(
     eastern_zone = ZoneInfo("America/New_York")
     fallback_schedule_cache: Optional[pd.DataFrame] = None
     fallback_attempted = False
+    future_only_cutoff = now_utc - dt.timedelta(minutes=5)
 
     def _resolve_schedule_start(schedule: Dict[str, Any]) -> Optional[pd.Timestamp]:
         """Resolve a kickoff time from a MySportsFeeds schedule payload."""
@@ -15684,7 +15685,6 @@ def predict_upcoming_games(
             seasons_to_query = [f"{now_utc.year}-regular"]
 
         fallback_rows: List[Dict[str, Any]] = []
-        recent_cutoff = now_utc - dt.timedelta(hours=12)
         seen_game_ids: Set[str] = set()
 
         def _append_msf_game(
@@ -15706,7 +15706,7 @@ def predict_upcoming_games(
             if start_time_ts.tzinfo is None:
                 start_time_ts = start_time_ts.tz_localize(dt.timezone.utc)
 
-            if start_time_ts < pd.Timestamp(recent_cutoff):
+            if start_time_ts < pd.Timestamp(future_only_cutoff):
                 return None
 
             home_info = schedule.get("homeTeam") or {}
@@ -15813,7 +15813,7 @@ def predict_upcoming_games(
                 fallback_schedule_cache["start_time"].notna()
             ]
 
-            future_cutoff = pd.Timestamp(now_utc - dt.timedelta(hours=12), tz="UTC")
+            future_cutoff = pd.Timestamp(future_only_cutoff, tz="UTC")
             fallback_schedule_cache = fallback_schedule_cache[
                 fallback_schedule_cache["start_time"] >= future_cutoff
             ]
@@ -15998,13 +15998,15 @@ def predict_upcoming_games(
     normalized_games = _prepare_schedule_frame(games_source, "database schedule")
 
     fallback_frame = _fetch_msf_schedule("primary upcoming schedule refresh")
+    fallback_normalized = pd.DataFrame()
     schedule_frames: List[pd.DataFrame] = []
 
     if not fallback_frame.empty:
         fallback_normalized = _prepare_schedule_frame(
             fallback_frame, "MySportsFeeds schedule"
         )
-        schedule_frames.append(fallback_normalized)
+        if not fallback_normalized.empty:
+            schedule_frames.append(fallback_normalized)
 
     if not normalized_games.empty:
         schedule_frames.append(normalized_games)
@@ -16015,7 +16017,17 @@ def predict_upcoming_games(
         logging.warning("No upcoming schedule data available from MySportsFeeds or database")
         return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
-    upcoming = _select_upcoming(combined_schedule)
+    upcoming = pd.DataFrame()
+    if not fallback_normalized.empty:
+        upcoming = _select_upcoming(fallback_normalized)
+        if upcoming.empty:
+            logging.warning(
+                "MySportsFeeds schedule did not yield upcoming games after filtering; "
+                "falling back to combined schedule"
+            )
+
+    if upcoming.empty:
+        upcoming = _select_upcoming(combined_schedule)
 
     if upcoming.empty:
         logging.warning("No upcoming games found for prediction")
