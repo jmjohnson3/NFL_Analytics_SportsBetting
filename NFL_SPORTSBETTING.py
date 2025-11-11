@@ -15684,7 +15684,7 @@ def predict_upcoming_games(
             seasons_to_query = [f"{now_utc.year}-regular"]
 
         fallback_rows: List[Dict[str, Any]] = []
-        recent_cutoff = now_utc - dt.timedelta(days=30)
+        recent_cutoff = now_utc - dt.timedelta(hours=12)
         seen_game_ids: Set[str] = set()
 
         def _append_msf_game(
@@ -15812,16 +15812,29 @@ def predict_upcoming_games(
             fallback_schedule_cache = fallback_schedule_cache[
                 fallback_schedule_cache["start_time"].notna()
             ]
+
+            future_cutoff = pd.Timestamp(now_utc - dt.timedelta(hours=12), tz="UTC")
+            fallback_schedule_cache = fallback_schedule_cache[
+                fallback_schedule_cache["start_time"] >= future_cutoff
+            ]
+
             fallback_schedule_cache["day_of_week"] = fallback_schedule_cache["day_of_week"].where(
                 fallback_schedule_cache["day_of_week"].notna(),
                 fallback_schedule_cache["start_time"].dt.day_name(),
             )
 
-            logging.info(
-                "Loaded %d upcoming games from MySportsFeeds fallback (%s)",
-                len(fallback_schedule_cache),
-                reason,
-            )
+            if fallback_schedule_cache.empty:
+                logging.warning(
+                    "MySportsFeeds fallback (%s) did not return any games with kickoffs after %s",
+                    reason,
+                    future_cutoff.tz_convert(eastern_zone),
+                )
+            else:
+                logging.info(
+                    "Loaded %d upcoming games from MySportsFeeds fallback (%s)",
+                    len(fallback_schedule_cache),
+                    reason,
+                )
 
         return fallback_schedule_cache.copy()
 
