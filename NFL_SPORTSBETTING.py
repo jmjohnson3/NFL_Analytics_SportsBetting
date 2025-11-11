@@ -15642,6 +15642,16 @@ def predict_upcoming_games(
         if "season" in working.columns:
             working["season"] = working["season"].astype(str)
 
+        text_normalize_columns = {"venue", "referee", "stadium", "venue_name"}
+        for text_col in text_normalize_columns:
+            if text_col in working.columns:
+                series = working[text_col]
+                series = series.where(series.notna(), "")
+                working[text_col] = series.astype(str).str.strip()
+
+        if "venue" not in working.columns and "venue_name" in working.columns:
+            working["venue"] = working["venue_name"]
+
         status_series = working.get("status")
         if status_series is not None:
             working["status"] = status_series.fillna("scheduled").astype(str).str.lower()
@@ -15768,6 +15778,13 @@ def predict_upcoming_games(
         selection = selection.drop(columns="_priority", errors="ignore")
 
         selection = selection.sort_values("start_time").reset_index(drop=True)
+
+        for text_col in ("venue", "referee"):
+            if text_col in selection.columns:
+                series = selection[text_col]
+                series = series.where(series.notna(), "")
+                selection[text_col] = series.astype(str).str.strip()
+
         return selection
 
     normalized_games = _prepare_schedule_frame(games_source, "database schedule")
