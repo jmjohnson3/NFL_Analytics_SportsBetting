@@ -15755,19 +15755,29 @@ def predict_upcoming_games(
                                 selection = next_week_frame
 
                 if selection.empty:
-                    earliest_start = schedule["start_time"].min()
-                    if pd.isna(earliest_start):
+                    future_start_times = schedule.loc[
+                        schedule["start_time"] >= now_utc, "start_time"
+                    ]
+                    anchor_start = future_start_times.min()
+
+                    if pd.isna(anchor_start):
+                        # All remaining games are still in the past relative to "now". Fall back to
+                        # the freshest slate available so that we at least provide a complete week
+                        # rather than returning nothing.
+                        anchor_start = schedule["start_time"].max()
+
+                    if pd.isna(anchor_start):
                         logging.warning("No upcoming games have a valid kickoff time available")
                         return pd.DataFrame()
 
-                    if earliest_start < now_utc - pd.Timedelta(days=30):
+                    if anchor_start < now_utc - pd.Timedelta(days=30):
                         logging.warning(
                             "Earliest available schedule data predates the last 30 days; ignoring stale slate"
                         )
                         return pd.DataFrame()
 
-                    week_start = earliest_start.normalize() - pd.to_timedelta(
-                        earliest_start.weekday(), unit="D"
+                    week_start = anchor_start.normalize() - pd.to_timedelta(
+                        anchor_start.weekday(), unit="D"
                     )
                     week_end = week_start + pd.Timedelta(days=7)
                     week_mask = (schedule["start_time"] >= week_start) & (
