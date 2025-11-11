@@ -15488,6 +15488,30 @@ def predict_upcoming_games(
                 return None
             if isinstance(value, float) and np.isnan(value):  # type: ignore[arg-type]
                 return None
+            if isinstance(value, (pd.Timestamp, dt.datetime)):
+                ts = pd.Timestamp(value)
+                return ts.tz_convert(dt.timezone.utc) if ts.tzinfo else ts.tz_localize(dt.timezone.utc)
+            if isinstance(value, dt.date):
+                return pd.Timestamp(value)
+            if isinstance(value, dict):
+                for candidate in (
+                    "utc",
+                    "iso",
+                    "ISO",
+                    "dateTime",
+                    "date_time",
+                    "date",
+                    "full",
+                ):
+                    if candidate in value:
+                        ts = _parse_timestamp(value.get(candidate))
+                        if ts is not None:
+                            return ts
+                for nested_value in value.values():
+                    ts = _parse_timestamp(nested_value)
+                    if ts is not None:
+                        return ts
+                return None
             try:
                 ts = pd.to_datetime(value, utc=False, errors="coerce")
             except Exception:
@@ -15496,7 +15520,36 @@ def predict_upcoming_games(
                 return None
             return ts
 
-        primary_fields = ("startTimeUTC", "startTime", "originalStartTime")
+        def _parse_time(value: Any) -> Optional[dt.time]:
+            if value is None:
+                return None
+            if isinstance(value, dt.time):
+                return value
+            if isinstance(value, (pd.Timestamp, dt.datetime)):
+                ts = pd.Timestamp(value)
+                ts = ts.tz_convert(eastern_zone) if ts.tzinfo else ts
+                return ts.time()
+            text = str(value).strip()
+            if not text or text.lower() in {"tbd", "tba", "na", "none"}:
+                return None
+            try:
+                parsed = pd.to_datetime(text, errors="coerce")
+            except Exception:
+                return None
+            if pd.isna(parsed):
+                return None
+            return pd.Timestamp(parsed).time()
+
+        primary_fields = (
+            "startTimeUTC",
+            "startTimeUtc",
+            "startTime",
+            "originalStartTime",
+            "startDateTime",
+            "startTimeISO",
+            "startTimeIso",
+            "dateTime",
+        )
         for field in primary_fields:
             ts = _parse_timestamp(schedule.get(field))
             if ts is None:
@@ -15507,25 +15560,43 @@ def predict_upcoming_games(
                 ts = ts.tz_convert(dt.timezone.utc)
             return ts
 
-        date_fields = ("startDate", "originalStartDate")
+        date_fields = (
+            "startDate",
+            "originalStartDate",
+            "date",
+            "gameDate",
+            "day",
+        )
+        time_fields = (
+            "startTime",
+            "startTimeLocal",
+            "startTimeEastern",
+            "startTimeET",
+            "gameTime",
+            "time",
+            "localStartTime",
+        )
+
         for field in date_fields:
             ts = _parse_timestamp(schedule.get(field))
             if ts is None:
                 continue
 
             if ts.tzinfo is None:
-                localized = dt.datetime.combine(
-                    ts.date(),
-                    dt.time(hour=13, minute=0),
-                    tzinfo=eastern_zone,
-                )
+                base_date = ts.date()
             else:
-                localized = dt.datetime.combine(
-                    ts.astimezone(eastern_zone).date(),
-                    dt.time(hour=13, minute=0),
-                    tzinfo=eastern_zone,
-                )
+                base_date = ts.astimezone(eastern_zone).date()
 
+            kickoff_time: Optional[dt.time] = None
+            for time_field in time_fields:
+                kickoff_time = _parse_time(schedule.get(time_field))
+                if kickoff_time is not None:
+                    break
+
+            if kickoff_time is None:
+                kickoff_time = dt.time(hour=13, minute=0)
+
+            localized = dt.datetime.combine(base_date, kickoff_time, tzinfo=eastern_zone)
             return pd.Timestamp(localized.astimezone(dt.timezone.utc))
 
         return None
@@ -15566,7 +15637,7 @@ def predict_upcoming_games(
             seasons_to_query = [f"{now_utc.year}-regular"]
 
         fallback_rows: List[Dict[str, Any]] = []
-        recent_cutoff = now_utc - dt.timedelta(days=2)
+        recent_cutoff = now_utc - dt.timedelta(days=30)
 
         for season_key in seasons_to_query:
             try:
