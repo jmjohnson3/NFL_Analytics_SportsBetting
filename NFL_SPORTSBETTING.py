@@ -7190,6 +7190,7 @@ class MySportsFeedsClient:
         attempts: Tuple[Optional[str], ...] = (
             "completed,upcoming",
             "final,inprogress,scheduled",
+            "scheduled",
             None,
         )
 
@@ -7215,6 +7216,52 @@ class MySportsFeedsClient:
             season,
         )
         return []
+
+    def fetch_games_by_date_range(
+        self,
+        season: str,
+        start_date: dt.date,
+        end_date: dt.date,
+        status: Optional[str] = "scheduled",
+    ) -> List[Dict[str, Any]]:
+        """Fetch games for each date in the provided range (inclusive)."""
+
+        aggregated: List[Dict[str, Any]] = []
+        seen_ids: Set[Any] = set()
+        current = start_date
+
+        while current <= end_date:
+            params: Dict[str, Any] = {
+                "limit": 500,
+                "date": current.strftime("%Y%m%d"),
+            }
+            if status:
+                params["status"] = status
+
+            try:
+                data = self._request(f"{season}/games.json", params=params)
+            except Exception:
+                logging.debug(
+                    "MySportsFeeds date-range request failed for %s on %s",
+                    season,
+                    current,
+                    exc_info=True,
+                )
+                current += dt.timedelta(days=1)
+                continue
+
+            games = data.get("games", [])
+            for game in games:
+                schedule = game.get("schedule") or {}
+                game_id = schedule.get("id")
+                if game_id in seen_ids:
+                    continue
+                aggregated.append(game)
+                seen_ids.add(game_id)
+
+            current += dt.timedelta(days=1)
+
+        return aggregated
 
     def fetch_game_boxscore(self, season: str, game_id: str) -> Dict[str, Any]:
         return self._request(f"{season}/games/{game_id}/boxscore.json")
@@ -15638,6 +15685,69 @@ def predict_upcoming_games(
 
         fallback_rows: List[Dict[str, Any]] = []
         recent_cutoff = now_utc - dt.timedelta(days=30)
+        seen_game_ids: Set[str] = set()
+
+        def _append_msf_game(
+            game: Dict[str, Any], season_key: str
+        ) -> Optional[pd.Timestamp]:
+            schedule = game.get("schedule") or {}
+            game_id = schedule.get("id")
+            if not game_id:
+                return None
+
+            game_id_str = str(game_id)
+            if game_id_str in seen_game_ids:
+                return None
+
+            start_time_ts = _resolve_schedule_start(schedule)
+            if start_time_ts is None:
+                return None
+
+            if start_time_ts.tzinfo is None:
+                start_time_ts = start_time_ts.tz_localize(dt.timezone.utc)
+
+            if start_time_ts < pd.Timestamp(recent_cutoff, tz=dt.timezone.utc):
+                return None
+
+            home_info = schedule.get("homeTeam") or {}
+            away_info = schedule.get("awayTeam") or {}
+            home_team = normalize_team_abbr(
+                home_info.get("abbreviation") or home_info.get("name")
+            )
+            away_team = normalize_team_abbr(
+                away_info.get("abbreviation") or away_info.get("name")
+            )
+            if not home_team or not away_team:
+                return None
+
+            week_value = schedule.get("week")
+            try:
+                week_int = int(week_value) if week_value is not None else None
+            except (TypeError, ValueError):
+                week_int = None
+
+            status_raw = schedule.get("status") or schedule.get("playedStatus")
+            status = str(status_raw).lower() if status_raw else "scheduled"
+
+            fallback_rows.append(
+                {
+                    "game_id": game_id_str,
+                    "season": str(season_key),
+                    "week": week_int,
+                    "start_time": start_time_ts.to_pydatetime(),
+                    "day_of_week": start_time_ts.tz_convert(eastern_zone).strftime("%A"),
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "status": status,
+                    "venue": schedule.get("venue"),
+                    "referee": schedule.get("referee"),
+                    "home_score": np.nan,
+                    "away_score": np.nan,
+                    "odds_updated": pd.NaT,
+                }
+            )
+            seen_game_ids.add(game_id_str)
+            return start_time_ts
 
         for season_key in seasons_to_query:
             try:
@@ -15650,55 +15760,43 @@ def predict_upcoming_games(
                 )
                 continue
 
+            future_detected = False
+
             for game in season_games or []:
-                schedule = game.get("schedule") or {}
-                game_id = schedule.get("id")
-                if not game_id:
-                    continue
+                start_time_ts = _append_msf_game(game, season_key)
+                if start_time_ts is not None and start_time_ts >= pd.Timestamp(now_utc):
+                    future_detected = True
 
-                start_time_ts = _resolve_schedule_start(schedule)
-                if start_time_ts is None:
-                    continue
-
-                start_time = start_time_ts.to_pydatetime()
-                if start_time < recent_cutoff:
-                    continue
-
-                home_info = schedule.get("homeTeam") or {}
-                away_info = schedule.get("awayTeam") or {}
-                home_team = normalize_team_abbr(
-                    home_info.get("abbreviation") or home_info.get("name")
-                )
-                away_team = normalize_team_abbr(
-                    away_info.get("abbreviation") or away_info.get("name")
-                )
-                if not home_team or not away_team:
-                    continue
-
-                week_value = schedule.get("week")
+            if not future_detected:
+                range_start = now_utc.date()
+                range_end = (now_utc + dt.timedelta(days=14)).date()
                 try:
-                    week_int = int(week_value) if week_value is not None else None
-                except (TypeError, ValueError):
-                    week_int = None
+                    date_range_games = msf_client.fetch_games_by_date_range(
+                        season_key, range_start, range_end
+                    )
+                except Exception:
+                    logging.warning(
+                        "Failed to fetch date-range schedule from MySportsFeeds for %s",
+                        season_key,
+                        exc_info=True,
+                    )
+                    date_range_games = []
 
-                status_raw = schedule.get("status") or schedule.get("playedStatus")
-                status = str(status_raw).lower() if status_raw else "scheduled"
+                if date_range_games:
+                    logging.debug(
+                        "Loaded %d scheduled games for %s via date-range fallback",
+                        len(date_range_games),
+                        season_key,
+                    )
 
-                fallback_rows.append(
-                    {
-                        "game_id": str(game_id),
-                        "season": str(season_key),
-                        "week": week_int,
-                        "start_time": start_time,
-                        "day_of_week": start_time.astimezone(eastern_zone).strftime("%A"),
-                        "home_team": home_team,
-                        "away_team": away_team,
-                        "status": status,
-                        "home_score": np.nan,
-                        "away_score": np.nan,
-                        "odds_updated": pd.NaT,
-                    }
-                )
+                for game in date_range_games:
+                    appended_ts = _append_msf_game(game, season_key)
+                    if (
+                        not future_detected
+                        and appended_ts is not None
+                        and appended_ts >= pd.Timestamp(now_utc)
+                    ):
+                        future_detected = True
 
         if not fallback_rows:
             fallback_schedule_cache = pd.DataFrame()
