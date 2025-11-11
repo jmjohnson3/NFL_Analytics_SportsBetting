@@ -15706,7 +15706,7 @@ def predict_upcoming_games(
             if start_time_ts.tzinfo is None:
                 start_time_ts = start_time_ts.tz_localize(dt.timezone.utc)
 
-            if start_time_ts < pd.Timestamp(recent_cutoff, tz=dt.timezone.utc):
+            if start_time_ts < pd.Timestamp(recent_cutoff):
                 return None
 
             home_info = schedule.get("homeTeam") or {}
