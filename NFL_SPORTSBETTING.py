@@ -15639,6 +15639,9 @@ def predict_upcoming_games(
         else:
             working["day_of_week"] = working["local_day_of_week"]
 
+        if "season" in working.columns:
+            working["season"] = working["season"].astype(str)
+
         status_series = working.get("status")
         if status_series is not None:
             working["status"] = status_series.fillna("scheduled").astype(str).str.lower()
@@ -15678,34 +15681,71 @@ def predict_upcoming_games(
 
         schedule = schedule.sort_values("start_time").reset_index(drop=True)
 
-        # Discard stale matchups before considering future slates so we never fall back to
-        # last season's schedule when the current slate fails to populate.
-        schedule = schedule[schedule["start_time"] >= lookback]
+        season_series = schedule.get("season")
+        if season_series is not None:
+            season_year = (
+                season_series.astype(str)
+                .str.extract(r"(\d{4})")[0]
+            )
+            season_year_numeric = pd.to_numeric(season_year, errors="coerce")
+            if season_year_numeric.notna().any():
+                max_season_year = int(season_year_numeric.max())
+                season_mask = season_year_numeric == max_season_year
+                filtered = schedule.loc[season_mask].copy()
+                if not filtered.empty:
+                    schedule = filtered
+
+        recent_cutoff = now_utc - pd.Timedelta(days=3)
+        schedule = schedule[schedule["start_time"] >= recent_cutoff]
         if schedule.empty:
             logging.warning(
-                "No upcoming games remain after enforcing the prediction window lookback"
+                "Latest season schedule data is more than three days old; no upcoming games available"
             )
             return pd.DataFrame()
 
-        future_cutoff = now_utc - pd.Timedelta(hours=1)
-        future_games = schedule[schedule["start_time"] >= future_cutoff].copy()
+        # Discard stale matchups before considering future slates so we never fall back to
+        # last season's schedule when the current slate fails to populate.
+        window_mask = (schedule["start_time"] >= lookback) & (
+            schedule["start_time"] <= lookahead
+        )
+        selection = schedule.loc[window_mask].copy()
 
-        if future_games.empty:
-            upcoming_only = schedule[schedule["start_time"] >= now_utc]
-            if upcoming_only.empty:
-                logging.warning(
-                    "Upcoming schedule is empty after filtering stale kickoffs; "
-                    "unable to produce forecasts"
+        if selection.empty:
+            future_games = schedule[schedule["start_time"] >= now_utc]
+            if not future_games.empty:
+                selection = future_games[future_games["start_time"] <= lookahead].copy()
+                if selection.empty:
+                    selection = future_games.copy()
+            else:
+                earliest_start = schedule["start_time"].min()
+                if pd.isna(earliest_start):
+                    logging.warning("No upcoming games have a valid kickoff time available")
+                    return pd.DataFrame()
+
+                if earliest_start < now_utc - pd.Timedelta(days=30):
+                    logging.warning(
+                        "Earliest available schedule data predates the last 30 days; ignoring stale slate"
+                    )
+                    return pd.DataFrame()
+
+                week_start = earliest_start.normalize() - pd.to_timedelta(
+                    earliest_start.weekday(), unit="D"
                 )
-                return pd.DataFrame()
+                week_end = week_start + pd.Timedelta(days=7)
+                week_mask = (schedule["start_time"] >= week_start) & (
+                    schedule["start_time"] <= week_end
+                )
+                selection = schedule.loc[week_mask].copy()
+                if selection.empty:
+                    logging.warning("No upcoming games within the fallback week window")
+                    return pd.DataFrame()
 
-            selection = upcoming_only[upcoming_only["start_time"] <= lookahead].copy()
-            if selection.empty:
-                selection = upcoming_only.copy()
-        else:
-            selection = future_games[future_games["start_time"] <= lookahead].copy()
-            if selection.empty:
-                selection = future_games.copy()
+                logging.info(
+                    "Falling back to scheduled week %s-%s with %d games",
+                    week_start.date(),
+                    week_end.date(),
+                    len(selection),
+                )
 
         desired_days = {"Thursday", "Sunday", "Monday", "Saturday"}
         day_mask = selection["local_day_of_week"].isin(desired_days)
