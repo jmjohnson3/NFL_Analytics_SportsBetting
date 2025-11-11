@@ -15480,6 +15480,56 @@ def predict_upcoming_games(
     fallback_schedule_cache: Optional[pd.DataFrame] = None
     fallback_attempted = False
 
+    def _resolve_schedule_start(schedule: Dict[str, Any]) -> Optional[pd.Timestamp]:
+        """Resolve a kickoff time from a MySportsFeeds schedule payload."""
+
+        def _parse_timestamp(value: Any) -> Optional[pd.Timestamp]:
+            if value is None:
+                return None
+            if isinstance(value, float) and np.isnan(value):  # type: ignore[arg-type]
+                return None
+            try:
+                ts = pd.to_datetime(value, utc=False, errors="coerce")
+            except Exception:
+                return None
+            if pd.isna(ts):
+                return None
+            return ts
+
+        primary_fields = ("startTimeUTC", "startTime", "originalStartTime")
+        for field in primary_fields:
+            ts = _parse_timestamp(schedule.get(field))
+            if ts is None:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.tz_localize(dt.timezone.utc)
+            else:
+                ts = ts.tz_convert(dt.timezone.utc)
+            return ts
+
+        date_fields = ("startDate", "originalStartDate")
+        for field in date_fields:
+            ts = _parse_timestamp(schedule.get(field))
+            if ts is None:
+                continue
+
+            if ts.tzinfo is None:
+                localized = dt.datetime.combine(
+                    ts.date(),
+                    dt.time(hour=13, minute=0),
+                    tzinfo=eastern_zone,
+                )
+            else:
+                localized = dt.datetime.combine(
+                    ts.astimezone(eastern_zone).date(),
+                    dt.time(hour=13, minute=0),
+                    tzinfo=eastern_zone,
+                )
+
+            return pd.Timestamp(localized.astimezone(dt.timezone.utc))
+
+        return None
+
     def _fetch_msf_schedule(reason: str) -> pd.DataFrame:
         nonlocal fallback_schedule_cache, fallback_attempted
 
@@ -15535,14 +15585,11 @@ def predict_upcoming_games(
                 if not game_id:
                     continue
 
-                start_time_value = schedule.get("startTime")
-                start_time = parse_dt(start_time_value) if start_time_value else None
-                if start_time is None:
+                start_time_ts = _resolve_schedule_start(schedule)
+                if start_time_ts is None:
                     continue
-                if start_time.tzinfo is None:
-                    start_time = start_time.replace(tzinfo=dt.timezone.utc)
-                else:
-                    start_time = start_time.astimezone(dt.timezone.utc)
+
+                start_time = start_time_ts.to_pydatetime()
                 if start_time < recent_cutoff:
                     continue
 
