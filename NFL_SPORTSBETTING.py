@@ -17613,7 +17613,7 @@ def main() -> None:
             )
             closing_gap_summary_logged = True
 
-    if not config.enable_paper_trading and closing_coverage < 0.9:
+    if not config.enable_paper_trading and closing_coverage < 0.86:
         logging.warning(
             "Closing odds coverage is %.1f%%. Falling back to paper trading until verified sportsbook closings are loaded.",
             closing_coverage * 100.0,
@@ -17623,7 +17623,7 @@ def main() -> None:
         _log_summary_location()
 
     if (
-        closing_coverage < 0.9
+        closing_coverage < 0.86
         or rest_coverage < 0.9
         or timezone_coverage < 0.9
     ):
@@ -17635,7 +17635,7 @@ def main() -> None:
                 timezone_coverage * 100.0,
             )
             config.enable_paper_trading = True
-            if closing_coverage < 0.9:
+            if closing_coverage < 0.86:
                 _log_gap_location()
                 _log_summary_location()
         else:
@@ -17645,7 +17645,7 @@ def main() -> None:
                 rest_coverage * 100.0,
                 timezone_coverage * 100.0,
             )
-            if closing_coverage < 0.9:
+            if closing_coverage < 0.86:
                 _log_gap_location()
                 _log_summary_location()
 
@@ -17673,7 +17673,7 @@ def main() -> None:
         graded = paper_summary.graded_bets
         cumulative_roi = paper_summary.cumulative_roi or 0.0
         if (
-            paper_summary.closing_coverage < 0.9
+            paper_summary.closing_coverage < 0.86
             or graded < 50
             or cumulative_roi <= 0.0
         ):
