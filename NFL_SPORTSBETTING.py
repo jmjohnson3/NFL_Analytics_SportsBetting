@@ -9786,6 +9786,19 @@ class FeatureBuilder:
                 away_logit = np.log((away_prob + 1e-6) / np.clip(1 - away_prob, 1e-6, None))
             working["implied_prob_logit_diff"] = home_logit - away_logit
 
+        # Clip differential features to reduce the impact of extreme outliers. This uses
+        # simple winsorization at the 1st/99th percentiles computed from the current frame.
+        diff_columns = list(diff_specs.keys()) + ["implied_prob_logit_diff"]
+        numeric_diff_columns = [col for col in diff_columns if col in working.columns]
+        if numeric_diff_columns:
+            diff_subset = working[numeric_diff_columns]
+            if not diff_subset.empty:
+                lower_bounds = diff_subset.quantile(0.01)
+                upper_bounds = diff_subset.quantile(0.99)
+                working[numeric_diff_columns] = diff_subset.clip(
+                    lower=lower_bounds, upper=upper_bounds, axis=1
+                )
+
         return working
 
     def _backfill_game_odds(self, games: pd.DataFrame) -> pd.DataFrame:
