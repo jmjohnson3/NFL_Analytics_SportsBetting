@@ -15729,6 +15729,23 @@ def predict_upcoming_games(
             status_raw = schedule.get("status") or schedule.get("playedStatus")
             status = str(status_raw).lower() if status_raw else "scheduled"
 
+            venue_info = schedule.get("venue")
+            if isinstance(venue_info, dict):
+                venue_value = (
+                    venue_info.get("name")
+                    or venue_info.get("venueName")
+                    or venue_info.get("stadium")
+                    or ""
+                )
+            else:
+                venue_value = venue_info or ""
+
+            referee_info = schedule.get("referee")
+            if isinstance(referee_info, dict):
+                referee_value = referee_info.get("name") or ""
+            else:
+                referee_value = referee_info or ""
+
             fallback_rows.append(
                 {
                     "game_id": game_id_str,
@@ -15739,8 +15756,8 @@ def predict_upcoming_games(
                     "home_team": home_team,
                     "away_team": away_team,
                     "status": status,
-                    "venue": schedule.get("venue"),
-                    "referee": schedule.get("referee"),
+                    "venue": venue_value,
+                    "referee": referee_value,
                     "home_score": np.nan,
                     "away_score": np.nan,
                     "odds_updated": pd.NaT,
@@ -15750,54 +15767,75 @@ def predict_upcoming_games(
             return start_time_ts
 
         for season_key in seasons_to_query:
-            try:
-                season_games = msf_client.fetch_games(season_key)
-            except Exception:
-                logging.warning(
-                    "Failed to fetch schedule from MySportsFeeds for %s during upcoming fallback",
-                    season_key,
-                    exc_info=True,
-                )
-                continue
-
-            future_detected = False
-
-            for game in season_games or []:
-                start_time_ts = _append_msf_game(game, season_key)
-                if start_time_ts is not None and start_time_ts >= pd.Timestamp(now_utc):
-                    future_detected = True
-
             range_start = (now_utc - dt.timedelta(days=1)).date()
             range_end = (now_utc + dt.timedelta(days=14)).date()
-            try:
-                date_range_games = msf_client.fetch_games_by_date_range(
-                    season_key, range_start, range_end
-                )
-            except Exception:
-                logging.warning(
-                    "Failed to fetch date-range schedule from MySportsFeeds for %s",
-                    season_key,
-                    exc_info=True,
-                )
-                date_range_games = []
+            status_candidates: Tuple[Optional[str], ...] = (
+                "scheduled",
+                "upcoming",
+                "unplayed",
+                "pre",
+                None,
+            )
 
-            if date_range_games:
+            season_has_future = False
+
+            for status_filter in status_candidates:
+                try:
+                    date_range_games = msf_client.fetch_games_by_date_range(
+                        season_key,
+                        range_start,
+                        range_end,
+                        status=status_filter,
+                    )
+                except Exception:
+                    logging.warning(
+                        "Failed to fetch date-range schedule from MySportsFeeds for %s",
+                        season_key,
+                        exc_info=True,
+                    )
+                    continue
+
+                if not date_range_games:
+                    continue
+
                 logging.debug(
-                    "Loaded %d scheduled games for %s via date-range fallback",
+                    "Loaded %d scheduled games for %s via date-range status '%s'",
                     len(date_range_games),
                     season_key,
+                    status_filter or "any",
                 )
 
-            for game in date_range_games:
-                appended_ts = _append_msf_game(game, season_key)
-                if appended_ts is not None and appended_ts >= pd.Timestamp(now_utc):
-                    future_detected = True
+                for game in date_range_games:
+                    appended_ts = _append_msf_game(game, season_key)
+                    if appended_ts is not None and appended_ts >= pd.Timestamp(now_utc):
+                        season_has_future = True
 
-            if not future_detected:
-                logging.debug(
-                    "No future games detected for %s within the next two weeks of schedule data",
-                    season_key,
-                )
+                if season_has_future:
+                    break
+
+            if not season_has_future:
+                try:
+                    season_games = msf_client.fetch_games(season_key)
+                except Exception:
+                    logging.warning(
+                        "Failed to fetch full season schedule from MySportsFeeds for %s",
+                        season_key,
+                        exc_info=True,
+                    )
+                    continue
+
+                for game in season_games or []:
+                    appended_ts = _append_msf_game(game, season_key)
+                    if appended_ts is not None and appended_ts >= pd.Timestamp(now_utc):
+                        season_has_future = True
+
+                if not season_has_future:
+                    logging.debug(
+                        "No future games detected for %s between %s and %s using MySportsFeeds data",
+                        season_key,
+                        range_start,
+                        range_end,
+                    )
 
         if not fallback_rows:
             fallback_schedule_cache = pd.DataFrame()
@@ -15935,7 +15973,7 @@ def predict_upcoming_games(
         window_mask = upcoming["start_time"] <= lookahead
         window_games = upcoming.loc[window_mask].copy()
 
-        if window_games.empty():
+        if window_games.empty:
             earliest_start = upcoming["start_time"].min()
             if pd.isna(earliest_start):
                 logging.warning("No upcoming games have a valid kickoff time available")
@@ -15949,7 +15987,7 @@ def predict_upcoming_games(
                 upcoming["start_time"] <= week_end
             )
             window_games = upcoming.loc[week_mask].copy()
-            if window_games.empty():
+            if window_games.empty:
                 logging.warning("No upcoming games within the fallback week window")
                 return pd.DataFrame()
 
