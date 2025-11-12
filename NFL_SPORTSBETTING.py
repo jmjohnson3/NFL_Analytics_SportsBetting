@@ -15528,6 +15528,14 @@ def predict_upcoming_games(
     fallback_attempted = False
     future_only_cutoff = now_utc - dt.timedelta(minutes=5)
 
+    def _to_utc_timestamp(value: Any) -> pd.Timestamp:
+        """Return a timezone-aware UTC pandas Timestamp."""
+
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")
+        return ts.tz_convert("UTC")
+
     def _resolve_schedule_start(schedule: Dict[str, Any]) -> Optional[pd.Timestamp]:
         """Resolve a kickoff time from a MySportsFeeds schedule payload."""
 
@@ -15706,7 +15714,7 @@ def predict_upcoming_games(
             if start_time_ts.tzinfo is None:
                 start_time_ts = start_time_ts.tz_localize(dt.timezone.utc)
 
-            if start_time_ts < pd.Timestamp(future_only_cutoff):
+            if start_time_ts < _to_utc_timestamp(future_only_cutoff):
                 return None
 
             home_info = schedule.get("homeTeam") or {}
@@ -15807,7 +15815,7 @@ def predict_upcoming_games(
 
                 for game in date_range_games:
                     appended_ts = _append_msf_game(game, season_key)
-                    if appended_ts is not None and appended_ts >= pd.Timestamp(now_utc):
+                    if appended_ts is not None and appended_ts >= _to_utc_timestamp(now_utc):
                         season_has_future = True
 
                 if season_has_future:
@@ -15826,7 +15834,7 @@ def predict_upcoming_games(
 
                 for game in season_games or []:
                     appended_ts = _append_msf_game(game, season_key)
-                    if appended_ts is not None and appended_ts >= pd.Timestamp(now_utc):
+                    if appended_ts is not None and appended_ts >= _to_utc_timestamp(now_utc):
                         season_has_future = True
 
                 if not season_has_future:
@@ -15851,7 +15859,7 @@ def predict_upcoming_games(
                 fallback_schedule_cache["start_time"].notna()
             ]
 
-            future_cutoff = pd.Timestamp(future_only_cutoff, tz="UTC")
+            future_cutoff = _to_utc_timestamp(future_only_cutoff)
             fallback_schedule_cache = fallback_schedule_cache[
                 fallback_schedule_cache["start_time"] >= future_cutoff
             ]
