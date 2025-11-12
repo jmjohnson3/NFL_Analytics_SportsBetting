@@ -9768,6 +9768,13 @@ class FeatureBuilder:
                 "home_prev_point_diff",
                 "away_prev_point_diff",
             ),
+            "elo_pre_diff": ("home_elo_pre", "away_elo_pre"),
+            "elo_win_prob_diff": ("home_elo_win_prob", "away_elo_win_prob"),
+            "elo_vs_opponent_diff": (
+                "home_elo_vs_opponent",
+                "away_elo_vs_opponent",
+            ),
+            "elo_edge_diff": ("home_elo_edge", "away_elo_edge"),
             "injury_total_diff": ("home_injury_total", "away_injury_total"),
         }
 
@@ -10935,6 +10942,12 @@ class FeatureBuilder:
                 "rest_penalty": "home_rest_penalty",
                 "travel_penalty": "home_travel_penalty_hist",
                 "timezone_diff_hours": "home_timezone_diff_hours",
+                "team_elo_pre": "home_elo_pre",
+                "team_elo_post": "home_elo_post",
+                "team_elo_change": "home_elo_change",
+                "team_elo_win_prob": "home_elo_win_prob",
+                "team_elo_vs_opponent": "home_elo_vs_opponent",
+                "opponent_elo_pre": "home_opponent_elo_pre",
             }
         )
 
@@ -10955,6 +10968,12 @@ class FeatureBuilder:
                 "rest_penalty": "away_rest_penalty",
                 "travel_penalty": "away_travel_penalty_hist",
                 "timezone_diff_hours": "away_timezone_diff_hours",
+                "team_elo_pre": "away_elo_pre",
+                "team_elo_post": "away_elo_post",
+                "team_elo_change": "away_elo_change",
+                "team_elo_win_prob": "away_elo_win_prob",
+                "team_elo_vs_opponent": "away_elo_vs_opponent",
+                "opponent_elo_pre": "away_opponent_elo_pre",
             }
         )
 
@@ -11007,6 +11026,30 @@ class FeatureBuilder:
                     games_context[col], errors="coerce"
                 ).fillna(0.0)
 
+        elo_cols = [
+            "home_elo_pre",
+            "home_elo_post",
+            "home_elo_change",
+            "home_elo_win_prob",
+            "home_elo_vs_opponent",
+            "home_opponent_elo_pre",
+            "home_elo_edge",
+            "away_elo_pre",
+            "away_elo_post",
+            "away_elo_change",
+            "away_elo_win_prob",
+            "away_elo_vs_opponent",
+            "away_opponent_elo_pre",
+            "away_elo_edge",
+        ]
+        for col in elo_cols:
+            if col in games_context.columns:
+                games_context[col] = pd.to_numeric(
+                    games_context[col], errors="coerce"
+                )
+            else:
+                games_context[col] = np.nan
+
         games_context["moneyline_diff"] = games_context["home_moneyline"] - games_context["away_moneyline"]
         games_context["implied_prob_diff"] = (
             games_context["home_implied_prob"] - games_context["away_implied_prob"]
@@ -11014,6 +11057,22 @@ class FeatureBuilder:
         games_context["implied_prob_sum"] = (
             games_context["home_implied_prob"] + games_context["away_implied_prob"]
         )
+
+        if {
+            "home_elo_win_prob",
+            "away_elo_win_prob",
+            "home_implied_prob",
+            "away_implied_prob",
+        }.issubset(games_context.columns):
+            games_context["home_elo_edge"] = (
+                games_context["home_elo_win_prob"] - games_context["home_implied_prob"]
+            )
+            games_context["away_elo_edge"] = (
+                games_context["away_elo_win_prob"] - games_context["away_implied_prob"]
+            )
+        else:
+            games_context["home_elo_edge"] = np.nan
+            games_context["away_elo_edge"] = np.nan
 
         games_context["point_diff"] = games_context["home_score"] - games_context["away_score"]
         self.games_frame = games_context.copy()
@@ -11170,6 +11229,13 @@ class FeatureBuilder:
             "home_prev_point_diff": np.nan,
             "home_rest_days": np.nan,
             "home_injury_total": 0.0,
+            "home_elo_pre": np.nan,
+            "home_elo_post": np.nan,
+            "home_elo_change": np.nan,
+            "home_elo_win_prob": np.nan,
+            "home_elo_vs_opponent": np.nan,
+            "home_opponent_elo_pre": np.nan,
+            "home_elo_edge": np.nan,
             "away_points_for_avg": np.nan,
             "away_points_against_avg": np.nan,
             "away_point_diff_avg": np.nan,
@@ -11178,6 +11244,13 @@ class FeatureBuilder:
             "away_prev_points_against": np.nan,
             "away_prev_point_diff": np.nan,
             "away_rest_days": np.nan,
+            "away_elo_pre": np.nan,
+            "away_elo_post": np.nan,
+            "away_elo_change": np.nan,
+            "away_elo_win_prob": np.nan,
+            "away_elo_vs_opponent": np.nan,
+            "away_opponent_elo_pre": np.nan,
+            "away_elo_edge": np.nan,
             "away_injury_total": 0.0,
             "offense_pass_rating_diff": 0.0,
             "offense_rush_rating_diff": 0.0,
@@ -11301,6 +11374,12 @@ class FeatureBuilder:
                         features.at[idx, "home_travel_penalty"] = history.get("travel_penalty")
                     if pd.isna(features.at[idx, "home_timezone_diff_hours"]):
                         features.at[idx, "home_timezone_diff_hours"] = history.get("timezone_diff_hours")
+                    latest_elo = history.get("team_elo_post")
+                    if pd.isna(latest_elo):
+                        latest_elo = history.get("team_elo_pre")
+                    features.at[idx, "home_elo_pre"] = latest_elo
+                    features.at[idx, "home_elo_post"] = latest_elo
+                    features.at[idx, "home_elo_change"] = history.get("team_elo_change")
 
                 fallback_home = self._fallback_team_context(
                     home_team,
@@ -11350,6 +11429,12 @@ class FeatureBuilder:
                         features.at[idx, "away_travel_penalty"] = history.get("travel_penalty")
                     if pd.isna(features.at[idx, "away_timezone_diff_hours"]):
                         features.at[idx, "away_timezone_diff_hours"] = history.get("timezone_diff_hours")
+                    latest_elo = history.get("team_elo_post")
+                    if pd.isna(latest_elo):
+                        latest_elo = history.get("team_elo_pre")
+                    features.at[idx, "away_elo_pre"] = latest_elo
+                    features.at[idx, "away_elo_post"] = latest_elo
+                    features.at[idx, "away_elo_change"] = history.get("team_elo_change")
 
                 fallback_away = self._fallback_team_context(
                     away_team,
@@ -11366,6 +11451,32 @@ class FeatureBuilder:
                         target_col = f"away_{key}"
                     if target_col in features.columns and pd.isna(features.at[idx, target_col]):
                         features.at[idx, target_col] = value
+
+        def _elo_expected(home_rating: float, away_rating: float) -> float:
+            return 1.0 / (1.0 + 10 ** ((away_rating - (home_rating + 55.0)) / 400.0))
+
+        if {"home_elo_pre", "away_elo_pre"}.issubset(features.columns):
+            mask = features["home_elo_pre"].notna() & features["away_elo_pre"].notna()
+            if mask.any():
+                home_ratings = features.loc[mask, "home_elo_pre"].astype(float)
+                away_ratings = features.loc[mask, "away_elo_pre"].astype(float)
+                expected = home_ratings.combine(away_ratings, _elo_expected)
+                features.loc[mask, "home_elo_win_prob"] = expected
+                features.loc[mask, "away_elo_win_prob"] = 1.0 - expected
+                features.loc[mask, "home_elo_vs_opponent"] = home_ratings - away_ratings
+                features.loc[mask, "away_elo_vs_opponent"] = away_ratings - home_ratings
+                features.loc[mask, "home_opponent_elo_pre"] = away_ratings
+                features.loc[mask, "away_opponent_elo_pre"] = home_ratings
+                if "home_implied_prob" in features.columns:
+                    features.loc[mask, "home_elo_edge"] = (
+                        features.loc[mask, "home_elo_win_prob"]
+                        - features.loc[mask, "home_implied_prob"].astype(float)
+                    )
+                if "away_implied_prob" in features.columns:
+                    features.loc[mask, "away_elo_edge"] = (
+                        features.loc[mask, "away_elo_win_prob"]
+                        - features.loc[mask, "away_implied_prob"].astype(float)
+                    )
 
         features = self._augment_matchup_features(features)
 
@@ -12581,8 +12692,103 @@ class FeatureBuilder:
         )
         return context
 
+    @staticmethod
+    def _compute_game_elo_history(games: pd.DataFrame) -> pd.DataFrame:
+        if games.empty:
+            return pd.DataFrame(
+                columns=[
+                    "game_id",
+                    "team",
+                    "opponent",
+                    "team_elo_pre",
+                    "team_elo_post",
+                    "team_elo_change",
+                    "team_elo_win_prob",
+                    "team_elo_vs_opponent",
+                    "opponent_elo_pre",
+                ]
+            )
+
+        ratings: Dict[str, float] = defaultdict(lambda: 1500.0)
+        home_field_advantage = 55.0
+        k_factor = 20.0
+        records: List[Dict[str, Any]] = []
+
+        working = games.copy()
+        working["start_time"] = pd.to_datetime(working["start_time"], utc=True, errors="coerce")
+        working = working.sort_values("start_time")
+
+        def _expected(r_a: float, r_b: float) -> float:
+            return 1.0 / (1.0 + 10 ** ((r_b - r_a) / 400.0))
+
+        def _margin_multiplier(point_diff: float, rating_gap: float) -> float:
+            diff_abs = abs(point_diff)
+            if diff_abs <= 0:
+                return 1.0
+            scaled_gap = max(0.0, abs(rating_gap))
+            return math.log(diff_abs + 1.0) * (2.2 / ((scaled_gap * 0.001) + 2.2))
+
+        for row in working.itertuples(index=False):
+            home_team = normalize_team_abbr(getattr(row, "home_team", None))
+            away_team = normalize_team_abbr(getattr(row, "away_team", None))
+            if not home_team or not away_team:
+                continue
+
+            home_rating = ratings[home_team]
+            away_rating = ratings[away_team]
+
+            expected_home = _expected(home_rating + home_field_advantage, away_rating)
+            expected_away = 1.0 - expected_home
+
+            home_post = home_rating
+            away_post = away_rating
+
+            home_score = getattr(row, "home_score", np.nan)
+            away_score = getattr(row, "away_score", np.nan)
+            if pd.notna(home_score) and pd.notna(away_score):
+                point_diff = float(home_score) - float(away_score)
+                result_home = 1.0 if point_diff > 0 else (0.0 if point_diff < 0 else 0.5)
+                result_away = 1.0 - result_home
+                margin_mult = _margin_multiplier(point_diff, home_rating - away_rating)
+                home_post = home_rating + k_factor * margin_mult * (result_home - expected_home)
+                away_post = away_rating + k_factor * margin_mult * (result_away - expected_away)
+                ratings[home_team] = home_post
+                ratings[away_team] = away_post
+
+            records.append(
+                {
+                    "game_id": getattr(row, "game_id", None),
+                    "team": home_team,
+                    "opponent": away_team,
+                    "team_elo_pre": home_rating,
+                    "team_elo_post": home_post,
+                    "team_elo_win_prob": expected_home,
+                    "opponent_elo_pre": away_rating,
+                }
+            )
+            records.append(
+                {
+                    "game_id": getattr(row, "game_id", None),
+                    "team": away_team,
+                    "opponent": home_team,
+                    "team_elo_pre": away_rating,
+                    "team_elo_post": away_post,
+                    "team_elo_win_prob": expected_away,
+                    "opponent_elo_pre": home_rating,
+                }
+            )
+
+        elo_df = pd.DataFrame.from_records(records)
+        if elo_df.empty:
+            return elo_df
+
+        elo_df["team_elo_change"] = elo_df["team_elo_post"] - elo_df["team_elo_pre"]
+        elo_df["team_elo_vs_opponent"] = elo_df["team_elo_pre"] - elo_df["opponent_elo_pre"]
+        return elo_df
+
     def _compute_team_game_rolling_stats(self, games: pd.DataFrame) -> pd.DataFrame:
         """Create rolling scoring, travel, and rest indicators for each team game."""
+
 
         base_columns = [
             "game_id",
@@ -12603,6 +12809,12 @@ class FeatureBuilder:
             "rest_penalty",
             "timezone_diff_hours",
             "travel_penalty",
+            "team_elo_pre",
+            "team_elo_post",
+            "team_elo_change",
+            "team_elo_win_prob",
+            "team_elo_vs_opponent",
+            "opponent_elo_pre",
         ]
 
         if games.empty:
@@ -12694,6 +12906,26 @@ class FeatureBuilder:
             "start_time",
             "game_id",
         ]).reset_index(drop=True)
+
+        elo_history = self._compute_game_elo_history(games)
+        if elo_history.empty:
+            for col in [
+                "team_elo_pre",
+                "team_elo_post",
+                "team_elo_change",
+                "team_elo_win_prob",
+                "team_elo_vs_opponent",
+                "opponent_elo_pre",
+            ]:
+                team_games[col] = np.nan
+        else:
+            elo_history["team"] = elo_history["team"].apply(normalize_team_abbr)
+            elo_history["opponent"] = elo_history["opponent"].apply(normalize_team_abbr)
+            team_games = team_games.merge(
+                elo_history,
+                on=["game_id", "team", "opponent"],
+                how="left",
+            )
 
         def compute_group(group: pd.DataFrame) -> pd.DataFrame:
             group = group.sort_values("start_time").copy()
