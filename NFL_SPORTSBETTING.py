@@ -7190,6 +7190,7 @@ class MySportsFeedsClient:
         attempts: Tuple[Optional[str], ...] = (
             "completed,upcoming",
             "final,inprogress,scheduled",
+            "scheduled",
             None,
         )
 
@@ -7215,6 +7216,52 @@ class MySportsFeedsClient:
             season,
         )
         return []
+
+    def fetch_games_by_date_range(
+        self,
+        season: str,
+        start_date: dt.date,
+        end_date: dt.date,
+        status: Optional[str] = "scheduled",
+    ) -> List[Dict[str, Any]]:
+        """Fetch games for each date in the provided range (inclusive)."""
+
+        aggregated: List[Dict[str, Any]] = []
+        seen_ids: Set[Any] = set()
+        current = start_date
+
+        while current <= end_date:
+            params: Dict[str, Any] = {
+                "limit": 500,
+                "date": current.strftime("%Y%m%d"),
+            }
+            if status:
+                params["status"] = status
+
+            try:
+                data = self._request(f"{season}/games.json", params=params)
+            except Exception:
+                logging.debug(
+                    "MySportsFeeds date-range request failed for %s on %s",
+                    season,
+                    current,
+                    exc_info=True,
+                )
+                current += dt.timedelta(days=1)
+                continue
+
+            games = data.get("games", [])
+            for game in games:
+                schedule = game.get("schedule") or {}
+                game_id = schedule.get("id")
+                if game_id in seen_ids:
+                    continue
+                aggregated.append(game)
+                seen_ids.add(game_id)
+
+            current += dt.timedelta(days=1)
+
+        return aggregated
 
     def fetch_game_boxscore(self, season: str, game_id: str) -> Dict[str, Any]:
         return self._request(f"{season}/games/{game_id}/boxscore.json")
@@ -9638,6 +9685,109 @@ class FeatureBuilder:
                 merged.drop(columns=[lookup_col], inplace=True)
         return merged
 
+    @staticmethod
+    def _augment_matchup_features(features: pd.DataFrame) -> pd.DataFrame:
+        """Add relative matchup features (diffs/ratios) that help the models."""
+
+        if features.empty:
+            return features
+
+        working = features.copy()
+
+        def _maybe_diff(output: str, home_col: str, away_col: str) -> None:
+            if home_col in working.columns and away_col in working.columns:
+                working[output] = working[home_col] - working[away_col]
+
+        diff_specs = {
+            "offense_pass_rating_diff": (
+                "home_offense_pass_rating",
+                "away_offense_pass_rating",
+            ),
+            "offense_rush_rating_diff": (
+                "home_offense_rush_rating",
+                "away_offense_rush_rating",
+            ),
+            "defense_pass_rating_diff": (
+                "home_defense_pass_rating",
+                "away_defense_pass_rating",
+            ),
+            "defense_rush_rating_diff": (
+                "home_defense_rush_rating",
+                "away_defense_rush_rating",
+            ),
+            "offense_epa_diff": ("home_offense_epa", "away_offense_epa"),
+            "defense_epa_diff": ("home_defense_epa", "away_defense_epa"),
+            "offense_success_rate_diff": (
+                "home_offense_success_rate",
+                "away_offense_success_rate",
+            ),
+            "defense_success_rate_diff": (
+                "home_defense_success_rate",
+                "away_defense_success_rate",
+            ),
+            "pace_seconds_diff": (
+                "home_pace_seconds_per_play",
+                "away_pace_seconds_per_play",
+            ),
+            "travel_penalty_diff": ("home_travel_penalty", "away_travel_penalty"),
+            "rest_penalty_diff": ("home_rest_penalty", "away_rest_penalty"),
+            "weather_adjustment_diff": (
+                "home_weather_adjustment",
+                "away_weather_adjustment",
+            ),
+            "timezone_diff_diff": (
+                "home_timezone_diff_hours",
+                "away_timezone_diff_hours",
+            ),
+            "points_for_avg_diff": (
+                "home_points_for_avg",
+                "away_points_for_avg",
+            ),
+            "points_against_avg_diff": (
+                "home_points_against_avg",
+                "away_points_against_avg",
+            ),
+            "point_diff_avg_diff": (
+                "home_point_diff_avg",
+                "away_point_diff_avg",
+            ),
+            "win_pct_recent_diff": (
+                "home_win_pct_recent",
+                "away_win_pct_recent",
+            ),
+            "rest_days_diff": ("home_rest_days", "away_rest_days"),
+            "prev_points_for_diff": (
+                "home_prev_points_for",
+                "away_prev_points_for",
+            ),
+            "prev_points_against_diff": (
+                "home_prev_points_against",
+                "away_prev_points_against",
+            ),
+            "prev_point_diff_diff": (
+                "home_prev_point_diff",
+                "away_prev_point_diff",
+            ),
+            "injury_total_diff": ("home_injury_total", "away_injury_total"),
+        }
+
+        for output, (home_col, away_col) in diff_specs.items():
+            _maybe_diff(output, home_col, away_col)
+
+        # Blend market-implied probabilities via logit difference for better calibration.
+        if {
+            "home_implied_prob",
+            "away_implied_prob",
+        }.issubset(working.columns):
+            home_prob = pd.to_numeric(working["home_implied_prob"], errors="coerce")
+            away_prob = pd.to_numeric(working["away_implied_prob"], errors="coerce")
+            with np.errstate(divide="ignore", invalid="ignore"):
+                home_logit = np.log((home_prob + 1e-6) / np.clip(1 - home_prob, 1e-6, None))
+                away_logit = np.log((away_prob + 1e-6) / np.clip(1 - away_prob, 1e-6, None))
+            working["implied_prob_logit_diff"] = home_logit - away_logit
+
+        return working
+
     def _backfill_game_odds(self, games: pd.DataFrame) -> pd.DataFrame:
         if games is None or games.empty:
             return games
@@ -11016,6 +11166,29 @@ class FeatureBuilder:
             "away_prev_point_diff": np.nan,
             "away_rest_days": np.nan,
             "away_injury_total": 0.0,
+            "offense_pass_rating_diff": 0.0,
+            "offense_rush_rating_diff": 0.0,
+            "defense_pass_rating_diff": 0.0,
+            "defense_rush_rating_diff": 0.0,
+            "offense_epa_diff": 0.0,
+            "defense_epa_diff": 0.0,
+            "offense_success_rate_diff": 0.0,
+            "defense_success_rate_diff": 0.0,
+            "pace_seconds_diff": 0.0,
+            "travel_penalty_diff": 0.0,
+            "rest_penalty_diff": 0.0,
+            "weather_adjustment_diff": 0.0,
+            "timezone_diff_diff": 0.0,
+            "points_for_avg_diff": 0.0,
+            "points_against_avg_diff": 0.0,
+            "point_diff_avg_diff": 0.0,
+            "win_pct_recent_diff": 0.0,
+            "rest_days_diff": 0.0,
+            "prev_points_for_diff": 0.0,
+            "prev_points_against_diff": 0.0,
+            "prev_point_diff_diff": 0.0,
+            "injury_total_diff": 0.0,
+            "implied_prob_logit_diff": 0.0,
             "wind_mph": np.nan,
             "humidity": np.nan,
         }
@@ -11180,6 +11353,8 @@ class FeatureBuilder:
                         target_col = f"away_{key}"
                     if target_col in features.columns and pd.isna(features.at[idx, target_col]):
                         features.at[idx, target_col] = value
+
+        features = self._augment_matchup_features(features)
 
         fill_defaults = {col: 0.0 for col in numeric_placeholders.keys()}
         features[list(fill_defaults.keys())] = features[list(fill_defaults.keys())].fillna(fill_defaults)
@@ -14905,6 +15080,7 @@ class ModelTrainer:
             "moneyline_diff",
             "implied_prob_diff",
             "implied_prob_sum",
+            "implied_prob_logit_diff",
             "home_offense_pass_rating",
             "home_offense_rush_rating",
             "home_defense_pass_rating",
@@ -14947,6 +15123,28 @@ class ModelTrainer:
             "away_prev_points_against",
             "away_prev_point_diff",
             "away_rest_days",
+            "offense_pass_rating_diff",
+            "offense_rush_rating_diff",
+            "defense_pass_rating_diff",
+            "defense_rush_rating_diff",
+            "offense_epa_diff",
+            "defense_epa_diff",
+            "offense_success_rate_diff",
+            "defense_success_rate_diff",
+            "pace_seconds_diff",
+            "travel_penalty_diff",
+            "rest_penalty_diff",
+            "weather_adjustment_diff",
+            "timezone_diff_diff",
+            "points_for_avg_diff",
+            "points_against_avg_diff",
+            "point_diff_avg_diff",
+            "win_pct_recent_diff",
+            "rest_days_diff",
+            "prev_points_for_diff",
+            "prev_points_against_diff",
+            "prev_point_diff_diff",
+            "injury_total_diff",
         ]
 
         injury_columns = [
@@ -15473,97 +15671,561 @@ def predict_upcoming_games(
     if "odds_updated" not in games_source.columns:
         games_source["odds_updated"] = pd.NaT
 
-    upcoming_mask = (games_source["status"].isin(["upcoming", "scheduled", "inprogress"])) | games_source["home_score"].isna()
-    upcoming = games_source.loc[upcoming_mask].copy()
-    if upcoming.empty:
-        logging.warning("No upcoming games found for prediction")
-        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
-
-    upcoming["home_team"] = upcoming["home_team"].apply(normalize_team_abbr)
-    upcoming["away_team"] = upcoming["away_team"].apply(normalize_team_abbr)
-    upcoming = upcoming[upcoming["home_team"].notna() & upcoming["away_team"].notna()]
-    if upcoming.empty:
-        logging.warning("Upcoming games are missing team assignments after normalization")
-        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
-
-    upcoming["start_time"] = pd.to_datetime(upcoming["start_time"], utc=True, errors="coerce")
-    upcoming = upcoming[upcoming["start_time"].notna()]
-    if upcoming.empty:
-        logging.warning("Upcoming games are missing valid start times after normalization")
-        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
-
-    eastern = ZoneInfo("America/New_York")
-    upcoming["local_start_time"] = upcoming["start_time"].dt.tz_convert(eastern)
-    upcoming["local_day_of_week"] = upcoming["local_start_time"].dt.day_name()
-    upcoming["day_of_week"] = upcoming["day_of_week"].where(
-        upcoming["day_of_week"].notna(), upcoming["local_day_of_week"]
-    )
-
     now_utc = dt.datetime.now(dt.timezone.utc)
     lookback = now_utc - pd.Timedelta(hours=12)
     lookahead = now_utc + pd.Timedelta(days=7, hours=12)
+    eastern_zone = ZoneInfo("America/New_York")
+    fallback_schedule_cache: Optional[pd.DataFrame] = None
+    fallback_attempted = False
+    future_only_cutoff = now_utc - dt.timedelta(minutes=5)
 
-    upcoming = upcoming[upcoming["start_time"] >= lookback].copy()
-    if upcoming.empty:
-        logging.warning(
-            "Upcoming schedule only contains games more than 12 hours in the past"
+    def _to_utc_timestamp(value: Any) -> pd.Timestamp:
+        """Return a timezone-aware UTC pandas Timestamp."""
+
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")
+        return ts.tz_convert("UTC")
+
+    def _resolve_schedule_start(schedule: Dict[str, Any]) -> Optional[pd.Timestamp]:
+        """Resolve a kickoff time from a MySportsFeeds schedule payload."""
+
+        def _parse_timestamp(value: Any) -> Optional[pd.Timestamp]:
+            if value is None:
+                return None
+            if isinstance(value, float) and np.isnan(value):  # type: ignore[arg-type]
+                return None
+            if isinstance(value, (pd.Timestamp, dt.datetime)):
+                ts = pd.Timestamp(value)
+                return ts.tz_convert(dt.timezone.utc) if ts.tzinfo else ts.tz_localize(dt.timezone.utc)
+            if isinstance(value, dt.date):
+                return pd.Timestamp(value)
+            if isinstance(value, dict):
+                for candidate in (
+                    "utc",
+                    "iso",
+                    "ISO",
+                    "dateTime",
+                    "date_time",
+                    "date",
+                    "full",
+                ):
+                    if candidate in value:
+                        ts = _parse_timestamp(value.get(candidate))
+                        if ts is not None:
+                            return ts
+                for nested_value in value.values():
+                    ts = _parse_timestamp(nested_value)
+                    if ts is not None:
+                        return ts
+                return None
+            try:
+                ts = pd.to_datetime(value, utc=False, errors="coerce")
+            except Exception:
+                return None
+            if pd.isna(ts):
+                return None
+            return ts
+
+        def _parse_time(value: Any) -> Optional[dt.time]:
+            if value is None:
+                return None
+            if isinstance(value, dt.time):
+                return value
+            if isinstance(value, (pd.Timestamp, dt.datetime)):
+                ts = pd.Timestamp(value)
+                ts = ts.tz_convert(eastern_zone) if ts.tzinfo else ts
+                return ts.time()
+            text = str(value).strip()
+            if not text or text.lower() in {"tbd", "tba", "na", "none"}:
+                return None
+            try:
+                parsed = pd.to_datetime(text, errors="coerce")
+            except Exception:
+                return None
+            if pd.isna(parsed):
+                return None
+            return pd.Timestamp(parsed).time()
+
+        primary_fields = (
+            "startTimeUTC",
+            "startTimeUtc",
+            "startTime",
+            "originalStartTime",
+            "startDateTime",
+            "startTimeISO",
+            "startTimeIso",
+            "dateTime",
         )
-        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
-    in_window_mask = (upcoming["start_time"] >= lookback) & (
-        upcoming["start_time"] <= lookahead
-    )
-    window_games = upcoming.loc[in_window_mask].copy()
+        for field in primary_fields:
+            ts = _parse_timestamp(schedule.get(field))
+            if ts is None:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.tz_localize(dt.timezone.utc)
+            else:
+                ts = ts.tz_convert(dt.timezone.utc)
+            return ts
 
-    if window_games.empty:
-        future_games = upcoming[upcoming["start_time"] >= now_utc]
-        use_future_window = not future_games.empty
-        search_frame = future_games if use_future_window else upcoming
-
-        earliest_start = search_frame["start_time"].min()
-        if pd.isna(earliest_start):
-            logging.warning("No upcoming games have a valid kickoff time available")
-            return {"games": pd.DataFrame(), "players": pd.DataFrame()}
-
-        week_start = earliest_start.normalize() - pd.to_timedelta(
-            earliest_start.weekday(), unit="D"
+        date_fields = (
+            "startDate",
+            "originalStartDate",
+            "date",
+            "gameDate",
+            "day",
         )
-        week_end = week_start + pd.Timedelta(days=7)
-        week_mask = (search_frame["start_time"] >= week_start) & (
-            search_frame["start_time"] <= week_end
+        time_fields = (
+            "startTime",
+            "startTimeLocal",
+            "startTimeEastern",
+            "startTimeET",
+            "gameTime",
+            "time",
+            "localStartTime",
         )
-        window_games = search_frame.loc[week_mask].copy()
+
+        for field in date_fields:
+            ts = _parse_timestamp(schedule.get(field))
+            if ts is None:
+                continue
+
+            if ts.tzinfo is None:
+                base_date = ts.date()
+            else:
+                base_date = ts.astimezone(eastern_zone).date()
+
+            kickoff_time: Optional[dt.time] = None
+            for time_field in time_fields:
+                kickoff_time = _parse_time(schedule.get(time_field))
+                if kickoff_time is not None:
+                    break
+
+            if kickoff_time is None:
+                kickoff_time = dt.time(hour=13, minute=0)
+
+            localized = dt.datetime.combine(base_date, kickoff_time, tzinfo=eastern_zone)
+            return pd.Timestamp(localized.astimezone(dt.timezone.utc))
+
+        return None
+
+    def _fetch_msf_schedule(reason: str) -> pd.DataFrame:
+        nonlocal fallback_schedule_cache, fallback_attempted
+
+        if fallback_schedule_cache is not None:
+            return fallback_schedule_cache
+        if fallback_attempted:
+            return pd.DataFrame()
+
+        fallback_attempted = True
+
+        msf_client = getattr(ingestor, "msf_client", None) if ingestor is not None else None
+        if msf_client is None:
+            logging.debug(
+                "Cannot fetch MySportsFeeds schedule fallback (%s): ingestor has no msf_client",
+                reason,
+            )
+            return pd.DataFrame()
+
+        if config is not None and getattr(config, "seasons", None):
+            seasons_to_query = [str(season) for season in config.seasons if season]
+        elif "season" in games_source.columns:
+            seasons_to_query = (
+                pd.Series(games_source["season"])
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+        else:
+            seasons_to_query = []
+
+        seasons_to_query = [season for season in seasons_to_query if season]
+        if not seasons_to_query:
+            seasons_to_query = [f"{now_utc.year}-regular"]
+
+        fallback_rows: List[Dict[str, Any]] = []
+        seen_game_ids: Set[str] = set()
+
+        def _append_msf_game(
+            game: Dict[str, Any], season_key: str
+        ) -> Optional[pd.Timestamp]:
+            schedule = game.get("schedule") or {}
+            game_id = schedule.get("id")
+            if not game_id:
+                return None
+
+            game_id_str = str(game_id)
+            if game_id_str in seen_game_ids:
+                return None
+
+            start_time_ts = _resolve_schedule_start(schedule)
+            if start_time_ts is None:
+                return None
+
+            if start_time_ts.tzinfo is None:
+                start_time_ts = start_time_ts.tz_localize(dt.timezone.utc)
+
+            if start_time_ts < _to_utc_timestamp(future_only_cutoff):
+                return None
+
+            home_info = schedule.get("homeTeam") or {}
+            away_info = schedule.get("awayTeam") or {}
+            home_team = normalize_team_abbr(
+                home_info.get("abbreviation") or home_info.get("name")
+            )
+            away_team = normalize_team_abbr(
+                away_info.get("abbreviation") or away_info.get("name")
+            )
+            if not home_team or not away_team:
+                return None
+
+            week_value = schedule.get("week")
+            try:
+                week_int = int(week_value) if week_value is not None else None
+            except (TypeError, ValueError):
+                week_int = None
+
+            status_raw = schedule.get("status") or schedule.get("playedStatus")
+            status = str(status_raw).lower() if status_raw else "scheduled"
+
+            venue_info = schedule.get("venue")
+            if isinstance(venue_info, dict):
+                venue_value = (
+                    venue_info.get("name")
+                    or venue_info.get("venueName")
+                    or venue_info.get("stadium")
+                    or ""
+                )
+            else:
+                venue_value = venue_info or ""
+
+            referee_info = schedule.get("referee")
+            if isinstance(referee_info, dict):
+                referee_value = referee_info.get("name") or ""
+            else:
+                referee_value = referee_info or ""
+
+            fallback_rows.append(
+                {
+                    "game_id": game_id_str,
+                    "season": str(season_key),
+                    "week": week_int,
+                    "start_time": start_time_ts.to_pydatetime(),
+                    "day_of_week": start_time_ts.tz_convert(eastern_zone).strftime("%A"),
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "status": status,
+                    "venue": venue_value,
+                    "referee": referee_value,
+                    "home_score": np.nan,
+                    "away_score": np.nan,
+                    "odds_updated": pd.NaT,
+                }
+            )
+            seen_game_ids.add(game_id_str)
+            return start_time_ts
+
+        for season_key in seasons_to_query:
+            range_start = (now_utc - dt.timedelta(days=1)).date()
+            range_end = (now_utc + dt.timedelta(days=14)).date()
+            status_candidates: Tuple[Optional[str], ...] = (
+                "scheduled",
+                "upcoming",
+                "unplayed",
+                "pre",
+                None,
+            )
+
+            season_has_future = False
+
+            for status_filter in status_candidates:
+                try:
+                    date_range_games = msf_client.fetch_games_by_date_range(
+                        season_key,
+                        range_start,
+                        range_end,
+                        status=status_filter,
+                    )
+                except Exception:
+                    logging.warning(
+                        "Failed to fetch date-range schedule from MySportsFeeds for %s",
+                        season_key,
+                        exc_info=True,
+                    )
+                    continue
+
+                if not date_range_games:
+                    continue
+
+                logging.debug(
+                    "Loaded %d scheduled games for %s via date-range status '%s'",
+                    len(date_range_games),
+                    season_key,
+                    status_filter or "any",
+                )
+
+                for game in date_range_games:
+                    appended_ts = _append_msf_game(game, season_key)
+                    if appended_ts is not None and appended_ts >= _to_utc_timestamp(now_utc):
+                        season_has_future = True
+
+                if season_has_future:
+                    break
+
+            if not season_has_future:
+                try:
+                    season_games = msf_client.fetch_games(season_key)
+                except Exception:
+                    logging.warning(
+                        "Failed to fetch full season schedule from MySportsFeeds for %s",
+                        season_key,
+                        exc_info=True,
+                    )
+                    continue
+
+                for game in season_games or []:
+                    appended_ts = _append_msf_game(game, season_key)
+                    if appended_ts is not None and appended_ts >= _to_utc_timestamp(now_utc):
+                        season_has_future = True
+
+                if not season_has_future:
+                    logging.debug(
+                        "No future games detected for %s between %s and %s using MySportsFeeds data",
+                        season_key,
+                        range_start,
+                        range_end,
+                    )
+
+        if not fallback_rows:
+            fallback_schedule_cache = pd.DataFrame()
+        else:
+            fallback_schedule_cache = pd.DataFrame(fallback_rows)
+            fallback_schedule_cache = fallback_schedule_cache.drop_duplicates(
+                subset=["game_id"], keep="last"
+            )
+            fallback_schedule_cache["start_time"] = pd.to_datetime(
+                fallback_schedule_cache["start_time"], utc=True, errors="coerce"
+            )
+            fallback_schedule_cache = fallback_schedule_cache[
+                fallback_schedule_cache["start_time"].notna()
+            ]
+
+            future_cutoff = _to_utc_timestamp(future_only_cutoff)
+            fallback_schedule_cache = fallback_schedule_cache[
+                fallback_schedule_cache["start_time"] >= future_cutoff
+            ]
+
+            fallback_schedule_cache["day_of_week"] = fallback_schedule_cache["day_of_week"].where(
+                fallback_schedule_cache["day_of_week"].notna(),
+                fallback_schedule_cache["start_time"].dt.day_name(),
+            )
+
+            if fallback_schedule_cache.empty:
+                logging.warning(
+                    "MySportsFeeds fallback (%s) did not return any games with kickoffs after %s",
+                    reason,
+                    future_cutoff.tz_convert(eastern_zone),
+                )
+            else:
+                logging.info(
+                    "Loaded %d upcoming games from MySportsFeeds fallback (%s)",
+                    len(fallback_schedule_cache),
+                    reason,
+                )
+
+        return fallback_schedule_cache.copy()
+
+    def _prepare_schedule_frame(frame: pd.DataFrame, source_label: str) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+
+        working = frame.copy()
+        if "home_team" in working.columns:
+            working["home_team"] = working["home_team"].apply(normalize_team_abbr)
+        if "away_team" in working.columns:
+            working["away_team"] = working["away_team"].apply(normalize_team_abbr)
+
+        required_cols = {"home_team", "away_team"}
+        if required_cols.issubset(working.columns):
+            working = working[working["home_team"].notna() & working["away_team"].notna()]
+
+        if working.empty:
+            return working
+
+        working["start_time"] = pd.to_datetime(working.get("start_time"), utc=True, errors="coerce")
+        working = working[working["start_time"].notna()]
+        if working.empty:
+            return working
+
+        working["local_start_time"] = working["start_time"].dt.tz_convert(eastern_zone)
+        working["local_day_of_week"] = working["local_start_time"].dt.day_name()
+        if "day_of_week" in working.columns:
+            working["day_of_week"] = working["day_of_week"].where(
+                working["day_of_week"].notna(), working["local_day_of_week"]
+            )
+        else:
+            working["day_of_week"] = working["local_day_of_week"]
+
+        if "season" in working.columns:
+            working["season"] = working["season"].astype(str)
+
+        text_normalize_columns = {"venue", "referee", "stadium", "venue_name"}
+        for text_col in text_normalize_columns:
+            if text_col in working.columns:
+                series = working[text_col]
+                series = series.where(series.notna(), "")
+                working[text_col] = series.astype(str).str.strip()
+
+        if "venue" not in working.columns and "venue_name" in working.columns:
+            working["venue"] = working["venue_name"]
+
+        status_series = working.get("status")
+        if status_series is not None:
+            working["status"] = status_series.fillna("scheduled").astype(str).str.lower()
+        else:
+            working["status"] = "scheduled"
+
+        if "odds_updated" not in working.columns:
+            working["odds_updated"] = pd.NaT
+
+        working["_schedule_source"] = source_label
+
+        return working
+
+    def _select_upcoming(frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+
+        status_whitelist = {
+            "upcoming",
+            "scheduled",
+            "inprogress",
+            "pre",
+            "pregame",
+            "pre-game",
+            "tbd",
+            "unplayed",
+        }
+
+        schedule = frame[
+            frame["status"].isin(status_whitelist)
+            | frame["home_score"].isna()
+            | frame["away_score"].isna()
+        ].copy()
+        if schedule.empty:
+            logging.warning("No upcoming games found for prediction")
+            return pd.DataFrame()
+
+        schedule = schedule.sort_values("start_time").reset_index(drop=True)
+
+        future_mask = schedule["start_time"] >= now_utc
+        upcoming = schedule.loc[future_mask].copy()
+        if upcoming.empty:
+            upcoming = schedule[schedule["start_time"] >= lookback].copy()
+
+        if upcoming.empty:
+            logging.warning(
+                "Upcoming schedule only contains games more than 12 hours in the past"
+            )
+            return pd.DataFrame()
+
+        window_mask = upcoming["start_time"] <= lookahead
+        window_games = upcoming.loc[window_mask].copy()
+
         if window_games.empty:
-            logging.warning("No upcoming games within the fallback week window")
-            return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+            earliest_start = upcoming["start_time"].min()
+            if pd.isna(earliest_start):
+                logging.warning("No upcoming games have a valid kickoff time available")
+                return pd.DataFrame()
 
-        logging.info(
-            "Falling back to %s scheduled week %s-%s with %d games",
-            "future" if use_future_window else "earliest",
-            week_start.date(),
-            week_end.date(),
-            len(window_games),
+            week_start = earliest_start.normalize() - pd.to_timedelta(
+                earliest_start.weekday(), unit="D"
+            )
+            week_end = week_start + pd.Timedelta(days=7)
+            week_mask = (upcoming["start_time"] >= week_start) & (
+                upcoming["start_time"] <= week_end
+            )
+            window_games = upcoming.loc[week_mask].copy()
+            if window_games.empty:
+                logging.warning("No upcoming games within the fallback week window")
+                return pd.DataFrame()
+
+            logging.info(
+                "Falling back to future scheduled week %s-%s with %d games",
+                week_start.date(),
+                week_end.date(),
+                len(window_games),
+            )
+
+        selection = window_games.copy()
+
+        desired_days = {"Thursday", "Saturday", "Sunday", "Monday"}
+        day_mask = selection["local_day_of_week"].isin(desired_days)
+        if day_mask.any():
+            selection = selection.loc[day_mask].copy()
+        else:
+            logging.warning(
+                "No Thursday/Saturday/Sunday/Monday games available for prediction; using full schedule window"
+            )
+
+        selection.loc[:, "_priority"] = selection["_schedule_source"].map(
+            {"MySportsFeeds schedule": 0, "database schedule": 1}
+        ).fillna(1)
+        selection = selection.sort_values(
+            ["_priority", "odds_updated", "start_time"], ascending=[True, False, True]
         )
+        selection = selection.drop_duplicates(
+            subset=["home_team", "away_team", "start_time"], keep="first"
+        )
+        selection = selection.drop(columns="_priority", errors="ignore")
 
-    upcoming = window_games.copy()
+        selection = selection.sort_values("start_time").reset_index(drop=True)
 
-    desired_days = {"Thursday", "Sunday", "Monday"}
-    upcoming = upcoming[upcoming["local_day_of_week"].isin(desired_days)]
-    if upcoming.empty:
-        logging.warning("No Thursday/Sunday/Monday games available for prediction")
+        for text_col in ("venue", "referee"):
+            if text_col in selection.columns:
+                series = selection[text_col]
+                series = series.where(series.notna(), "")
+                selection[text_col] = series.astype(str).str.strip()
+
+        return selection
+
+    normalized_games = _prepare_schedule_frame(games_source, "database schedule")
+
+    fallback_frame = _fetch_msf_schedule("primary upcoming schedule refresh")
+    fallback_normalized = pd.DataFrame()
+    schedule_frames: List[pd.DataFrame] = []
+
+    if not fallback_frame.empty:
+        fallback_normalized = _prepare_schedule_frame(
+            fallback_frame, "MySportsFeeds schedule"
+        )
+        if not fallback_normalized.empty:
+            schedule_frames.append(fallback_normalized)
+
+    if not normalized_games.empty:
+        schedule_frames.append(normalized_games)
+
+    combined_schedule = safe_concat(schedule_frames)
+
+    if combined_schedule.empty:
+        logging.warning("No upcoming schedule data available from MySportsFeeds or database")
         return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
-    upcoming.loc[:, "_priority"] = upcoming["game_id"].apply(
-        lambda value: 0 if isinstance(value, str) and value.isdigit() else 1
-    )
-    upcoming = upcoming.sort_values(
-        ["_priority", "odds_updated", "start_time"], ascending=[True, False, True]
-    )
-    upcoming = upcoming.drop_duplicates(
-        subset=["home_team", "away_team", "start_time"], keep="first"
-    )
-    upcoming = upcoming.drop(columns="_priority", errors="ignore")
+    upcoming = pd.DataFrame()
+    if not fallback_normalized.empty:
+        upcoming = _select_upcoming(fallback_normalized)
+        if upcoming.empty:
+            logging.warning(
+                "MySportsFeeds schedule did not yield upcoming games after filtering; "
+                "falling back to combined schedule"
+            )
 
-    upcoming = upcoming.sort_values("start_time").reset_index(drop=True)
+    if upcoming.empty:
+        upcoming = _select_upcoming(combined_schedule)
+
+    if upcoming.empty:
+        logging.warning("No upcoming games found for prediction")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
     def _ensure_model_features(frame: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
         columns: Optional[Iterable[str]] = getattr(model, "feature_columns", None)
