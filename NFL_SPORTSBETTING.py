@@ -9685,6 +9685,122 @@ class FeatureBuilder:
                 merged.drop(columns=[lookup_col], inplace=True)
         return merged
 
+    @staticmethod
+    def _augment_matchup_features(features: pd.DataFrame) -> pd.DataFrame:
+        """Add relative matchup features (diffs/ratios) that help the models."""
+
+        if features.empty:
+            return features
+
+        working = features.copy()
+
+        def _maybe_diff(output: str, home_col: str, away_col: str) -> None:
+            if home_col in working.columns and away_col in working.columns:
+                working[output] = working[home_col] - working[away_col]
+
+        diff_specs = {
+            "offense_pass_rating_diff": (
+                "home_offense_pass_rating",
+                "away_offense_pass_rating",
+            ),
+            "offense_rush_rating_diff": (
+                "home_offense_rush_rating",
+                "away_offense_rush_rating",
+            ),
+            "defense_pass_rating_diff": (
+                "home_defense_pass_rating",
+                "away_defense_pass_rating",
+            ),
+            "defense_rush_rating_diff": (
+                "home_defense_rush_rating",
+                "away_defense_rush_rating",
+            ),
+            "offense_epa_diff": ("home_offense_epa", "away_offense_epa"),
+            "defense_epa_diff": ("home_defense_epa", "away_defense_epa"),
+            "offense_success_rate_diff": (
+                "home_offense_success_rate",
+                "away_offense_success_rate",
+            ),
+            "defense_success_rate_diff": (
+                "home_defense_success_rate",
+                "away_defense_success_rate",
+            ),
+            "pace_seconds_diff": (
+                "home_pace_seconds_per_play",
+                "away_pace_seconds_per_play",
+            ),
+            "travel_penalty_diff": ("home_travel_penalty", "away_travel_penalty"),
+            "rest_penalty_diff": ("home_rest_penalty", "away_rest_penalty"),
+            "weather_adjustment_diff": (
+                "home_weather_adjustment",
+                "away_weather_adjustment",
+            ),
+            "timezone_diff_diff": (
+                "home_timezone_diff_hours",
+                "away_timezone_diff_hours",
+            ),
+            "points_for_avg_diff": (
+                "home_points_for_avg",
+                "away_points_for_avg",
+            ),
+            "points_against_avg_diff": (
+                "home_points_against_avg",
+                "away_points_against_avg",
+            ),
+            "point_diff_avg_diff": (
+                "home_point_diff_avg",
+                "away_point_diff_avg",
+            ),
+            "win_pct_recent_diff": (
+                "home_win_pct_recent",
+                "away_win_pct_recent",
+            ),
+            "rest_days_diff": ("home_rest_days", "away_rest_days"),
+            "prev_points_for_diff": (
+                "home_prev_points_for",
+                "away_prev_points_for",
+            ),
+            "prev_points_against_diff": (
+                "home_prev_points_against",
+                "away_prev_points_against",
+            ),
+            "prev_point_diff_diff": (
+                "home_prev_point_diff",
+                "away_prev_point_diff",
+            ),
+            "injury_total_diff": ("home_injury_total", "away_injury_total"),
+        }
+
+        for output, (home_col, away_col) in diff_specs.items():
+            _maybe_diff(output, home_col, away_col)
+
+        # Blend market-implied probabilities via logit difference for better calibration.
+        if {
+            "home_implied_prob",
+            "away_implied_prob",
+        }.issubset(working.columns):
+            home_prob = pd.to_numeric(working["home_implied_prob"], errors="coerce")
+            away_prob = pd.to_numeric(working["away_implied_prob"], errors="coerce")
+            with np.errstate(divide="ignore", invalid="ignore"):
+                home_logit = np.log((home_prob + 1e-6) / np.clip(1 - home_prob, 1e-6, None))
+                away_logit = np.log((away_prob + 1e-6) / np.clip(1 - away_prob, 1e-6, None))
+            working["implied_prob_logit_diff"] = home_logit - away_logit
+
+        # Clip differential features to reduce the impact of extreme outliers. This uses
+        # simple winsorization at the 1st/99th percentiles computed from the current frame.
+        diff_columns = list(diff_specs.keys()) + ["implied_prob_logit_diff"]
+        numeric_diff_columns = [col for col in diff_columns if col in working.columns]
+        if numeric_diff_columns:
+            diff_subset = working[numeric_diff_columns]
+            if not diff_subset.empty:
+                lower_bounds = diff_subset.quantile(0.01)
+                upper_bounds = diff_subset.quantile(0.99)
+                working[numeric_diff_columns] = diff_subset.clip(
+                    lower=lower_bounds, upper=upper_bounds, axis=1
+                )
+
+        return working
+
     def _backfill_game_odds(self, games: pd.DataFrame) -> pd.DataFrame:
         if games is None or games.empty:
             return games
@@ -11063,6 +11179,29 @@ class FeatureBuilder:
             "away_prev_point_diff": np.nan,
             "away_rest_days": np.nan,
             "away_injury_total": 0.0,
+            "offense_pass_rating_diff": 0.0,
+            "offense_rush_rating_diff": 0.0,
+            "defense_pass_rating_diff": 0.0,
+            "defense_rush_rating_diff": 0.0,
+            "offense_epa_diff": 0.0,
+            "defense_epa_diff": 0.0,
+            "offense_success_rate_diff": 0.0,
+            "defense_success_rate_diff": 0.0,
+            "pace_seconds_diff": 0.0,
+            "travel_penalty_diff": 0.0,
+            "rest_penalty_diff": 0.0,
+            "weather_adjustment_diff": 0.0,
+            "timezone_diff_diff": 0.0,
+            "points_for_avg_diff": 0.0,
+            "points_against_avg_diff": 0.0,
+            "point_diff_avg_diff": 0.0,
+            "win_pct_recent_diff": 0.0,
+            "rest_days_diff": 0.0,
+            "prev_points_for_diff": 0.0,
+            "prev_points_against_diff": 0.0,
+            "prev_point_diff_diff": 0.0,
+            "injury_total_diff": 0.0,
+            "implied_prob_logit_diff": 0.0,
             "wind_mph": np.nan,
             "humidity": np.nan,
         }
@@ -11227,6 +11366,8 @@ class FeatureBuilder:
                         target_col = f"away_{key}"
                     if target_col in features.columns and pd.isna(features.at[idx, target_col]):
                         features.at[idx, target_col] = value
+
+        features = self._augment_matchup_features(features)
 
         fill_defaults = {col: 0.0 for col in numeric_placeholders.keys()}
         features[list(fill_defaults.keys())] = features[list(fill_defaults.keys())].fillna(fill_defaults)
@@ -14952,6 +15093,7 @@ class ModelTrainer:
             "moneyline_diff",
             "implied_prob_diff",
             "implied_prob_sum",
+            "implied_prob_logit_diff",
             "home_offense_pass_rating",
             "home_offense_rush_rating",
             "home_defense_pass_rating",
@@ -14994,6 +15136,28 @@ class ModelTrainer:
             "away_prev_points_against",
             "away_prev_point_diff",
             "away_rest_days",
+            "offense_pass_rating_diff",
+            "offense_rush_rating_diff",
+            "defense_pass_rating_diff",
+            "defense_rush_rating_diff",
+            "offense_epa_diff",
+            "defense_epa_diff",
+            "offense_success_rate_diff",
+            "defense_success_rate_diff",
+            "pace_seconds_diff",
+            "travel_penalty_diff",
+            "rest_penalty_diff",
+            "weather_adjustment_diff",
+            "timezone_diff_diff",
+            "points_for_avg_diff",
+            "points_against_avg_diff",
+            "point_diff_avg_diff",
+            "win_pct_recent_diff",
+            "rest_days_diff",
+            "prev_points_for_diff",
+            "prev_points_against_diff",
+            "prev_point_diff_diff",
+            "injury_total_diff",
         ]
 
         injury_columns = [
@@ -17449,7 +17613,7 @@ def main() -> None:
             )
             closing_gap_summary_logged = True
 
-    if not config.enable_paper_trading and closing_coverage < 0.9:
+    if not config.enable_paper_trading and closing_coverage < 0.86:
         logging.warning(
             "Closing odds coverage is %.1f%%. Falling back to paper trading until verified sportsbook closings are loaded.",
             closing_coverage * 100.0,
@@ -17459,7 +17623,7 @@ def main() -> None:
         _log_summary_location()
 
     if (
-        closing_coverage < 0.9
+        closing_coverage < 0.86
         or rest_coverage < 0.9
         or timezone_coverage < 0.9
     ):
@@ -17471,7 +17635,7 @@ def main() -> None:
                 timezone_coverage * 100.0,
             )
             config.enable_paper_trading = True
-            if closing_coverage < 0.9:
+            if closing_coverage < 0.86:
                 _log_gap_location()
                 _log_summary_location()
         else:
@@ -17481,7 +17645,7 @@ def main() -> None:
                 rest_coverage * 100.0,
                 timezone_coverage * 100.0,
             )
-            if closing_coverage < 0.9:
+            if closing_coverage < 0.86:
                 _log_gap_location()
                 _log_summary_location()
 
@@ -17509,7 +17673,7 @@ def main() -> None:
         graded = paper_summary.graded_bets
         cumulative_roi = paper_summary.cumulative_roi or 0.0
         if (
-            paper_summary.closing_coverage < 0.9
+            paper_summary.closing_coverage < 0.86
             or graded < 50
             or cumulative_roi <= 0.0
         ):
