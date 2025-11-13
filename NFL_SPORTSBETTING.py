@@ -11686,9 +11686,13 @@ class FeatureBuilder:
             "wind_mph": np.nan,
             "humidity": np.nan,
         }
-        for col, default in numeric_placeholders.items():
-            if col not in features.columns:
-                features[col] = default
+        missing_numeric_cols = {
+            col: default
+            for col, default in numeric_placeholders.items()
+            if col not in features.columns
+        }
+        if missing_numeric_cols:
+            features = features.assign(**missing_numeric_cols)
 
         loader = getattr(self, "supplemental_loader", None)
         travel_context = None
@@ -11915,11 +11919,18 @@ class FeatureBuilder:
         features = self._augment_matchup_features(features)
 
         fill_defaults = {col: 0.0 for col in numeric_placeholders.keys()}
-        features[list(fill_defaults.keys())] = features[list(fill_defaults.keys())].fillna(fill_defaults)
+        features[list(fill_defaults.keys())] = features[list(fill_defaults.keys())].fillna(
+            fill_defaults
+        )
 
-        features["moneyline_diff"] = features["home_moneyline"] - features["away_moneyline"]
-        features["implied_prob_diff"] = features["home_implied_prob"] - features["away_implied_prob"]
-        features["implied_prob_sum"] = features["home_implied_prob"] + features["away_implied_prob"]
+        derived_numeric_cols = {
+            "moneyline_diff": features["home_moneyline"] - features["away_moneyline"],
+            "implied_prob_diff": features["home_implied_prob"]
+            - features["away_implied_prob"],
+            "implied_prob_sum": features["home_implied_prob"]
+            + features["away_implied_prob"],
+        }
+        features = features.assign(**derived_numeric_cols)
 
         return features
 
