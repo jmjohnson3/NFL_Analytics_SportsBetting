@@ -4556,8 +4556,12 @@ def build_lineups_df(msf_json: Dict[str, Any]) -> pd.DataFrame:
 API_PREFIX_NFL = "https://api.mysportsfeeds.com/v2.1/pull/nfl"
 NFL_SEASONS = ["2025-regular", "2024-regular"]
 
-NFL_API_USER = "4359aa1b-cc29-4647-a3e5-7314e2"
-NFL_API_PASS = "MYSPORTSFEEDS"
+DEFAULT_NFL_API_USER = "4359aa1b-cc29-4647-a3e5-7314e2"
+DEFAULT_NFL_API_PASS = "MYSPORTSFEEDS"
+DEFAULT_NFL_API_TIMEOUT = 45
+DEFAULT_NFL_API_TIMEOUT_RETRIES = 2
+DEFAULT_NFL_API_HTTP_RETRIES = 3
+DEFAULT_NFL_API_TIMEOUT_BACKOFF = 1.5
 
 ODDS_API_KEY = "5b6f0290e265c3329b3ed27897d79eaf"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
@@ -6594,6 +6598,14 @@ class NFLConfig:
     weather_forecast_path: Optional[str] = os.getenv("NFL_FORECAST_PATH")
     closing_odds_history_path: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PATH") or DEFAULT_CLOSING_ODDS_PATH
     rest_travel_context_path: Optional[str] = os.getenv("NFL_TRAVEL_CONTEXT_PATH") or DEFAULT_TRAVEL_CONTEXT_PATH
+    msf_user: str = os.getenv("NFL_API_USER", DEFAULT_NFL_API_USER)
+    msf_password: str = os.getenv("NFL_API_PASS", DEFAULT_NFL_API_PASS)
+    msf_timeout_seconds: int = int(os.getenv("NFL_API_TIMEOUT", str(DEFAULT_NFL_API_TIMEOUT)))
+    msf_timeout_retries: int = int(os.getenv("NFL_API_TIMEOUT_RETRIES", str(DEFAULT_NFL_API_TIMEOUT_RETRIES)))
+    msf_timeout_backoff: float = float(
+        os.getenv("NFL_API_TIMEOUT_BACKOFF", str(DEFAULT_NFL_API_TIMEOUT_BACKOFF))
+    )
+    msf_http_retries: int = int(os.getenv("NFL_API_HTTP_RETRIES", str(DEFAULT_NFL_API_HTTP_RETRIES)))
     respect_lineups: bool = True
     odds_allow_insecure_ssl: bool = env_flag("ODDS_ALLOW_INSECURE_SSL", False)
     odds_ssl_cert_path: Optional[str] = os.getenv("NFL_ODDS_SSL_CERT")
@@ -7189,32 +7201,85 @@ class NFLDatabase:
 
 
 class MySportsFeedsClient:
-    def __init__(self, user: str, password: str, timeout: int = 30):
+    def __init__(
+        self,
+        user: str,
+        password: str,
+        *,
+        timeout: int = 30,
+        timeout_retries: int = 0,
+        timeout_backoff: float = 1.0,
+        http_retries: int = 3,
+    ):
         self.user = user
         self.password = password
         self.auth = (user, password)
         self.timeout = timeout
+        self.timeout_retries = max(0, timeout_retries)
+        self.timeout_backoff = max(0.0, timeout_backoff)
+        self.session = requests.Session()
+        retry = Retry(
+            total=max(0, http_retries),
+            read=max(0, http_retries),
+            connect=max(0, http_retries),
+            status=max(0, http_retries),
+            allowed_methods=("GET",),
+            status_forcelist=(429, 500, 502, 503, 504),
+            backoff_factor=self.timeout_backoff,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def _request(self, endpoint: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{API_PREFIX_NFL}/{endpoint}"
         logging.debug("Requesting MySportsFeeds endpoint %s", url)
-        try:
-            resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
-        except ReadTimeout:
-            logging.warning(
-                "MySportsFeeds request to %s timed out after %ss; returning empty payload",
-                url,
-                self.timeout,
-            )
+        response = None
+        for attempt in range(self.timeout_retries + 1):
+            try:
+                response = self.session.get(
+                    url,
+                    params=params,
+                    auth=self.auth,
+                    timeout=self.timeout,
+                )
+                break
+            except ReadTimeout:
+                if attempt >= self.timeout_retries:
+                    logging.warning(
+                        "MySportsFeeds request to %s timed out after %ss; returning empty payload",
+                        url,
+                        self.timeout,
+                    )
+                    return {}
+                sleep_for = self.timeout_backoff * (2 ** attempt)
+                logging.warning(
+                    "MySportsFeeds request to %s timed out after %ss (attempt %d/%d); retrying in %.1fs",
+                    url,
+                    self.timeout,
+                    attempt + 1,
+                    self.timeout_retries + 1,
+                    sleep_for,
+                )
+                time.sleep(sleep_for)
+            except RequestsConnectionError as exc:
+                logging.warning("MySportsFeeds request to %s failed: %s", url, exc)
+                return {}
+        if response is None:
             return {}
-        except RequestsConnectionError as exc:
-            logging.warning("MySportsFeeds request to %s failed: %s", url, exc)
-            return {}
-        resp.raise_for_status()
         try:
-            return resp.json()
+            response.raise_for_status()
+        except HTTPError:
+            if response.status_code == HTTPStatus.UNAUTHORIZED:
+                logging.error(
+                    "MySportsFeeds rejected the provided credentials. Set NFL_API_USER/NFL_API_PASS or update config."
+                )
+            raise
+        try:
+            return response.json()
         except RequestsJSONDecodeError:
-            content = resp.text.strip()
+            content = response.text.strip()
             if not content:
                 logging.debug(
                     "Empty response body for MySportsFeeds endpoint %s; returning empty payload",
@@ -7224,7 +7289,7 @@ class MySportsFeedsClient:
             logging.warning(
                 "Failed to decode JSON from MySportsFeeds endpoint %s (content-type=%s)",
                 url,
-                resp.headers.get("Content-Type"),
+                response.headers.get("Content-Type"),
             )
             raise
 
@@ -18030,7 +18095,14 @@ def main() -> None:
     except Exception:
         logging.exception("Automated closing odds synchronization failed")
 
-    msf_client = MySportsFeedsClient(NFL_API_USER, NFL_API_PASS)
+    msf_client = MySportsFeedsClient(
+        config.msf_user,
+        config.msf_password,
+        timeout=config.msf_timeout_seconds,
+        timeout_retries=config.msf_timeout_retries,
+        timeout_backoff=config.msf_timeout_backoff,
+        http_retries=config.msf_http_retries,
+    )
     odds_client = OddsApiClient(
         ODDS_API_KEY,
         allow_insecure_ssl=config.odds_allow_insecure_ssl,
