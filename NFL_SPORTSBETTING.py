@@ -6720,6 +6720,28 @@ class NFLDatabase:
                 "ALTER TABLE nfl_injury_reports ADD COLUMN IF NOT EXISTS position TEXT"
             )
 
+        if "nfl_team_advanced_metrics" in table_names:
+            try:
+                advanced_columns = {
+                    col["name"] for col in inspector.get_columns("nfl_team_advanced_metrics")
+                }
+            except Exception:
+                advanced_columns = set()
+            advanced_column_defs = {
+                "offense_yards_per_play": "DOUBLE PRECISION",
+                "defense_yards_per_play": "DOUBLE PRECISION",
+                "offense_td_rate": "DOUBLE PRECISION",
+                "defense_td_rate": "DOUBLE PRECISION",
+                "pass_rate": "DOUBLE PRECISION",
+                "rush_rate": "DOUBLE PRECISION",
+                "pass_rate_over_expectation": "DOUBLE PRECISION",
+            }
+            for column_name, column_type in advanced_column_defs.items():
+                if column_name not in advanced_columns:
+                    statements.append(
+                        f"ALTER TABLE nfl_team_advanced_metrics ADD COLUMN IF NOT EXISTS {column_name} {column_type}"
+                    )
+
         if not statements:
             return
 
@@ -6861,6 +6883,13 @@ class NFLDatabase:
             Column("defense_epa", Float),
             Column("offense_success_rate", Float),
             Column("defense_success_rate", Float),
+            Column("offense_yards_per_play", Float),
+            Column("defense_yards_per_play", Float),
+            Column("offense_td_rate", Float),
+            Column("defense_td_rate", Float),
+            Column("pass_rate", Float),
+            Column("rush_rate", Float),
+            Column("pass_rate_over_expectation", Float),
             Column("travel_penalty", Float),
             Column("rest_penalty", Float),
             Column("weather_adjustment", Float),
@@ -7083,6 +7112,22 @@ class NFLDatabase:
         with self.engine.begin() as conn:
             rows = conn.execute(select(self.player_stats.c.game_id).distinct()).fetchall()
         return {row[0] for row in rows}
+
+    def fetch_existing_advanced_metric_keys(self) -> Set[Tuple[str, int, str]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(
+                    self.team_advanced_metrics.c.season,
+                    self.team_advanced_metrics.c.week,
+                    self.team_advanced_metrics.c.team,
+                )
+            ).fetchall()
+        keys: Set[Tuple[str, int, str]] = set()
+        for season, week, team in rows:
+            if team is None or week is None:
+                continue
+            keys.add((str(season), int(week), normalize_team_abbr(team)))
+        return keys
 
     def latest_team_rating_week(self, season: str) -> Optional[int]:
         with self.engine.begin() as conn:
@@ -8014,6 +8059,23 @@ class NFLIngestor:
                         "defense_success_rate": self._safe_float(
                             advanced_payload.get("defense_success_rate")
                         ),
+                        "offense_yards_per_play": self._safe_float(
+                            advanced_payload.get("offense_yards_per_play")
+                        ),
+                        "defense_yards_per_play": self._safe_float(
+                            advanced_payload.get("defense_yards_per_play")
+                        ),
+                        "offense_td_rate": self._safe_float(
+                            advanced_payload.get("offense_td_rate")
+                        ),
+                        "defense_td_rate": self._safe_float(
+                            advanced_payload.get("defense_td_rate")
+                        ),
+                        "pass_rate": self._safe_float(advanced_payload.get("pass_rate")),
+                        "rush_rate": self._safe_float(advanced_payload.get("rush_rate")),
+                        "pass_rate_over_expectation": self._safe_float(
+                            advanced_payload.get("pass_rate_over_expectation")
+                        ),
                         "travel_penalty": self._safe_float(advanced_payload.get("travel_penalty")),
                         "rest_penalty": self._safe_float(advanced_payload.get("rest_penalty")),
                         "weather_adjustment": self._safe_float(
@@ -8163,11 +8225,26 @@ class NFLIngestor:
 
         if injury_rows_all:
             self.db.upsert_rows(self.db.injury_reports, injury_rows_all, ["injury_id"])
-        if advanced_rows_map:
+        supplemental_rows = list(advanced_rows_map.values())
+        if supplemental_rows:
             self.db.upsert_rows(
                 self.db.team_advanced_metrics,
-                list(advanced_rows_map.values()),
-                ["metric_id"],
+                supplemental_rows,
+                ["season", "week", "team"],
+            )
+
+        skip_keys: Set[Tuple[str, int, str]] = set(
+            (row.get("season"), int(row.get("week") or 0), row.get("team"))
+            for row in supplemental_rows
+            if row.get("team")
+        )
+        skip_keys.update(self.db.fetch_existing_advanced_metric_keys())
+        derived_rows = self._derive_advanced_metrics_from_player_stats(skip_keys)
+        if derived_rows:
+            self.db.upsert_rows(
+                self.db.team_advanced_metrics,
+                derived_rows,
+                ["season", "week", "team"],
             )
 
         # Ingest odds separately as they change frequently (always upsert)
@@ -8778,6 +8855,115 @@ class NFLIngestor:
                     "player_id",
                 ],
             )
+
+    def _derive_advanced_metrics_from_player_stats(
+        self, skip_keys: Set[Tuple[str, int, str]]
+    ) -> List[Dict[str, Any]]:
+        try:
+            player_stats = pd.read_sql_table("nfl_player_stats", self.db.engine)
+        except Exception:
+            logging.exception(
+                "Failed to load player stats for derived advanced metric generation"
+            )
+            return []
+
+        if player_stats.empty:
+            return []
+
+        try:
+            games = pd.read_sql_table(
+                "nfl_games",
+                self.db.engine,
+                columns=["game_id", "season", "week", "home_team", "away_team"],
+            )
+        except Exception:
+            logging.exception(
+                "Failed to load games metadata for derived advanced metric generation"
+            )
+            return []
+
+        if games.empty or "game_id" not in games.columns:
+            return []
+
+        enrichment_cols = [
+            "rushing_attempts",
+            "rushing_yards",
+            "rushing_tds",
+            "receiving_targets",
+            "receiving_yards",
+            "receiving_tds",
+            "passing_attempts",
+            "passing_yards",
+            "passing_tds",
+        ]
+        for col in enrichment_cols:
+            if col not in player_stats.columns:
+                player_stats[col] = 0.0
+
+        merged = player_stats.merge(games, on="game_id", how="left")
+        merged = merged.dropna(subset=["season", "week", "team"])
+        if merged.empty:
+            return []
+
+        merged["season"] = merged["season"].astype(str)
+        merged["week"] = merged["week"].apply(lambda x: int(x) if pd.notna(x) else None)
+        merged = merged.dropna(subset=["week"])
+        if merged.empty:
+            return []
+
+        for col in ("team", "home_team", "away_team"):
+            if col in merged.columns:
+                merged[col] = merged[col].apply(normalize_team_abbr)
+
+        derived = FeatureBuilder._compute_team_unit_strength(merged, None)
+        if derived is None or derived.empty:
+            return []
+
+        derived = derived.replace({np.nan: None})
+        metrics_columns = [
+            "pace_seconds_per_play",
+            "offense_epa",
+            "defense_epa",
+            "offense_success_rate",
+            "defense_success_rate",
+            "offense_yards_per_play",
+            "defense_yards_per_play",
+            "offense_td_rate",
+            "defense_td_rate",
+            "pass_rate",
+            "rush_rate",
+            "pass_rate_over_expectation",
+            "travel_penalty",
+            "rest_penalty",
+            "weather_adjustment",
+        ]
+
+        rows: List[Dict[str, Any]] = []
+        for _, metric_row in derived.iterrows():
+            season = str(metric_row.get("season"))
+            week_val = metric_row.get("week")
+            team = normalize_team_abbr(metric_row.get("team"))
+            if not team:
+                continue
+            if week_val is None or pd.isna(week_val):
+                continue
+            week_int = int(week_val)
+            key = (season, week_int, team)
+            if key in skip_keys:
+                continue
+            row: Dict[str, Any] = {
+                "metric_id": f"derived_{season}_{week_int}_{team}",
+                "season": season,
+                "week": week_int,
+                "team": team,
+            }
+            for col in metrics_columns:
+                row[col] = self._safe_float(metric_row.get(col))
+            rows.append(row)
+
+        if rows:
+            logging.info("Derived %d advanced metric rows from player stats", len(rows))
+        return rows
 
     def _group_msf_injuries(
         self,
@@ -9725,6 +9911,28 @@ class FeatureBuilder:
                 "home_defense_success_rate",
                 "away_defense_success_rate",
             ),
+            "offense_yards_per_play_diff": (
+                "home_offense_yards_per_play",
+                "away_offense_yards_per_play",
+            ),
+            "defense_yards_per_play_diff": (
+                "home_defense_yards_per_play",
+                "away_defense_yards_per_play",
+            ),
+            "offense_td_rate_diff": (
+                "home_offense_td_rate",
+                "away_offense_td_rate",
+            ),
+            "defense_td_rate_diff": (
+                "home_defense_td_rate",
+                "away_defense_td_rate",
+            ),
+            "pass_rate_diff": ("home_pass_rate", "away_pass_rate"),
+            "rush_rate_diff": ("home_rush_rate", "away_rush_rate"),
+            "pass_rate_over_expectation_diff": (
+                "home_pass_rate_over_expectation",
+                "away_pass_rate_over_expectation",
+            ),
             "pace_seconds_diff": (
                 "home_pace_seconds_per_play",
                 "away_pace_seconds_per_play",
@@ -9768,11 +9976,80 @@ class FeatureBuilder:
                 "home_prev_point_diff",
                 "away_prev_point_diff",
             ),
+            "elo_pre_diff": ("home_elo_pre", "away_elo_pre"),
+            "elo_win_prob_diff": ("home_elo_win_prob", "away_elo_win_prob"),
+            "elo_vs_opponent_diff": (
+                "home_elo_vs_opponent",
+                "away_elo_vs_opponent",
+            ),
+            "elo_edge_diff": ("home_elo_edge", "away_elo_edge"),
             "injury_total_diff": ("home_injury_total", "away_injury_total"),
         }
 
         for output, (home_col, away_col) in diff_specs.items():
             _maybe_diff(output, home_col, away_col)
+
+        def _maybe_net(output: str, offense_col: str, defense_col: str) -> None:
+            if offense_col in working.columns and defense_col in working.columns:
+                working[output] = working[offense_col] - working[defense_col]
+
+        net_specs = [
+            ("home_net_epa", "home_offense_epa", "away_defense_epa"),
+            ("away_net_epa", "away_offense_epa", "home_defense_epa"),
+            (
+                "home_net_success_rate",
+                "home_offense_success_rate",
+                "away_defense_success_rate",
+            ),
+            (
+                "away_net_success_rate",
+                "away_offense_success_rate",
+                "home_defense_success_rate",
+            ),
+            (
+                "home_net_yards_per_play",
+                "home_offense_yards_per_play",
+                "away_defense_yards_per_play",
+            ),
+            (
+                "away_net_yards_per_play",
+                "away_offense_yards_per_play",
+                "home_defense_yards_per_play",
+            ),
+            (
+                "home_net_td_rate",
+                "home_offense_td_rate",
+                "away_defense_td_rate",
+            ),
+            (
+                "away_net_td_rate",
+                "away_offense_td_rate",
+                "home_defense_td_rate",
+            ),
+            (
+                "home_pass_matchup",
+                "home_offense_pass_rating",
+                "away_defense_pass_rating",
+            ),
+            (
+                "away_pass_matchup",
+                "away_offense_pass_rating",
+                "home_defense_pass_rating",
+            ),
+            (
+                "home_rush_matchup",
+                "home_offense_rush_rating",
+                "away_defense_rush_rating",
+            ),
+            (
+                "away_rush_matchup",
+                "away_offense_rush_rating",
+                "home_defense_rush_rating",
+            ),
+        ]
+
+        for output, offense_col, defense_col in net_specs:
+            _maybe_net(output, offense_col, defense_col)
 
         # Blend market-implied probabilities via logit difference for better calibration.
         if {
@@ -9788,7 +10065,24 @@ class FeatureBuilder:
 
         # Clip differential features to reduce the impact of extreme outliers. This uses
         # simple winsorization at the 1st/99th percentiles computed from the current frame.
-        diff_columns = list(diff_specs.keys()) + ["implied_prob_logit_diff"]
+        diff_columns = (
+            list(diff_specs.keys())
+            + [
+                "implied_prob_logit_diff",
+                "home_net_epa",
+                "away_net_epa",
+                "home_net_success_rate",
+                "away_net_success_rate",
+                "home_net_yards_per_play",
+                "away_net_yards_per_play",
+                "home_net_td_rate",
+                "away_net_td_rate",
+                "home_pass_matchup",
+                "away_pass_matchup",
+                "home_rush_matchup",
+                "away_rush_matchup",
+            ]
+        )
         numeric_diff_columns = [col for col in diff_columns if col in working.columns]
         if numeric_diff_columns:
             diff_subset = working[numeric_diff_columns]
@@ -10640,6 +10934,13 @@ class FeatureBuilder:
                     "defense_epa": "opp_defense_epa",
                     "offense_success_rate": "opp_offense_success_rate",
                     "defense_success_rate": "opp_defense_success_rate",
+                    "offense_yards_per_play": "opp_offense_yards_per_play",
+                    "defense_yards_per_play": "opp_defense_yards_per_play",
+                    "offense_td_rate": "opp_offense_td_rate",
+                    "defense_td_rate": "opp_defense_td_rate",
+                    "pass_rate": "opp_pass_rate",
+                    "rush_rate": "opp_rush_rate",
+                    "pass_rate_over_expectation": "opp_pass_rate_over_expectation",
                     "travel_penalty": "opp_travel_penalty",
                     "rest_penalty": "opp_rest_penalty",
                     "weather_adjustment": "opp_weather_adjustment",
@@ -10893,6 +11194,13 @@ class FeatureBuilder:
                 "defense_epa": "home_defense_epa",
                 "offense_success_rate": "home_offense_success_rate",
                 "defense_success_rate": "home_defense_success_rate",
+                "offense_yards_per_play": "home_offense_yards_per_play",
+                "defense_yards_per_play": "home_defense_yards_per_play",
+                "offense_td_rate": "home_offense_td_rate",
+                "defense_td_rate": "home_defense_td_rate",
+                "pass_rate": "home_pass_rate",
+                "rush_rate": "home_rush_rate",
+                "pass_rate_over_expectation": "home_pass_rate_over_expectation",
                 "travel_penalty": "home_travel_penalty",
                 "rest_penalty": "home_rest_penalty",
                 "weather_adjustment": "home_weather_adjustment",
@@ -10911,6 +11219,13 @@ class FeatureBuilder:
                 "defense_epa": "away_defense_epa",
                 "offense_success_rate": "away_offense_success_rate",
                 "defense_success_rate": "away_defense_success_rate",
+                "offense_yards_per_play": "away_offense_yards_per_play",
+                "defense_yards_per_play": "away_defense_yards_per_play",
+                "offense_td_rate": "away_offense_td_rate",
+                "defense_td_rate": "away_defense_td_rate",
+                "pass_rate": "away_pass_rate",
+                "rush_rate": "away_rush_rate",
+                "pass_rate_over_expectation": "away_pass_rate_over_expectation",
                 "travel_penalty": "away_travel_penalty",
                 "rest_penalty": "away_rest_penalty",
                 "weather_adjustment": "away_weather_adjustment",
@@ -10935,6 +11250,12 @@ class FeatureBuilder:
                 "rest_penalty": "home_rest_penalty",
                 "travel_penalty": "home_travel_penalty_hist",
                 "timezone_diff_hours": "home_timezone_diff_hours",
+                "team_elo_pre": "home_elo_pre",
+                "team_elo_post": "home_elo_post",
+                "team_elo_change": "home_elo_change",
+                "team_elo_win_prob": "home_elo_win_prob",
+                "team_elo_vs_opponent": "home_elo_vs_opponent",
+                "opponent_elo_pre": "home_opponent_elo_pre",
             }
         )
 
@@ -10955,6 +11276,12 @@ class FeatureBuilder:
                 "rest_penalty": "away_rest_penalty",
                 "travel_penalty": "away_travel_penalty_hist",
                 "timezone_diff_hours": "away_timezone_diff_hours",
+                "team_elo_pre": "away_elo_pre",
+                "team_elo_post": "away_elo_post",
+                "team_elo_change": "away_elo_change",
+                "team_elo_win_prob": "away_elo_win_prob",
+                "team_elo_vs_opponent": "away_elo_vs_opponent",
+                "opponent_elo_pre": "away_opponent_elo_pre",
             }
         )
 
@@ -10972,6 +11299,8 @@ class FeatureBuilder:
             .merge(home_history, on="game_id", how="left")
             .merge(away_history, on="game_id", how="left")
         )
+
+        games_context = self._augment_matchup_features(games_context)
 
         if "home_travel_penalty" not in games_context.columns:
             games_context["home_travel_penalty"] = np.nan
@@ -11007,6 +11336,30 @@ class FeatureBuilder:
                     games_context[col], errors="coerce"
                 ).fillna(0.0)
 
+        elo_cols = [
+            "home_elo_pre",
+            "home_elo_post",
+            "home_elo_change",
+            "home_elo_win_prob",
+            "home_elo_vs_opponent",
+            "home_opponent_elo_pre",
+            "home_elo_edge",
+            "away_elo_pre",
+            "away_elo_post",
+            "away_elo_change",
+            "away_elo_win_prob",
+            "away_elo_vs_opponent",
+            "away_opponent_elo_pre",
+            "away_elo_edge",
+        ]
+        for col in elo_cols:
+            if col in games_context.columns:
+                games_context[col] = pd.to_numeric(
+                    games_context[col], errors="coerce"
+                )
+            else:
+                games_context[col] = np.nan
+
         games_context["moneyline_diff"] = games_context["home_moneyline"] - games_context["away_moneyline"]
         games_context["implied_prob_diff"] = (
             games_context["home_implied_prob"] - games_context["away_implied_prob"]
@@ -11014,6 +11367,22 @@ class FeatureBuilder:
         games_context["implied_prob_sum"] = (
             games_context["home_implied_prob"] + games_context["away_implied_prob"]
         )
+
+        if {
+            "home_elo_win_prob",
+            "away_elo_win_prob",
+            "home_implied_prob",
+            "away_implied_prob",
+        }.issubset(games_context.columns):
+            games_context["home_elo_edge"] = (
+                games_context["home_elo_win_prob"] - games_context["home_implied_prob"]
+            )
+            games_context["away_elo_edge"] = (
+                games_context["away_elo_win_prob"] - games_context["away_implied_prob"]
+            )
+        else:
+            games_context["home_elo_edge"] = np.nan
+            games_context["away_elo_edge"] = np.nan
 
         games_context["point_diff"] = games_context["home_score"] - games_context["away_score"]
         self.games_frame = games_context.copy()
@@ -11142,6 +11511,13 @@ class FeatureBuilder:
             "home_defense_epa": np.nan,
             "home_offense_success_rate": np.nan,
             "home_defense_success_rate": np.nan,
+            "home_offense_yards_per_play": np.nan,
+            "home_defense_yards_per_play": np.nan,
+            "home_offense_td_rate": np.nan,
+            "home_defense_td_rate": np.nan,
+            "home_pass_rate": np.nan,
+            "home_rush_rate": np.nan,
+            "home_pass_rate_over_expectation": np.nan,
             "home_travel_penalty": np.nan,
             "home_rest_penalty": np.nan,
             "home_weather_adjustment": np.nan,
@@ -11156,6 +11532,13 @@ class FeatureBuilder:
             "away_defense_epa": np.nan,
             "away_offense_success_rate": np.nan,
             "away_defense_success_rate": np.nan,
+            "away_offense_yards_per_play": np.nan,
+            "away_defense_yards_per_play": np.nan,
+            "away_offense_td_rate": np.nan,
+            "away_defense_td_rate": np.nan,
+            "away_pass_rate": np.nan,
+            "away_rush_rate": np.nan,
+            "away_pass_rate_over_expectation": np.nan,
             "away_travel_penalty": np.nan,
             "away_rest_penalty": np.nan,
             "away_weather_adjustment": np.nan,
@@ -11170,6 +11553,13 @@ class FeatureBuilder:
             "home_prev_point_diff": np.nan,
             "home_rest_days": np.nan,
             "home_injury_total": 0.0,
+            "home_elo_pre": np.nan,
+            "home_elo_post": np.nan,
+            "home_elo_change": np.nan,
+            "home_elo_win_prob": np.nan,
+            "home_elo_vs_opponent": np.nan,
+            "home_opponent_elo_pre": np.nan,
+            "home_elo_edge": np.nan,
             "away_points_for_avg": np.nan,
             "away_points_against_avg": np.nan,
             "away_point_diff_avg": np.nan,
@@ -11178,6 +11568,13 @@ class FeatureBuilder:
             "away_prev_points_against": np.nan,
             "away_prev_point_diff": np.nan,
             "away_rest_days": np.nan,
+            "away_elo_pre": np.nan,
+            "away_elo_post": np.nan,
+            "away_elo_change": np.nan,
+            "away_elo_win_prob": np.nan,
+            "away_elo_vs_opponent": np.nan,
+            "away_opponent_elo_pre": np.nan,
+            "away_elo_edge": np.nan,
             "away_injury_total": 0.0,
             "offense_pass_rating_diff": 0.0,
             "offense_rush_rating_diff": 0.0,
@@ -11187,6 +11584,13 @@ class FeatureBuilder:
             "defense_epa_diff": 0.0,
             "offense_success_rate_diff": 0.0,
             "defense_success_rate_diff": 0.0,
+            "offense_yards_per_play_diff": 0.0,
+            "defense_yards_per_play_diff": 0.0,
+            "offense_td_rate_diff": 0.0,
+            "defense_td_rate_diff": 0.0,
+            "pass_rate_diff": 0.0,
+            "rush_rate_diff": 0.0,
+            "pass_rate_over_expectation_diff": 0.0,
             "pace_seconds_diff": 0.0,
             "travel_penalty_diff": 0.0,
             "rest_penalty_diff": 0.0,
@@ -11202,6 +11606,18 @@ class FeatureBuilder:
             "prev_point_diff_diff": 0.0,
             "injury_total_diff": 0.0,
             "implied_prob_logit_diff": 0.0,
+            "home_net_epa": 0.0,
+            "away_net_epa": 0.0,
+            "home_net_success_rate": 0.0,
+            "away_net_success_rate": 0.0,
+            "home_net_yards_per_play": 0.0,
+            "away_net_yards_per_play": 0.0,
+            "home_net_td_rate": 0.0,
+            "away_net_td_rate": 0.0,
+            "home_pass_matchup": 0.0,
+            "away_pass_matchup": 0.0,
+            "home_rush_matchup": 0.0,
+            "away_rush_matchup": 0.0,
             "wind_mph": np.nan,
             "humidity": np.nan,
         }
@@ -11281,6 +11697,19 @@ class FeatureBuilder:
                     features.at[idx, "home_defense_epa"] = strength.get("defense_epa")
                     features.at[idx, "home_offense_success_rate"] = strength.get("offense_success_rate")
                     features.at[idx, "home_defense_success_rate"] = strength.get("defense_success_rate")
+                    features.at[idx, "home_offense_yards_per_play"] = strength.get(
+                        "offense_yards_per_play"
+                    )
+                    features.at[idx, "home_defense_yards_per_play"] = strength.get(
+                        "defense_yards_per_play"
+                    )
+                    features.at[idx, "home_offense_td_rate"] = strength.get("offense_td_rate")
+                    features.at[idx, "home_defense_td_rate"] = strength.get("defense_td_rate")
+                    features.at[idx, "home_pass_rate"] = strength.get("pass_rate")
+                    features.at[idx, "home_rush_rate"] = strength.get("rush_rate")
+                    features.at[idx, "home_pass_rate_over_expectation"] = strength.get(
+                        "pass_rate_over_expectation"
+                    )
                     features.at[idx, "home_travel_penalty"] = strength.get("travel_penalty")
                     features.at[idx, "home_rest_penalty"] = strength.get("rest_penalty")
                     features.at[idx, "home_weather_adjustment"] = strength.get("weather_adjustment")
@@ -11301,6 +11730,12 @@ class FeatureBuilder:
                         features.at[idx, "home_travel_penalty"] = history.get("travel_penalty")
                     if pd.isna(features.at[idx, "home_timezone_diff_hours"]):
                         features.at[idx, "home_timezone_diff_hours"] = history.get("timezone_diff_hours")
+                    latest_elo = history.get("team_elo_post")
+                    if pd.isna(latest_elo):
+                        latest_elo = history.get("team_elo_pre")
+                    features.at[idx, "home_elo_pre"] = latest_elo
+                    features.at[idx, "home_elo_post"] = latest_elo
+                    features.at[idx, "home_elo_change"] = history.get("team_elo_change")
 
                 fallback_home = self._fallback_team_context(
                     home_team,
@@ -11330,6 +11765,19 @@ class FeatureBuilder:
                     features.at[idx, "away_defense_epa"] = strength.get("defense_epa")
                     features.at[idx, "away_offense_success_rate"] = strength.get("offense_success_rate")
                     features.at[idx, "away_defense_success_rate"] = strength.get("defense_success_rate")
+                    features.at[idx, "away_offense_yards_per_play"] = strength.get(
+                        "offense_yards_per_play"
+                    )
+                    features.at[idx, "away_defense_yards_per_play"] = strength.get(
+                        "defense_yards_per_play"
+                    )
+                    features.at[idx, "away_offense_td_rate"] = strength.get("offense_td_rate")
+                    features.at[idx, "away_defense_td_rate"] = strength.get("defense_td_rate")
+                    features.at[idx, "away_pass_rate"] = strength.get("pass_rate")
+                    features.at[idx, "away_rush_rate"] = strength.get("rush_rate")
+                    features.at[idx, "away_pass_rate_over_expectation"] = strength.get(
+                        "pass_rate_over_expectation"
+                    )
                     features.at[idx, "away_travel_penalty"] = strength.get("travel_penalty")
                     features.at[idx, "away_rest_penalty"] = strength.get("rest_penalty")
                     features.at[idx, "away_weather_adjustment"] = strength.get("weather_adjustment")
@@ -11350,6 +11798,12 @@ class FeatureBuilder:
                         features.at[idx, "away_travel_penalty"] = history.get("travel_penalty")
                     if pd.isna(features.at[idx, "away_timezone_diff_hours"]):
                         features.at[idx, "away_timezone_diff_hours"] = history.get("timezone_diff_hours")
+                    latest_elo = history.get("team_elo_post")
+                    if pd.isna(latest_elo):
+                        latest_elo = history.get("team_elo_pre")
+                    features.at[idx, "away_elo_pre"] = latest_elo
+                    features.at[idx, "away_elo_post"] = latest_elo
+                    features.at[idx, "away_elo_change"] = history.get("team_elo_change")
 
                 fallback_away = self._fallback_team_context(
                     away_team,
@@ -11366,6 +11820,32 @@ class FeatureBuilder:
                         target_col = f"away_{key}"
                     if target_col in features.columns and pd.isna(features.at[idx, target_col]):
                         features.at[idx, target_col] = value
+
+        def _elo_expected(home_rating: float, away_rating: float) -> float:
+            return 1.0 / (1.0 + 10 ** ((away_rating - (home_rating + 55.0)) / 400.0))
+
+        if {"home_elo_pre", "away_elo_pre"}.issubset(features.columns):
+            mask = features["home_elo_pre"].notna() & features["away_elo_pre"].notna()
+            if mask.any():
+                home_ratings = features.loc[mask, "home_elo_pre"].astype(float)
+                away_ratings = features.loc[mask, "away_elo_pre"].astype(float)
+                expected = home_ratings.combine(away_ratings, _elo_expected)
+                features.loc[mask, "home_elo_win_prob"] = expected
+                features.loc[mask, "away_elo_win_prob"] = 1.0 - expected
+                features.loc[mask, "home_elo_vs_opponent"] = home_ratings - away_ratings
+                features.loc[mask, "away_elo_vs_opponent"] = away_ratings - home_ratings
+                features.loc[mask, "home_opponent_elo_pre"] = away_ratings
+                features.loc[mask, "away_opponent_elo_pre"] = home_ratings
+                if "home_implied_prob" in features.columns:
+                    features.loc[mask, "home_elo_edge"] = (
+                        features.loc[mask, "home_elo_win_prob"]
+                        - features.loc[mask, "home_implied_prob"].astype(float)
+                    )
+                if "away_implied_prob" in features.columns:
+                    features.loc[mask, "away_elo_edge"] = (
+                        features.loc[mask, "away_elo_win_prob"]
+                        - features.loc[mask, "away_implied_prob"].astype(float)
+                    )
 
         features = self._augment_matchup_features(features)
 
@@ -12183,6 +12663,15 @@ class FeatureBuilder:
                         row_copy["defense_epa"] = strength.get("defense_epa")
                         row_copy["offense_success_rate"] = strength.get("offense_success_rate")
                         row_copy["defense_success_rate"] = strength.get("defense_success_rate")
+                        row_copy["offense_yards_per_play"] = strength.get("offense_yards_per_play")
+                        row_copy["defense_yards_per_play"] = strength.get("defense_yards_per_play")
+                        row_copy["offense_td_rate"] = strength.get("offense_td_rate")
+                        row_copy["defense_td_rate"] = strength.get("defense_td_rate")
+                        row_copy["pass_rate"] = strength.get("pass_rate")
+                        row_copy["rush_rate"] = strength.get("rush_rate")
+                        row_copy["pass_rate_over_expectation"] = strength.get(
+                            "pass_rate_over_expectation"
+                        )
                         row_copy["travel_penalty"] = strength.get("travel_penalty")
                         row_copy["rest_penalty"] = strength.get("rest_penalty")
                         row_copy["weather_adjustment"] = strength.get("weather_adjustment")
@@ -12221,6 +12710,19 @@ class FeatureBuilder:
                         row_copy["opp_defense_epa"] = opp_strength.get("defense_epa")
                         row_copy["opp_offense_success_rate"] = opp_strength.get("offense_success_rate")
                         row_copy["opp_defense_success_rate"] = opp_strength.get("defense_success_rate")
+                        row_copy["opp_offense_yards_per_play"] = opp_strength.get(
+                            "offense_yards_per_play"
+                        )
+                        row_copy["opp_defense_yards_per_play"] = opp_strength.get(
+                            "defense_yards_per_play"
+                        )
+                        row_copy["opp_offense_td_rate"] = opp_strength.get("offense_td_rate")
+                        row_copy["opp_defense_td_rate"] = opp_strength.get("defense_td_rate")
+                        row_copy["opp_pass_rate"] = opp_strength.get("pass_rate")
+                        row_copy["opp_rush_rate"] = opp_strength.get("rush_rate")
+                        row_copy["opp_pass_rate_over_expectation"] = opp_strength.get(
+                            "pass_rate_over_expectation"
+                        )
                         row_copy["opp_travel_penalty"] = opp_strength.get("travel_penalty")
                         row_copy["opp_rest_penalty"] = opp_strength.get("rest_penalty")
                         row_copy["opp_weather_adjustment"] = opp_strength.get("weather_adjustment")
@@ -12308,8 +12810,9 @@ class FeatureBuilder:
 
         return player_features
 
+    @staticmethod
     def _compute_team_unit_strength(
-        self, player_stats: pd.DataFrame, advanced_metrics: Optional[pd.DataFrame] = None
+        player_stats: pd.DataFrame, advanced_metrics: Optional[pd.DataFrame] = None
     ) -> pd.DataFrame:
         base_columns = [
             "season",
@@ -12324,6 +12827,13 @@ class FeatureBuilder:
             "defense_epa",
             "offense_success_rate",
             "defense_success_rate",
+            "offense_yards_per_play",
+            "defense_yards_per_play",
+            "offense_td_rate",
+            "defense_td_rate",
+            "pass_rate",
+            "rush_rate",
+            "pass_rate_over_expectation",
             "travel_penalty",
             "rest_penalty",
             "weather_adjustment",
@@ -12382,11 +12892,16 @@ class FeatureBuilder:
                 opp_receiving_targets=pd.NamedAgg(column="receiving_targets", aggfunc="sum"),
                 opp_passing_yards=pd.NamedAgg(column="passing_yards", aggfunc="sum"),
                 opp_passing_attempts=pd.NamedAgg(column="passing_attempts", aggfunc="sum"),
+                opp_rushing_tds=pd.NamedAgg(column="rushing_tds", aggfunc="sum"),
+                opp_passing_tds=pd.NamedAgg(column="passing_tds", aggfunc="sum"),
             )
             .rename(columns={"opponent": "team"})
         )
 
         merged = offense.merge(defense, on=["season", "week", "team"], how="left")
+        for td_col in ("opp_rushing_tds", "opp_passing_tds"):
+            if td_col not in merged.columns:
+                merged[td_col] = np.nan
         merged["plays"] = merged["rushing_attempts"] + merged["passing_attempts"]
         merged["yards_per_play"] = np.where(
             merged["plays"] > 0,
@@ -12406,6 +12921,22 @@ class FeatureBuilder:
         merged["pace_seconds_per_play"] = np.where(
             merged["plays"] > 0,
             3600.0 / merged["plays"],
+            np.nan,
+        )
+        merged["offense_yards_per_play"] = merged["yards_per_play"]
+        merged["pass_rate"] = np.where(
+            merged["plays"] > 0,
+            merged["passing_attempts"] / merged["plays"],
+            np.nan,
+        )
+        merged["rush_rate"] = np.where(
+            merged["plays"] > 0,
+            merged["rushing_attempts"] / merged["plays"],
+            np.nan,
+        )
+        merged["offense_td_rate"] = np.where(
+            merged["plays"] > 0,
+            (merged["rushing_tds"] + merged["passing_tds"]) / merged["plays"],
             np.nan,
         )
 
@@ -12442,10 +12973,36 @@ class FeatureBuilder:
             0,
             1,
         )
+        merged["defense_yards_per_play"] = np.where(
+            (merged["opp_rushing_attempts"] + merged["opp_passing_attempts"]) > 0,
+            (merged["opp_rushing_yards"] + merged["opp_passing_yards"]) /
+            (merged["opp_rushing_attempts"] + merged["opp_passing_attempts"]),
+            np.nan,
+        )
+        total_allowed_tds = (
+            merged["opp_rushing_tds"].fillna(0.0) + merged["opp_passing_tds"].fillna(0.0)
+        )
+        merged["defense_td_rate"] = np.where(
+            (merged["opp_rushing_attempts"] + merged["opp_passing_attempts"]) > 0,
+            total_allowed_tds
+            / (merged["opp_rushing_attempts"] + merged["opp_passing_attempts"]),
+            np.nan,
+        )
 
         league = (
             merged.groupby(["season", "week"], as_index=False)[
-                ["rush_per_attempt", "pass_per_attempt", "allowed_rush_per_attempt", "allowed_pass_per_attempt", "yards_per_play"]
+                [
+                    "rush_per_attempt",
+                    "pass_per_attempt",
+                    "allowed_rush_per_attempt",
+                    "allowed_pass_per_attempt",
+                    "yards_per_play",
+                    "defense_yards_per_play",
+                    "pass_rate",
+                    "rush_rate",
+                    "offense_td_rate",
+                    "defense_td_rate",
+                ]
             ]
             .mean()
             .rename(
@@ -12455,6 +13012,11 @@ class FeatureBuilder:
                     "allowed_rush_per_attempt": "league_allowed_rush_per_attempt",
                     "allowed_pass_per_attempt": "league_allowed_pass_per_attempt",
                     "yards_per_play": "league_yards_per_play",
+                    "defense_yards_per_play": "league_defense_yards_per_play",
+                    "pass_rate": "league_pass_rate",
+                    "rush_rate": "league_rush_rate",
+                    "offense_td_rate": "league_offense_td_rate",
+                    "defense_td_rate": "league_defense_td_rate",
                 }
             )
         )
@@ -12472,6 +13034,7 @@ class FeatureBuilder:
         merged["defense_pass_rating"] = (
             merged["league_allowed_pass_per_attempt"] - merged["allowed_pass_per_attempt"]
         )
+        merged["pass_rate_over_expectation"] = merged["pass_rate"] - merged["league_pass_rate"]
 
         merged["offense_epa"] = merged["offense_pass_rating"] + merged["offense_rush_rating"]
         merged["defense_epa"] = merged["defense_pass_rating"] + merged["defense_rush_rating"]
@@ -12495,6 +13058,13 @@ class FeatureBuilder:
             "defense_epa",
             "offense_success_rate",
             "defense_success_rate",
+            "offense_yards_per_play",
+            "defense_yards_per_play",
+            "offense_td_rate",
+            "defense_td_rate",
+            "pass_rate",
+            "rush_rate",
+            "pass_rate_over_expectation",
             "travel_penalty",
             "rest_penalty",
             "weather_adjustment",
@@ -12513,6 +13083,13 @@ class FeatureBuilder:
                 "defense_epa",
                 "offense_success_rate",
                 "defense_success_rate",
+                "offense_yards_per_play",
+                "defense_yards_per_play",
+                "offense_td_rate",
+                "defense_td_rate",
+                "pass_rate",
+                "rush_rate",
+                "pass_rate_over_expectation",
                 "travel_penalty",
                 "rest_penalty",
                 "weather_adjustment",
@@ -12540,6 +13117,13 @@ class FeatureBuilder:
                     "defense_epa",
                     "offense_success_rate",
                     "defense_success_rate",
+                    "offense_yards_per_play",
+                    "defense_yards_per_play",
+                    "offense_td_rate",
+                    "defense_td_rate",
+                    "pass_rate",
+                    "rush_rate",
+                    "pass_rate_over_expectation",
                     "travel_penalty",
                     "rest_penalty",
                     "weather_adjustment",
@@ -12581,8 +13165,103 @@ class FeatureBuilder:
         )
         return context
 
+    @staticmethod
+    def _compute_game_elo_history(games: pd.DataFrame) -> pd.DataFrame:
+        if games.empty:
+            return pd.DataFrame(
+                columns=[
+                    "game_id",
+                    "team",
+                    "opponent",
+                    "team_elo_pre",
+                    "team_elo_post",
+                    "team_elo_change",
+                    "team_elo_win_prob",
+                    "team_elo_vs_opponent",
+                    "opponent_elo_pre",
+                ]
+            )
+
+        ratings: Dict[str, float] = defaultdict(lambda: 1500.0)
+        home_field_advantage = 55.0
+        k_factor = 20.0
+        records: List[Dict[str, Any]] = []
+
+        working = games.copy()
+        working["start_time"] = pd.to_datetime(working["start_time"], utc=True, errors="coerce")
+        working = working.sort_values("start_time")
+
+        def _expected(r_a: float, r_b: float) -> float:
+            return 1.0 / (1.0 + 10 ** ((r_b - r_a) / 400.0))
+
+        def _margin_multiplier(point_diff: float, rating_gap: float) -> float:
+            diff_abs = abs(point_diff)
+            if diff_abs <= 0:
+                return 1.0
+            scaled_gap = max(0.0, abs(rating_gap))
+            return math.log(diff_abs + 1.0) * (2.2 / ((scaled_gap * 0.001) + 2.2))
+
+        for row in working.itertuples(index=False):
+            home_team = normalize_team_abbr(getattr(row, "home_team", None))
+            away_team = normalize_team_abbr(getattr(row, "away_team", None))
+            if not home_team or not away_team:
+                continue
+
+            home_rating = ratings[home_team]
+            away_rating = ratings[away_team]
+
+            expected_home = _expected(home_rating + home_field_advantage, away_rating)
+            expected_away = 1.0 - expected_home
+
+            home_post = home_rating
+            away_post = away_rating
+
+            home_score = getattr(row, "home_score", np.nan)
+            away_score = getattr(row, "away_score", np.nan)
+            if pd.notna(home_score) and pd.notna(away_score):
+                point_diff = float(home_score) - float(away_score)
+                result_home = 1.0 if point_diff > 0 else (0.0 if point_diff < 0 else 0.5)
+                result_away = 1.0 - result_home
+                margin_mult = _margin_multiplier(point_diff, home_rating - away_rating)
+                home_post = home_rating + k_factor * margin_mult * (result_home - expected_home)
+                away_post = away_rating + k_factor * margin_mult * (result_away - expected_away)
+                ratings[home_team] = home_post
+                ratings[away_team] = away_post
+
+            records.append(
+                {
+                    "game_id": getattr(row, "game_id", None),
+                    "team": home_team,
+                    "opponent": away_team,
+                    "team_elo_pre": home_rating,
+                    "team_elo_post": home_post,
+                    "team_elo_win_prob": expected_home,
+                    "opponent_elo_pre": away_rating,
+                }
+            )
+            records.append(
+                {
+                    "game_id": getattr(row, "game_id", None),
+                    "team": away_team,
+                    "opponent": home_team,
+                    "team_elo_pre": away_rating,
+                    "team_elo_post": away_post,
+                    "team_elo_win_prob": expected_away,
+                    "opponent_elo_pre": home_rating,
+                }
+            )
+
+        elo_df = pd.DataFrame.from_records(records)
+        if elo_df.empty:
+            return elo_df
+
+        elo_df["team_elo_change"] = elo_df["team_elo_post"] - elo_df["team_elo_pre"]
+        elo_df["team_elo_vs_opponent"] = elo_df["team_elo_pre"] - elo_df["opponent_elo_pre"]
+        return elo_df
+
     def _compute_team_game_rolling_stats(self, games: pd.DataFrame) -> pd.DataFrame:
         """Create rolling scoring, travel, and rest indicators for each team game."""
+
 
         base_columns = [
             "game_id",
@@ -12603,6 +13282,12 @@ class FeatureBuilder:
             "rest_penalty",
             "timezone_diff_hours",
             "travel_penalty",
+            "team_elo_pre",
+            "team_elo_post",
+            "team_elo_change",
+            "team_elo_win_prob",
+            "team_elo_vs_opponent",
+            "opponent_elo_pre",
         ]
 
         if games.empty:
@@ -12694,6 +13379,26 @@ class FeatureBuilder:
             "start_time",
             "game_id",
         ]).reset_index(drop=True)
+
+        elo_history = self._compute_game_elo_history(games)
+        if elo_history.empty:
+            for col in [
+                "team_elo_pre",
+                "team_elo_post",
+                "team_elo_change",
+                "team_elo_win_prob",
+                "team_elo_vs_opponent",
+                "opponent_elo_pre",
+            ]:
+                team_games[col] = np.nan
+        else:
+            elo_history["team"] = elo_history["team"].apply(normalize_team_abbr)
+            elo_history["opponent"] = elo_history["opponent"].apply(normalize_team_abbr)
+            team_games = team_games.merge(
+                elo_history,
+                on=["game_id", "team", "opponent"],
+                how="left",
+            )
 
         def compute_group(group: pd.DataFrame) -> pd.DataFrame:
             group = group.sort_values("start_time").copy()
