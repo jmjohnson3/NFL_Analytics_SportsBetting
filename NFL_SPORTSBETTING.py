@@ -4556,8 +4556,12 @@ def build_lineups_df(msf_json: Dict[str, Any]) -> pd.DataFrame:
 API_PREFIX_NFL = "https://api.mysportsfeeds.com/v2.1/pull/nfl"
 NFL_SEASONS = ["2025-regular", "2024-regular"]
 
-NFL_API_USER = "4359aa1b-cc29-4647-a3e5-7314e2"
-NFL_API_PASS = "MYSPORTSFEEDS"
+DEFAULT_NFL_API_USER = "4359aa1b-cc29-4647-a3e5-7314e2"
+DEFAULT_NFL_API_PASS = "MYSPORTSFEEDS"
+DEFAULT_NFL_API_TIMEOUT = 45
+DEFAULT_NFL_API_TIMEOUT_RETRIES = 2
+DEFAULT_NFL_API_HTTP_RETRIES = 3
+DEFAULT_NFL_API_TIMEOUT_BACKOFF = 1.5
 
 ODDS_API_KEY = "5b6f0290e265c3329b3ed27897d79eaf"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
@@ -6594,6 +6598,14 @@ class NFLConfig:
     weather_forecast_path: Optional[str] = os.getenv("NFL_FORECAST_PATH")
     closing_odds_history_path: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PATH") or DEFAULT_CLOSING_ODDS_PATH
     rest_travel_context_path: Optional[str] = os.getenv("NFL_TRAVEL_CONTEXT_PATH") or DEFAULT_TRAVEL_CONTEXT_PATH
+    msf_user: str = os.getenv("NFL_API_USER", DEFAULT_NFL_API_USER)
+    msf_password: str = os.getenv("NFL_API_PASS", DEFAULT_NFL_API_PASS)
+    msf_timeout_seconds: int = int(os.getenv("NFL_API_TIMEOUT", str(DEFAULT_NFL_API_TIMEOUT)))
+    msf_timeout_retries: int = int(os.getenv("NFL_API_TIMEOUT_RETRIES", str(DEFAULT_NFL_API_TIMEOUT_RETRIES)))
+    msf_timeout_backoff: float = float(
+        os.getenv("NFL_API_TIMEOUT_BACKOFF", str(DEFAULT_NFL_API_TIMEOUT_BACKOFF))
+    )
+    msf_http_retries: int = int(os.getenv("NFL_API_HTTP_RETRIES", str(DEFAULT_NFL_API_HTTP_RETRIES)))
     respect_lineups: bool = True
     odds_allow_insecure_ssl: bool = env_flag("ODDS_ALLOW_INSECURE_SSL", False)
     odds_ssl_cert_path: Optional[str] = os.getenv("NFL_ODDS_SSL_CERT")
@@ -7113,6 +7125,22 @@ class NFLDatabase:
             rows = conn.execute(select(self.player_stats.c.game_id).distinct()).fetchall()
         return {row[0] for row in rows}
 
+    def fetch_existing_advanced_metric_keys(self) -> Set[Tuple[str, int, str]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(
+                    self.team_advanced_metrics.c.season,
+                    self.team_advanced_metrics.c.week,
+                    self.team_advanced_metrics.c.team,
+                )
+            ).fetchall()
+        keys: Set[Tuple[str, int, str]] = set()
+        for season, week, team in rows:
+            if team is None or week is None:
+                continue
+            keys.add((str(season), int(week), normalize_team_abbr(team)))
+        return keys
+
     def latest_team_rating_week(self, season: str) -> Optional[int]:
         with self.engine.begin() as conn:
             row = conn.execute(
@@ -7173,32 +7201,85 @@ class NFLDatabase:
 
 
 class MySportsFeedsClient:
-    def __init__(self, user: str, password: str, timeout: int = 30):
+    def __init__(
+        self,
+        user: str,
+        password: str,
+        *,
+        timeout: int = 30,
+        timeout_retries: int = 0,
+        timeout_backoff: float = 1.0,
+        http_retries: int = 3,
+    ):
         self.user = user
         self.password = password
         self.auth = (user, password)
         self.timeout = timeout
+        self.timeout_retries = max(0, timeout_retries)
+        self.timeout_backoff = max(0.0, timeout_backoff)
+        self.session = requests.Session()
+        retry = Retry(
+            total=max(0, http_retries),
+            read=max(0, http_retries),
+            connect=max(0, http_retries),
+            status=max(0, http_retries),
+            allowed_methods=("GET",),
+            status_forcelist=(429, 500, 502, 503, 504),
+            backoff_factor=self.timeout_backoff,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def _request(self, endpoint: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{API_PREFIX_NFL}/{endpoint}"
         logging.debug("Requesting MySportsFeeds endpoint %s", url)
-        try:
-            resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
-        except ReadTimeout:
-            logging.warning(
-                "MySportsFeeds request to %s timed out after %ss; returning empty payload",
-                url,
-                self.timeout,
-            )
+        response = None
+        for attempt in range(self.timeout_retries + 1):
+            try:
+                response = self.session.get(
+                    url,
+                    params=params,
+                    auth=self.auth,
+                    timeout=self.timeout,
+                )
+                break
+            except ReadTimeout:
+                if attempt >= self.timeout_retries:
+                    logging.warning(
+                        "MySportsFeeds request to %s timed out after %ss; returning empty payload",
+                        url,
+                        self.timeout,
+                    )
+                    return {}
+                sleep_for = self.timeout_backoff * (2 ** attempt)
+                logging.warning(
+                    "MySportsFeeds request to %s timed out after %ss (attempt %d/%d); retrying in %.1fs",
+                    url,
+                    self.timeout,
+                    attempt + 1,
+                    self.timeout_retries + 1,
+                    sleep_for,
+                )
+                time.sleep(sleep_for)
+            except RequestsConnectionError as exc:
+                logging.warning("MySportsFeeds request to %s failed: %s", url, exc)
+                return {}
+        if response is None:
             return {}
-        except RequestsConnectionError as exc:
-            logging.warning("MySportsFeeds request to %s failed: %s", url, exc)
-            return {}
-        resp.raise_for_status()
         try:
-            return resp.json()
+            response.raise_for_status()
+        except HTTPError:
+            if response.status_code == HTTPStatus.UNAUTHORIZED:
+                logging.error(
+                    "MySportsFeeds rejected the provided credentials. Set NFL_API_USER/NFL_API_PASS or update config."
+                )
+            raise
+        try:
+            return response.json()
         except RequestsJSONDecodeError:
-            content = resp.text.strip()
+            content = response.text.strip()
             if not content:
                 logging.debug(
                     "Empty response body for MySportsFeeds endpoint %s; returning empty payload",
@@ -7208,7 +7289,7 @@ class MySportsFeedsClient:
             logging.warning(
                 "Failed to decode JSON from MySportsFeeds endpoint %s (content-type=%s)",
                 url,
-                resp.headers.get("Content-Type"),
+                response.headers.get("Content-Type"),
             )
             raise
 
@@ -8209,11 +8290,26 @@ class NFLIngestor:
 
         if injury_rows_all:
             self.db.upsert_rows(self.db.injury_reports, injury_rows_all, ["injury_id"])
-        if advanced_rows_map:
+        supplemental_rows = list(advanced_rows_map.values())
+        if supplemental_rows:
             self.db.upsert_rows(
                 self.db.team_advanced_metrics,
-                list(advanced_rows_map.values()),
-                ["metric_id"],
+                supplemental_rows,
+                ["season", "week", "team"],
+            )
+
+        skip_keys: Set[Tuple[str, int, str]] = set(
+            (row.get("season"), int(row.get("week") or 0), row.get("team"))
+            for row in supplemental_rows
+            if row.get("team")
+        )
+        skip_keys.update(self.db.fetch_existing_advanced_metric_keys())
+        derived_rows = self._derive_advanced_metrics_from_player_stats(skip_keys)
+        if derived_rows:
+            self.db.upsert_rows(
+                self.db.team_advanced_metrics,
+                derived_rows,
+                ["season", "week", "team"],
             )
 
         # Ingest odds separately as they change frequently (always upsert)
@@ -8824,6 +8920,115 @@ class NFLIngestor:
                     "player_id",
                 ],
             )
+
+    def _derive_advanced_metrics_from_player_stats(
+        self, skip_keys: Set[Tuple[str, int, str]]
+    ) -> List[Dict[str, Any]]:
+        try:
+            player_stats = pd.read_sql_table("nfl_player_stats", self.db.engine)
+        except Exception:
+            logging.exception(
+                "Failed to load player stats for derived advanced metric generation"
+            )
+            return []
+
+        if player_stats.empty:
+            return []
+
+        try:
+            games = pd.read_sql_table(
+                "nfl_games",
+                self.db.engine,
+                columns=["game_id", "season", "week", "home_team", "away_team"],
+            )
+        except Exception:
+            logging.exception(
+                "Failed to load games metadata for derived advanced metric generation"
+            )
+            return []
+
+        if games.empty or "game_id" not in games.columns:
+            return []
+
+        enrichment_cols = [
+            "rushing_attempts",
+            "rushing_yards",
+            "rushing_tds",
+            "receiving_targets",
+            "receiving_yards",
+            "receiving_tds",
+            "passing_attempts",
+            "passing_yards",
+            "passing_tds",
+        ]
+        for col in enrichment_cols:
+            if col not in player_stats.columns:
+                player_stats[col] = 0.0
+
+        merged = player_stats.merge(games, on="game_id", how="left")
+        merged = merged.dropna(subset=["season", "week", "team"])
+        if merged.empty:
+            return []
+
+        merged["season"] = merged["season"].astype(str)
+        merged["week"] = merged["week"].apply(lambda x: int(x) if pd.notna(x) else None)
+        merged = merged.dropna(subset=["week"])
+        if merged.empty:
+            return []
+
+        for col in ("team", "home_team", "away_team"):
+            if col in merged.columns:
+                merged[col] = merged[col].apply(normalize_team_abbr)
+
+        derived = FeatureBuilder._compute_team_unit_strength(merged, None)
+        if derived is None or derived.empty:
+            return []
+
+        derived = derived.replace({np.nan: None})
+        metrics_columns = [
+            "pace_seconds_per_play",
+            "offense_epa",
+            "defense_epa",
+            "offense_success_rate",
+            "defense_success_rate",
+            "offense_yards_per_play",
+            "defense_yards_per_play",
+            "offense_td_rate",
+            "defense_td_rate",
+            "pass_rate",
+            "rush_rate",
+            "pass_rate_over_expectation",
+            "travel_penalty",
+            "rest_penalty",
+            "weather_adjustment",
+        ]
+
+        rows: List[Dict[str, Any]] = []
+        for _, metric_row in derived.iterrows():
+            season = str(metric_row.get("season"))
+            week_val = metric_row.get("week")
+            team = normalize_team_abbr(metric_row.get("team"))
+            if not team:
+                continue
+            if week_val is None or pd.isna(week_val):
+                continue
+            week_int = int(week_val)
+            key = (season, week_int, team)
+            if key in skip_keys:
+                continue
+            row: Dict[str, Any] = {
+                "metric_id": f"derived_{season}_{week_int}_{team}",
+                "season": season,
+                "week": week_int,
+                "team": team,
+            }
+            for col in metrics_columns:
+                row[col] = self._safe_float(metric_row.get(col))
+            rows.append(row)
+
+        if rows:
+            logging.info("Derived %d advanced metric rows from player stats", len(rows))
+        return rows
 
     def _group_msf_injuries(
         self,
@@ -11481,9 +11686,17 @@ class FeatureBuilder:
             "wind_mph": np.nan,
             "humidity": np.nan,
         }
-        for col, default in numeric_placeholders.items():
-            if col not in features.columns:
-                features[col] = default
+        missing_numeric_cols = {
+            col: default
+            for col, default in numeric_placeholders.items()
+            if col not in features.columns
+        }
+        if missing_numeric_cols:
+            filler = pd.DataFrame(
+                {col: default for col, default in missing_numeric_cols.items()},
+                index=features.index,
+            )
+            features = pd.concat([features, filler], axis=1)
 
         loader = getattr(self, "supplemental_loader", None)
         travel_context = None
@@ -11710,11 +11923,18 @@ class FeatureBuilder:
         features = self._augment_matchup_features(features)
 
         fill_defaults = {col: 0.0 for col in numeric_placeholders.keys()}
-        features[list(fill_defaults.keys())] = features[list(fill_defaults.keys())].fillna(fill_defaults)
+        features[list(fill_defaults.keys())] = features[list(fill_defaults.keys())].fillna(
+            fill_defaults
+        )
 
-        features["moneyline_diff"] = features["home_moneyline"] - features["away_moneyline"]
-        features["implied_prob_diff"] = features["home_implied_prob"] - features["away_implied_prob"]
-        features["implied_prob_sum"] = features["home_implied_prob"] + features["away_implied_prob"]
+        derived_numeric_cols = {
+            "moneyline_diff": features["home_moneyline"] - features["away_moneyline"],
+            "implied_prob_diff": features["home_implied_prob"]
+            - features["away_implied_prob"],
+            "implied_prob_sum": features["home_implied_prob"]
+            + features["away_implied_prob"],
+        }
+        features = features.assign(**derived_numeric_cols)
 
         return features
 
@@ -12670,8 +12890,9 @@ class FeatureBuilder:
 
         return player_features
 
+    @staticmethod
     def _compute_team_unit_strength(
-        self, player_stats: pd.DataFrame, advanced_metrics: Optional[pd.DataFrame] = None
+        player_stats: pd.DataFrame, advanced_metrics: Optional[pd.DataFrame] = None
     ) -> pd.DataFrame:
         base_columns = [
             "season",
@@ -17889,7 +18110,14 @@ def main() -> None:
     except Exception:
         logging.exception("Automated closing odds synchronization failed")
 
-    msf_client = MySportsFeedsClient(NFL_API_USER, NFL_API_PASS)
+    msf_client = MySportsFeedsClient(
+        config.msf_user,
+        config.msf_password,
+        timeout=config.msf_timeout_seconds,
+        timeout_retries=config.msf_timeout_retries,
+        timeout_backoff=config.msf_timeout_backoff,
+        http_retries=config.msf_http_retries,
+    )
     odds_client = OddsApiClient(
         ODDS_API_KEY,
         allow_insecure_ssl=config.odds_allow_insecure_ssl,
