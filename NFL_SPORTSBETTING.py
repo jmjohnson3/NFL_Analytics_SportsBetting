@@ -13566,6 +13566,93 @@ class ModelTrainer:
         self.supplemental_loader = supplemental_loader
 
     @staticmethod
+    def _build_confidence_profile(
+        margins: np.ndarray, correct_mask: np.ndarray, bucket_quantiles: Sequence[float] = (0.33, 0.66)
+    ) -> Optional[Dict[str, Any]]:
+        """Summarize how accuracy varies with probability margins."""
+
+        if margins.size == 0 or correct_mask.size == 0:
+            return None
+
+        valid = np.isfinite(margins) & np.isfinite(correct_mask)
+        if not valid.any():
+            return None
+
+        margins = margins[valid]
+        correct_mask = correct_mask[valid]
+        correct_mask = correct_mask.astype(int)
+
+        try:
+            quantiles = np.quantile(margins, bucket_quantiles)
+        except Exception:
+            quantiles = []
+
+        quantiles = [float(q) for q in quantiles if math.isfinite(q)]
+        if not quantiles:
+            quantiles = [0.1, 0.2]
+
+        thresholds = [0.0]
+        for value in quantiles:
+            if value > thresholds[-1]:
+                thresholds.append(value)
+        thresholds.append(float("inf"))
+
+        # Ensure strictly increasing cutpoints
+        for idx in range(1, len(thresholds)):
+            if thresholds[idx] <= thresholds[idx - 1]:
+                thresholds[idx] = thresholds[idx - 1] + 1e-6
+
+        bucket_labels = ["low", "medium", "high"][: len(thresholds) - 1]
+        buckets: List[Dict[str, Any]] = []
+        for label, lower, upper in zip(bucket_labels, thresholds[:-1], thresholds[1:]):
+            mask = (margins >= lower) & (margins < upper)
+            count = int(mask.sum())
+            accuracy = float(correct_mask[mask].mean()) if count > 0 else float("nan")
+            buckets.append(
+                {
+                    "label": label,
+                    "lower": float(lower),
+                    "upper": float(upper),
+                    "accuracy": accuracy,
+                    "count": count,
+                }
+            )
+
+        preferred_label = bucket_labels[-1] if bucket_labels else None
+        margin_threshold = thresholds[-2] if len(thresholds) >= 2 else 0.2
+
+        edge_threshold = max(0.03, float(margin_threshold) / 2.0)
+
+        return {
+            "thresholds": thresholds[: len(bucket_labels) + 1],
+            "buckets": buckets,
+            "preferred_label": preferred_label,
+            "margin_threshold": float(margin_threshold),
+            "edge_threshold": float(edge_threshold),
+        }
+
+    @staticmethod
+    def _build_error_profile(errors: np.ndarray) -> Optional[Dict[str, float]]:
+        if errors.size == 0:
+            return None
+
+        errors = errors[np.isfinite(errors)]
+        if errors.size == 0:
+            return None
+
+        quantile_levels = [0.5, 0.8, 0.9, 0.95]
+        profile = {
+            "mean": float(np.mean(errors)),
+            "median": float(np.median(errors)),
+        }
+        for level in quantile_levels:
+            try:
+                profile[f"q{int(level * 100)}"] = float(np.quantile(errors, level))
+            except Exception:
+                profile[f"q{int(level * 100)}"] = float("nan")
+        return profile
+
+    @staticmethod
     def _is_lineup_starter(position: str, rank: Optional[int]) -> bool:
         pos = normalize_position(position)
         if pos == "QB":
@@ -16276,6 +16363,24 @@ class ModelTrainer:
             f"{winner_brier:.3f}" if not np.isnan(winner_brier) else "nan",
         )
 
+        winner_margin = np.abs(winner_proba - 0.5)
+        confidence_profile = self._build_confidence_profile(
+            winner_margin, (winner_pred == y_winner_test).astype(int)
+        )
+        if confidence_profile:
+            entry = self.special_models.get("game_winner", {}).copy()
+            entry["confidence_profile"] = confidence_profile
+            self.special_models["game_winner"] = entry
+            for bucket in confidence_profile.get("buckets", []):
+                logging.info(
+                    "Winner confidence bucket %-6s | margin >= %.3f < %.3f | accuracy=%s | n=%d",
+                    bucket.get("label"),
+                    bucket.get("lower", float("nan")),
+                    bucket.get("upper", float("nan")),
+                    f"{bucket.get('accuracy'):.3f}" if bucket.get("accuracy") is not None else "nan",
+                    bucket.get("count", 0),
+                )
+
         home_pred = final_home.predict(X_test)
         home_r2 = final_home.score(X_test, y_home_test)
         home_mae = mean_absolute_error(y_home_test, home_pred)
@@ -16297,6 +16402,30 @@ class ModelTrainer:
             away_mae,
             away_rmse,
         )
+
+        home_error_profile = self._build_error_profile(np.abs(home_pred - y_home_test))
+        if home_error_profile:
+            entry = self.special_models.get("home_points", {}).copy()
+            entry["error_profile"] = home_error_profile
+            self.special_models["home_points"] = entry
+            logging.info(
+                "Home score error profile | median=%.2f | q80=%.2f | q95=%.2f",
+                home_error_profile.get("median", float("nan")),
+                home_error_profile.get("q80", float("nan")),
+                home_error_profile.get("q95", float("nan")),
+            )
+
+        away_error_profile = self._build_error_profile(np.abs(away_pred - y_away_test))
+        if away_error_profile:
+            entry = self.special_models.get("away_points", {}).copy()
+            entry["error_profile"] = away_error_profile
+            self.special_models["away_points"] = entry
+            logging.info(
+                "Away score error profile | median=%.2f | q80=%.2f | q95=%.2f",
+                away_error_profile.get("median", float("nan")),
+                away_error_profile.get("q80", float("nan")),
+                away_error_profile.get("q95", float("nan")),
+            )
 
         # Supplemental Poisson totals model for pricing
         try:
@@ -17069,6 +17198,7 @@ def predict_upcoming_games(
     home_predictions = models["home_points"].predict(home_features)
     winner_probs = models["game_winner"].predict_proba(winner_features)[:, 1]
 
+    specials: Dict[str, Any] = {}
     if trainer is not None:
         try:
             specials = getattr(trainer, "special_models", {}) or {}
@@ -17096,6 +17226,90 @@ def predict_upcoming_games(
     scoreboard["away_score"] = away_predictions
     scoreboard["home_score"] = home_predictions
     scoreboard["home_win_probability"] = winner_probs
+    scoreboard["home_win_margin"] = (scoreboard["home_win_probability"] - 0.5).abs()
+    scoreboard["home_win_confidence"] = pd.Series(pd.NA, index=scoreboard.index, dtype="object")
+    scoreboard["home_win_confidence_accuracy"] = np.nan
+    scoreboard["home_win_edge"] = np.nan
+    scoreboard["bet_recommendation"] = "monitor"
+    scoreboard["high_confidence_flag"] = False
+    scoreboard["home_score_expected_error"] = np.nan
+    scoreboard["away_score_expected_error"] = np.nan
+
+    confidence_profile = {}
+    if isinstance(specials, dict):
+        confidence_profile = specials.get("game_winner", {}).get("confidence_profile", {})
+    if confidence_profile:
+        thresholds = confidence_profile.get("thresholds")
+        bucket_records = confidence_profile.get("buckets", [])
+        bucket_labels = [record.get("label") for record in bucket_records if record.get("label")]
+        if thresholds and bucket_labels:
+            try:
+                confidence_series = pd.cut(
+                    scoreboard["home_win_margin"],
+                    bins=thresholds,
+                    labels=bucket_labels,
+                    include_lowest=True,
+                    right=False,
+                )
+                scoreboard["home_win_confidence"] = confidence_series.astype(str)
+                scoreboard.loc[
+                    confidence_series.isna(), "home_win_confidence"
+                ] = pd.NA
+            except Exception:
+                logging.debug("Unable to bucketize win confidence", exc_info=True)
+        acc_map = {record.get("label"): record.get("accuracy") for record in bucket_records}
+        scoreboard["home_win_confidence_accuracy"] = scoreboard["home_win_confidence"].map(acc_map)
+        preferred_label = confidence_profile.get("preferred_label")
+        if preferred_label:
+            scoreboard["high_confidence_flag"] = scoreboard["home_win_confidence"] == preferred_label
+
+    home_error_profile = (specials.get("home_points", {}) or {}).get("error_profile") if isinstance(specials, dict) else None
+    if home_error_profile:
+        scoreboard["home_score_expected_error"] = home_error_profile.get("median")
+
+    away_error_profile = (specials.get("away_points", {}) or {}).get("error_profile") if isinstance(specials, dict) else None
+    if away_error_profile:
+        scoreboard["away_score_expected_error"] = away_error_profile.get("median")
+
+    poisson_entry = specials.get("team_poisson") if isinstance(specials, dict) else None
+    if poisson_entry and not game_features.empty:
+        base_features = _ensure_model_features(
+            game_features,
+            SimpleNamespace(feature_columns=poisson_entry.get("feature_columns", [])),
+        )
+        processed = _transform_with_feature_names(
+            poisson_entry.get("preprocessor"),
+            base_features,
+            poisson_entry.get("feature_names"),
+        )
+        try:
+            lam_home, lam_away = poisson_entry["model"].predict_lambda(processed, processed)
+        except Exception:
+            logging.debug("Unable to score Poisson consensus for upcoming games", exc_info=True)
+            lam_home = lam_away = np.array([])
+        if lam_home.size and lam_away.size:
+            poisson_probs = [
+                TeamPoissonTotals._home_win_probability_pair(float(h), float(a))
+                for h, a in zip(lam_home, lam_away)
+            ]
+            poisson_df = pd.DataFrame(
+                {
+                    "game_id": game_features["game_id"].values,
+                    "home_score_poisson": lam_home,
+                    "away_score_poisson": lam_away,
+                    "home_win_poisson_prob": poisson_probs,
+                }
+            )
+            scoreboard = scoreboard.merge(poisson_df, on="game_id", how="left")
+            scoreboard["home_score_consensus_gap"] = (
+                scoreboard["home_score"] - scoreboard["home_score_poisson"]
+            )
+            scoreboard["away_score_consensus_gap"] = (
+                scoreboard["away_score"] - scoreboard["away_score_poisson"]
+            )
+            scoreboard["home_win_consensus_gap"] = (
+                scoreboard["home_win_probability"] - scoreboard["home_win_poisson_prob"]
+            )
 
     home_unc = (model_uncertainty.get("home_points") or {})
     away_unc = (model_uncertainty.get("away_points") or {})
@@ -17122,31 +17336,6 @@ def predict_upcoming_games(
     scoreboard["home_win_brier"] = winner_unc.get("brier")
     scoreboard["home_win_accuracy"] = winner_unc.get("accuracy")
     scoreboard["date"] = scoreboard["local_start_time"].dt.date.astype(str)
-    scoreboard = scoreboard[
-        [
-            "game_id",
-            "date",
-            "start_time",
-            "local_start_time",
-            "away_team",
-            "home_team",
-            "away_score",
-            "home_score",
-            "away_score_lower",
-            "away_score_upper",
-            "home_score_lower",
-            "home_score_upper",
-            "home_win_probability",
-            "home_win_log_loss",
-            "home_win_brier",
-            "home_win_accuracy",
-        ]
-    ].rename(
-        columns={
-            "away_team": "away_team_abbr",
-            "home_team": "home_team_abbr",
-        }
-    )
 
     odds_columns = [
         "home_moneyline",
@@ -17160,7 +17349,81 @@ def predict_upcoming_games(
         odds_frame = game_features[["game_id", *available_odds]].drop_duplicates("game_id")
         scoreboard = scoreboard.merge(odds_frame, on="game_id", how="left")
 
+    if "home_implied_prob" in scoreboard.columns:
+        scoreboard["home_win_edge"] = scoreboard["home_win_probability"] - scoreboard["home_implied_prob"]
+    if "away_implied_prob" in scoreboard.columns:
+        scoreboard["away_win_edge"] = (1.0 - scoreboard["home_win_probability"]) - scoreboard["away_implied_prob"]
+
+    edge_threshold = 0.05
+    if confidence_profile:
+        edge_threshold = float(confidence_profile.get("edge_threshold", edge_threshold))
+
+    consensus_gap = scoreboard.get("home_win_consensus_gap")
+    if consensus_gap is None:
+        consensus_gap = pd.Series(0.0, index=scoreboard.index)
+    scoreboard["consensus_warning"] = np.where(
+        consensus_gap.abs() >= 0.1,
+        "model_disagrees",
+        "",
+    )
+
+    confidence_text = scoreboard["home_win_confidence"].fillna("")
+    scoreboard["bet_recommendation"] = np.select(
+        [
+            scoreboard["high_confidence_flag"]
+            & scoreboard["home_win_edge"].abs().ge(edge_threshold),
+            scoreboard["high_confidence_flag"],
+        ],
+        ["target", "lean"],
+        default=np.where(confidence_text == "medium", "monitor", "pass"),
+    )
+
     scoreboard = scoreboard.sort_values(["date", "start_time", "game_id"]).reset_index(drop=True)
+
+    base_columns = [
+        "game_id",
+        "date",
+        "start_time",
+        "local_start_time",
+        "away_team",
+        "home_team",
+        "away_score",
+        "home_score",
+        "away_score_lower",
+        "away_score_upper",
+        "home_score_lower",
+        "home_score_upper",
+        "home_score_expected_error",
+        "away_score_expected_error",
+        "home_score_poisson",
+        "away_score_poisson",
+        "home_score_consensus_gap",
+        "away_score_consensus_gap",
+        "home_win_probability",
+        "home_win_poisson_prob",
+        "home_win_consensus_gap",
+        "home_win_margin",
+        "home_win_confidence",
+        "home_win_confidence_accuracy",
+        "home_win_edge",
+        "away_win_edge",
+        "home_win_log_loss",
+        "home_win_brier",
+        "home_win_accuracy",
+        "bet_recommendation",
+        "consensus_warning",
+        "high_confidence_flag",
+    ]
+    odds_cols_present = [col for col in odds_columns if col in scoreboard.columns]
+    final_columns = base_columns + odds_cols_present
+    available_final = [col for col in final_columns if col in scoreboard.columns]
+
+    scoreboard = scoreboard[available_final].rename(
+        columns={
+            "away_team": "away_team_abbr",
+            "home_team": "home_team_abbr",
+        }
+    )
 
     # Player-level predictions
     lineup_df = pd.DataFrame()
