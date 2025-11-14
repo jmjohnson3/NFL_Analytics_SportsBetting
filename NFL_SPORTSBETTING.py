@@ -11692,7 +11692,11 @@ class FeatureBuilder:
             if col not in features.columns
         }
         if missing_numeric_cols:
-            features = features.assign(**missing_numeric_cols)
+            filler = pd.DataFrame(
+                {col: default for col, default in missing_numeric_cols.items()},
+                index=features.index,
+            )
+            features = pd.concat([features, filler], axis=1)
 
         loader = getattr(self, "supplemental_loader", None)
         travel_context = None
