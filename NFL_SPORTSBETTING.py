@@ -4556,8 +4556,12 @@ def build_lineups_df(msf_json: Dict[str, Any]) -> pd.DataFrame:
 API_PREFIX_NFL = "https://api.mysportsfeeds.com/v2.1/pull/nfl"
 NFL_SEASONS = ["2025-regular", "2024-regular"]
 
-NFL_API_USER = "4359aa1b-cc29-4647-a3e5-7314e2"
-NFL_API_PASS = "MYSPORTSFEEDS"
+DEFAULT_NFL_API_USER = "4359aa1b-cc29-4647-a3e5-7314e2"
+DEFAULT_NFL_API_PASS = "MYSPORTSFEEDS"
+DEFAULT_NFL_API_TIMEOUT = 45
+DEFAULT_NFL_API_TIMEOUT_RETRIES = 2
+DEFAULT_NFL_API_HTTP_RETRIES = 3
+DEFAULT_NFL_API_TIMEOUT_BACKOFF = 1.5
 
 ODDS_API_KEY = "5b6f0290e265c3329b3ed27897d79eaf"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
@@ -6594,6 +6598,14 @@ class NFLConfig:
     weather_forecast_path: Optional[str] = os.getenv("NFL_FORECAST_PATH")
     closing_odds_history_path: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PATH") or DEFAULT_CLOSING_ODDS_PATH
     rest_travel_context_path: Optional[str] = os.getenv("NFL_TRAVEL_CONTEXT_PATH") or DEFAULT_TRAVEL_CONTEXT_PATH
+    msf_user: str = os.getenv("NFL_API_USER", DEFAULT_NFL_API_USER)
+    msf_password: str = os.getenv("NFL_API_PASS", DEFAULT_NFL_API_PASS)
+    msf_timeout_seconds: int = int(os.getenv("NFL_API_TIMEOUT", str(DEFAULT_NFL_API_TIMEOUT)))
+    msf_timeout_retries: int = int(os.getenv("NFL_API_TIMEOUT_RETRIES", str(DEFAULT_NFL_API_TIMEOUT_RETRIES)))
+    msf_timeout_backoff: float = float(
+        os.getenv("NFL_API_TIMEOUT_BACKOFF", str(DEFAULT_NFL_API_TIMEOUT_BACKOFF))
+    )
+    msf_http_retries: int = int(os.getenv("NFL_API_HTTP_RETRIES", str(DEFAULT_NFL_API_HTTP_RETRIES)))
     respect_lineups: bool = True
     odds_allow_insecure_ssl: bool = env_flag("ODDS_ALLOW_INSECURE_SSL", False)
     odds_ssl_cert_path: Optional[str] = os.getenv("NFL_ODDS_SSL_CERT")
@@ -6719,6 +6731,28 @@ class NFLDatabase:
             statements.append(
                 "ALTER TABLE nfl_injury_reports ADD COLUMN IF NOT EXISTS position TEXT"
             )
+
+        if "nfl_team_advanced_metrics" in table_names:
+            try:
+                advanced_columns = {
+                    col["name"] for col in inspector.get_columns("nfl_team_advanced_metrics")
+                }
+            except Exception:
+                advanced_columns = set()
+            advanced_column_defs = {
+                "offense_yards_per_play": "DOUBLE PRECISION",
+                "defense_yards_per_play": "DOUBLE PRECISION",
+                "offense_td_rate": "DOUBLE PRECISION",
+                "defense_td_rate": "DOUBLE PRECISION",
+                "pass_rate": "DOUBLE PRECISION",
+                "rush_rate": "DOUBLE PRECISION",
+                "pass_rate_over_expectation": "DOUBLE PRECISION",
+            }
+            for column_name, column_type in advanced_column_defs.items():
+                if column_name not in advanced_columns:
+                    statements.append(
+                        f"ALTER TABLE nfl_team_advanced_metrics ADD COLUMN IF NOT EXISTS {column_name} {column_type}"
+                    )
 
         if not statements:
             return
@@ -6861,6 +6895,13 @@ class NFLDatabase:
             Column("defense_epa", Float),
             Column("offense_success_rate", Float),
             Column("defense_success_rate", Float),
+            Column("offense_yards_per_play", Float),
+            Column("defense_yards_per_play", Float),
+            Column("offense_td_rate", Float),
+            Column("defense_td_rate", Float),
+            Column("pass_rate", Float),
+            Column("rush_rate", Float),
+            Column("pass_rate_over_expectation", Float),
             Column("travel_penalty", Float),
             Column("rest_penalty", Float),
             Column("weather_adjustment", Float),
@@ -7084,6 +7125,22 @@ class NFLDatabase:
             rows = conn.execute(select(self.player_stats.c.game_id).distinct()).fetchall()
         return {row[0] for row in rows}
 
+    def fetch_existing_advanced_metric_keys(self) -> Set[Tuple[str, int, str]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(
+                    self.team_advanced_metrics.c.season,
+                    self.team_advanced_metrics.c.week,
+                    self.team_advanced_metrics.c.team,
+                )
+            ).fetchall()
+        keys: Set[Tuple[str, int, str]] = set()
+        for season, week, team in rows:
+            if team is None or week is None:
+                continue
+            keys.add((str(season), int(week), normalize_team_abbr(team)))
+        return keys
+
     def latest_team_rating_week(self, season: str) -> Optional[int]:
         with self.engine.begin() as conn:
             row = conn.execute(
@@ -7144,32 +7201,85 @@ class NFLDatabase:
 
 
 class MySportsFeedsClient:
-    def __init__(self, user: str, password: str, timeout: int = 30):
+    def __init__(
+        self,
+        user: str,
+        password: str,
+        *,
+        timeout: int = 30,
+        timeout_retries: int = 0,
+        timeout_backoff: float = 1.0,
+        http_retries: int = 3,
+    ):
         self.user = user
         self.password = password
         self.auth = (user, password)
         self.timeout = timeout
+        self.timeout_retries = max(0, timeout_retries)
+        self.timeout_backoff = max(0.0, timeout_backoff)
+        self.session = requests.Session()
+        retry = Retry(
+            total=max(0, http_retries),
+            read=max(0, http_retries),
+            connect=max(0, http_retries),
+            status=max(0, http_retries),
+            allowed_methods=("GET",),
+            status_forcelist=(429, 500, 502, 503, 504),
+            backoff_factor=self.timeout_backoff,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def _request(self, endpoint: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{API_PREFIX_NFL}/{endpoint}"
         logging.debug("Requesting MySportsFeeds endpoint %s", url)
-        try:
-            resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
-        except ReadTimeout:
-            logging.warning(
-                "MySportsFeeds request to %s timed out after %ss; returning empty payload",
-                url,
-                self.timeout,
-            )
+        response = None
+        for attempt in range(self.timeout_retries + 1):
+            try:
+                response = self.session.get(
+                    url,
+                    params=params,
+                    auth=self.auth,
+                    timeout=self.timeout,
+                )
+                break
+            except ReadTimeout:
+                if attempt >= self.timeout_retries:
+                    logging.warning(
+                        "MySportsFeeds request to %s timed out after %ss; returning empty payload",
+                        url,
+                        self.timeout,
+                    )
+                    return {}
+                sleep_for = self.timeout_backoff * (2 ** attempt)
+                logging.warning(
+                    "MySportsFeeds request to %s timed out after %ss (attempt %d/%d); retrying in %.1fs",
+                    url,
+                    self.timeout,
+                    attempt + 1,
+                    self.timeout_retries + 1,
+                    sleep_for,
+                )
+                time.sleep(sleep_for)
+            except RequestsConnectionError as exc:
+                logging.warning("MySportsFeeds request to %s failed: %s", url, exc)
+                return {}
+        if response is None:
             return {}
-        except RequestsConnectionError as exc:
-            logging.warning("MySportsFeeds request to %s failed: %s", url, exc)
-            return {}
-        resp.raise_for_status()
         try:
-            return resp.json()
+            response.raise_for_status()
+        except HTTPError:
+            if response.status_code == HTTPStatus.UNAUTHORIZED:
+                logging.error(
+                    "MySportsFeeds rejected the provided credentials. Set NFL_API_USER/NFL_API_PASS or update config."
+                )
+            raise
+        try:
+            return response.json()
         except RequestsJSONDecodeError:
-            content = resp.text.strip()
+            content = response.text.strip()
             if not content:
                 logging.debug(
                     "Empty response body for MySportsFeeds endpoint %s; returning empty payload",
@@ -7179,7 +7289,7 @@ class MySportsFeedsClient:
             logging.warning(
                 "Failed to decode JSON from MySportsFeeds endpoint %s (content-type=%s)",
                 url,
-                resp.headers.get("Content-Type"),
+                response.headers.get("Content-Type"),
             )
             raise
 
@@ -8014,6 +8124,23 @@ class NFLIngestor:
                         "defense_success_rate": self._safe_float(
                             advanced_payload.get("defense_success_rate")
                         ),
+                        "offense_yards_per_play": self._safe_float(
+                            advanced_payload.get("offense_yards_per_play")
+                        ),
+                        "defense_yards_per_play": self._safe_float(
+                            advanced_payload.get("defense_yards_per_play")
+                        ),
+                        "offense_td_rate": self._safe_float(
+                            advanced_payload.get("offense_td_rate")
+                        ),
+                        "defense_td_rate": self._safe_float(
+                            advanced_payload.get("defense_td_rate")
+                        ),
+                        "pass_rate": self._safe_float(advanced_payload.get("pass_rate")),
+                        "rush_rate": self._safe_float(advanced_payload.get("rush_rate")),
+                        "pass_rate_over_expectation": self._safe_float(
+                            advanced_payload.get("pass_rate_over_expectation")
+                        ),
                         "travel_penalty": self._safe_float(advanced_payload.get("travel_penalty")),
                         "rest_penalty": self._safe_float(advanced_payload.get("rest_penalty")),
                         "weather_adjustment": self._safe_float(
@@ -8163,11 +8290,26 @@ class NFLIngestor:
 
         if injury_rows_all:
             self.db.upsert_rows(self.db.injury_reports, injury_rows_all, ["injury_id"])
-        if advanced_rows_map:
+        supplemental_rows = list(advanced_rows_map.values())
+        if supplemental_rows:
             self.db.upsert_rows(
                 self.db.team_advanced_metrics,
-                list(advanced_rows_map.values()),
-                ["metric_id"],
+                supplemental_rows,
+                ["season", "week", "team"],
+            )
+
+        skip_keys: Set[Tuple[str, int, str]] = set(
+            (row.get("season"), int(row.get("week") or 0), row.get("team"))
+            for row in supplemental_rows
+            if row.get("team")
+        )
+        skip_keys.update(self.db.fetch_existing_advanced_metric_keys())
+        derived_rows = self._derive_advanced_metrics_from_player_stats(skip_keys)
+        if derived_rows:
+            self.db.upsert_rows(
+                self.db.team_advanced_metrics,
+                derived_rows,
+                ["season", "week", "team"],
             )
 
         # Ingest odds separately as they change frequently (always upsert)
@@ -8778,6 +8920,115 @@ class NFLIngestor:
                     "player_id",
                 ],
             )
+
+    def _derive_advanced_metrics_from_player_stats(
+        self, skip_keys: Set[Tuple[str, int, str]]
+    ) -> List[Dict[str, Any]]:
+        try:
+            player_stats = pd.read_sql_table("nfl_player_stats", self.db.engine)
+        except Exception:
+            logging.exception(
+                "Failed to load player stats for derived advanced metric generation"
+            )
+            return []
+
+        if player_stats.empty:
+            return []
+
+        try:
+            games = pd.read_sql_table(
+                "nfl_games",
+                self.db.engine,
+                columns=["game_id", "season", "week", "home_team", "away_team"],
+            )
+        except Exception:
+            logging.exception(
+                "Failed to load games metadata for derived advanced metric generation"
+            )
+            return []
+
+        if games.empty or "game_id" not in games.columns:
+            return []
+
+        enrichment_cols = [
+            "rushing_attempts",
+            "rushing_yards",
+            "rushing_tds",
+            "receiving_targets",
+            "receiving_yards",
+            "receiving_tds",
+            "passing_attempts",
+            "passing_yards",
+            "passing_tds",
+        ]
+        for col in enrichment_cols:
+            if col not in player_stats.columns:
+                player_stats[col] = 0.0
+
+        merged = player_stats.merge(games, on="game_id", how="left")
+        merged = merged.dropna(subset=["season", "week", "team"])
+        if merged.empty:
+            return []
+
+        merged["season"] = merged["season"].astype(str)
+        merged["week"] = merged["week"].apply(lambda x: int(x) if pd.notna(x) else None)
+        merged = merged.dropna(subset=["week"])
+        if merged.empty:
+            return []
+
+        for col in ("team", "home_team", "away_team"):
+            if col in merged.columns:
+                merged[col] = merged[col].apply(normalize_team_abbr)
+
+        derived = FeatureBuilder._compute_team_unit_strength(merged, None)
+        if derived is None or derived.empty:
+            return []
+
+        derived = derived.replace({np.nan: None})
+        metrics_columns = [
+            "pace_seconds_per_play",
+            "offense_epa",
+            "defense_epa",
+            "offense_success_rate",
+            "defense_success_rate",
+            "offense_yards_per_play",
+            "defense_yards_per_play",
+            "offense_td_rate",
+            "defense_td_rate",
+            "pass_rate",
+            "rush_rate",
+            "pass_rate_over_expectation",
+            "travel_penalty",
+            "rest_penalty",
+            "weather_adjustment",
+        ]
+
+        rows: List[Dict[str, Any]] = []
+        for _, metric_row in derived.iterrows():
+            season = str(metric_row.get("season"))
+            week_val = metric_row.get("week")
+            team = normalize_team_abbr(metric_row.get("team"))
+            if not team:
+                continue
+            if week_val is None or pd.isna(week_val):
+                continue
+            week_int = int(week_val)
+            key = (season, week_int, team)
+            if key in skip_keys:
+                continue
+            row: Dict[str, Any] = {
+                "metric_id": f"derived_{season}_{week_int}_{team}",
+                "season": season,
+                "week": week_int,
+                "team": team,
+            }
+            for col in metrics_columns:
+                row[col] = self._safe_float(metric_row.get(col))
+            rows.append(row)
+
+        if rows:
+            logging.info("Derived %d advanced metric rows from player stats", len(rows))
+        return rows
 
     def _group_msf_injuries(
         self,
@@ -9725,6 +9976,28 @@ class FeatureBuilder:
                 "home_defense_success_rate",
                 "away_defense_success_rate",
             ),
+            "offense_yards_per_play_diff": (
+                "home_offense_yards_per_play",
+                "away_offense_yards_per_play",
+            ),
+            "defense_yards_per_play_diff": (
+                "home_defense_yards_per_play",
+                "away_defense_yards_per_play",
+            ),
+            "offense_td_rate_diff": (
+                "home_offense_td_rate",
+                "away_offense_td_rate",
+            ),
+            "defense_td_rate_diff": (
+                "home_defense_td_rate",
+                "away_defense_td_rate",
+            ),
+            "pass_rate_diff": ("home_pass_rate", "away_pass_rate"),
+            "rush_rate_diff": ("home_rush_rate", "away_rush_rate"),
+            "pass_rate_over_expectation_diff": (
+                "home_pass_rate_over_expectation",
+                "away_pass_rate_over_expectation",
+            ),
             "pace_seconds_diff": (
                 "home_pace_seconds_per_play",
                 "away_pace_seconds_per_play",
@@ -9768,11 +10041,80 @@ class FeatureBuilder:
                 "home_prev_point_diff",
                 "away_prev_point_diff",
             ),
+            "elo_pre_diff": ("home_elo_pre", "away_elo_pre"),
+            "elo_win_prob_diff": ("home_elo_win_prob", "away_elo_win_prob"),
+            "elo_vs_opponent_diff": (
+                "home_elo_vs_opponent",
+                "away_elo_vs_opponent",
+            ),
+            "elo_edge_diff": ("home_elo_edge", "away_elo_edge"),
             "injury_total_diff": ("home_injury_total", "away_injury_total"),
         }
 
         for output, (home_col, away_col) in diff_specs.items():
             _maybe_diff(output, home_col, away_col)
+
+        def _maybe_net(output: str, offense_col: str, defense_col: str) -> None:
+            if offense_col in working.columns and defense_col in working.columns:
+                working[output] = working[offense_col] - working[defense_col]
+
+        net_specs = [
+            ("home_net_epa", "home_offense_epa", "away_defense_epa"),
+            ("away_net_epa", "away_offense_epa", "home_defense_epa"),
+            (
+                "home_net_success_rate",
+                "home_offense_success_rate",
+                "away_defense_success_rate",
+            ),
+            (
+                "away_net_success_rate",
+                "away_offense_success_rate",
+                "home_defense_success_rate",
+            ),
+            (
+                "home_net_yards_per_play",
+                "home_offense_yards_per_play",
+                "away_defense_yards_per_play",
+            ),
+            (
+                "away_net_yards_per_play",
+                "away_offense_yards_per_play",
+                "home_defense_yards_per_play",
+            ),
+            (
+                "home_net_td_rate",
+                "home_offense_td_rate",
+                "away_defense_td_rate",
+            ),
+            (
+                "away_net_td_rate",
+                "away_offense_td_rate",
+                "home_defense_td_rate",
+            ),
+            (
+                "home_pass_matchup",
+                "home_offense_pass_rating",
+                "away_defense_pass_rating",
+            ),
+            (
+                "away_pass_matchup",
+                "away_offense_pass_rating",
+                "home_defense_pass_rating",
+            ),
+            (
+                "home_rush_matchup",
+                "home_offense_rush_rating",
+                "away_defense_rush_rating",
+            ),
+            (
+                "away_rush_matchup",
+                "away_offense_rush_rating",
+                "home_defense_rush_rating",
+            ),
+        ]
+
+        for output, offense_col, defense_col in net_specs:
+            _maybe_net(output, offense_col, defense_col)
 
         # Blend market-implied probabilities via logit difference for better calibration.
         if {
@@ -9788,7 +10130,24 @@ class FeatureBuilder:
 
         # Clip differential features to reduce the impact of extreme outliers. This uses
         # simple winsorization at the 1st/99th percentiles computed from the current frame.
-        diff_columns = list(diff_specs.keys()) + ["implied_prob_logit_diff"]
+        diff_columns = (
+            list(diff_specs.keys())
+            + [
+                "implied_prob_logit_diff",
+                "home_net_epa",
+                "away_net_epa",
+                "home_net_success_rate",
+                "away_net_success_rate",
+                "home_net_yards_per_play",
+                "away_net_yards_per_play",
+                "home_net_td_rate",
+                "away_net_td_rate",
+                "home_pass_matchup",
+                "away_pass_matchup",
+                "home_rush_matchup",
+                "away_rush_matchup",
+            ]
+        )
         numeric_diff_columns = [col for col in diff_columns if col in working.columns]
         if numeric_diff_columns:
             diff_subset = working[numeric_diff_columns]
@@ -10640,6 +10999,13 @@ class FeatureBuilder:
                     "defense_epa": "opp_defense_epa",
                     "offense_success_rate": "opp_offense_success_rate",
                     "defense_success_rate": "opp_defense_success_rate",
+                    "offense_yards_per_play": "opp_offense_yards_per_play",
+                    "defense_yards_per_play": "opp_defense_yards_per_play",
+                    "offense_td_rate": "opp_offense_td_rate",
+                    "defense_td_rate": "opp_defense_td_rate",
+                    "pass_rate": "opp_pass_rate",
+                    "rush_rate": "opp_rush_rate",
+                    "pass_rate_over_expectation": "opp_pass_rate_over_expectation",
                     "travel_penalty": "opp_travel_penalty",
                     "rest_penalty": "opp_rest_penalty",
                     "weather_adjustment": "opp_weather_adjustment",
@@ -10893,6 +11259,13 @@ class FeatureBuilder:
                 "defense_epa": "home_defense_epa",
                 "offense_success_rate": "home_offense_success_rate",
                 "defense_success_rate": "home_defense_success_rate",
+                "offense_yards_per_play": "home_offense_yards_per_play",
+                "defense_yards_per_play": "home_defense_yards_per_play",
+                "offense_td_rate": "home_offense_td_rate",
+                "defense_td_rate": "home_defense_td_rate",
+                "pass_rate": "home_pass_rate",
+                "rush_rate": "home_rush_rate",
+                "pass_rate_over_expectation": "home_pass_rate_over_expectation",
                 "travel_penalty": "home_travel_penalty",
                 "rest_penalty": "home_rest_penalty",
                 "weather_adjustment": "home_weather_adjustment",
@@ -10911,6 +11284,13 @@ class FeatureBuilder:
                 "defense_epa": "away_defense_epa",
                 "offense_success_rate": "away_offense_success_rate",
                 "defense_success_rate": "away_defense_success_rate",
+                "offense_yards_per_play": "away_offense_yards_per_play",
+                "defense_yards_per_play": "away_defense_yards_per_play",
+                "offense_td_rate": "away_offense_td_rate",
+                "defense_td_rate": "away_defense_td_rate",
+                "pass_rate": "away_pass_rate",
+                "rush_rate": "away_rush_rate",
+                "pass_rate_over_expectation": "away_pass_rate_over_expectation",
                 "travel_penalty": "away_travel_penalty",
                 "rest_penalty": "away_rest_penalty",
                 "weather_adjustment": "away_weather_adjustment",
@@ -10935,6 +11315,12 @@ class FeatureBuilder:
                 "rest_penalty": "home_rest_penalty",
                 "travel_penalty": "home_travel_penalty_hist",
                 "timezone_diff_hours": "home_timezone_diff_hours",
+                "team_elo_pre": "home_elo_pre",
+                "team_elo_post": "home_elo_post",
+                "team_elo_change": "home_elo_change",
+                "team_elo_win_prob": "home_elo_win_prob",
+                "team_elo_vs_opponent": "home_elo_vs_opponent",
+                "opponent_elo_pre": "home_opponent_elo_pre",
             }
         )
 
@@ -10955,6 +11341,12 @@ class FeatureBuilder:
                 "rest_penalty": "away_rest_penalty",
                 "travel_penalty": "away_travel_penalty_hist",
                 "timezone_diff_hours": "away_timezone_diff_hours",
+                "team_elo_pre": "away_elo_pre",
+                "team_elo_post": "away_elo_post",
+                "team_elo_change": "away_elo_change",
+                "team_elo_win_prob": "away_elo_win_prob",
+                "team_elo_vs_opponent": "away_elo_vs_opponent",
+                "opponent_elo_pre": "away_opponent_elo_pre",
             }
         )
 
@@ -10972,6 +11364,8 @@ class FeatureBuilder:
             .merge(home_history, on="game_id", how="left")
             .merge(away_history, on="game_id", how="left")
         )
+
+        games_context = self._augment_matchup_features(games_context)
 
         if "home_travel_penalty" not in games_context.columns:
             games_context["home_travel_penalty"] = np.nan
@@ -11007,6 +11401,30 @@ class FeatureBuilder:
                     games_context[col], errors="coerce"
                 ).fillna(0.0)
 
+        elo_cols = [
+            "home_elo_pre",
+            "home_elo_post",
+            "home_elo_change",
+            "home_elo_win_prob",
+            "home_elo_vs_opponent",
+            "home_opponent_elo_pre",
+            "home_elo_edge",
+            "away_elo_pre",
+            "away_elo_post",
+            "away_elo_change",
+            "away_elo_win_prob",
+            "away_elo_vs_opponent",
+            "away_opponent_elo_pre",
+            "away_elo_edge",
+        ]
+        for col in elo_cols:
+            if col in games_context.columns:
+                games_context[col] = pd.to_numeric(
+                    games_context[col], errors="coerce"
+                )
+            else:
+                games_context[col] = np.nan
+
         games_context["moneyline_diff"] = games_context["home_moneyline"] - games_context["away_moneyline"]
         games_context["implied_prob_diff"] = (
             games_context["home_implied_prob"] - games_context["away_implied_prob"]
@@ -11014,6 +11432,22 @@ class FeatureBuilder:
         games_context["implied_prob_sum"] = (
             games_context["home_implied_prob"] + games_context["away_implied_prob"]
         )
+
+        if {
+            "home_elo_win_prob",
+            "away_elo_win_prob",
+            "home_implied_prob",
+            "away_implied_prob",
+        }.issubset(games_context.columns):
+            games_context["home_elo_edge"] = (
+                games_context["home_elo_win_prob"] - games_context["home_implied_prob"]
+            )
+            games_context["away_elo_edge"] = (
+                games_context["away_elo_win_prob"] - games_context["away_implied_prob"]
+            )
+        else:
+            games_context["home_elo_edge"] = np.nan
+            games_context["away_elo_edge"] = np.nan
 
         games_context["point_diff"] = games_context["home_score"] - games_context["away_score"]
         self.games_frame = games_context.copy()
@@ -11142,6 +11576,13 @@ class FeatureBuilder:
             "home_defense_epa": np.nan,
             "home_offense_success_rate": np.nan,
             "home_defense_success_rate": np.nan,
+            "home_offense_yards_per_play": np.nan,
+            "home_defense_yards_per_play": np.nan,
+            "home_offense_td_rate": np.nan,
+            "home_defense_td_rate": np.nan,
+            "home_pass_rate": np.nan,
+            "home_rush_rate": np.nan,
+            "home_pass_rate_over_expectation": np.nan,
             "home_travel_penalty": np.nan,
             "home_rest_penalty": np.nan,
             "home_weather_adjustment": np.nan,
@@ -11156,6 +11597,13 @@ class FeatureBuilder:
             "away_defense_epa": np.nan,
             "away_offense_success_rate": np.nan,
             "away_defense_success_rate": np.nan,
+            "away_offense_yards_per_play": np.nan,
+            "away_defense_yards_per_play": np.nan,
+            "away_offense_td_rate": np.nan,
+            "away_defense_td_rate": np.nan,
+            "away_pass_rate": np.nan,
+            "away_rush_rate": np.nan,
+            "away_pass_rate_over_expectation": np.nan,
             "away_travel_penalty": np.nan,
             "away_rest_penalty": np.nan,
             "away_weather_adjustment": np.nan,
@@ -11170,6 +11618,13 @@ class FeatureBuilder:
             "home_prev_point_diff": np.nan,
             "home_rest_days": np.nan,
             "home_injury_total": 0.0,
+            "home_elo_pre": np.nan,
+            "home_elo_post": np.nan,
+            "home_elo_change": np.nan,
+            "home_elo_win_prob": np.nan,
+            "home_elo_vs_opponent": np.nan,
+            "home_opponent_elo_pre": np.nan,
+            "home_elo_edge": np.nan,
             "away_points_for_avg": np.nan,
             "away_points_against_avg": np.nan,
             "away_point_diff_avg": np.nan,
@@ -11178,6 +11633,13 @@ class FeatureBuilder:
             "away_prev_points_against": np.nan,
             "away_prev_point_diff": np.nan,
             "away_rest_days": np.nan,
+            "away_elo_pre": np.nan,
+            "away_elo_post": np.nan,
+            "away_elo_change": np.nan,
+            "away_elo_win_prob": np.nan,
+            "away_elo_vs_opponent": np.nan,
+            "away_opponent_elo_pre": np.nan,
+            "away_elo_edge": np.nan,
             "away_injury_total": 0.0,
             "offense_pass_rating_diff": 0.0,
             "offense_rush_rating_diff": 0.0,
@@ -11187,6 +11649,13 @@ class FeatureBuilder:
             "defense_epa_diff": 0.0,
             "offense_success_rate_diff": 0.0,
             "defense_success_rate_diff": 0.0,
+            "offense_yards_per_play_diff": 0.0,
+            "defense_yards_per_play_diff": 0.0,
+            "offense_td_rate_diff": 0.0,
+            "defense_td_rate_diff": 0.0,
+            "pass_rate_diff": 0.0,
+            "rush_rate_diff": 0.0,
+            "pass_rate_over_expectation_diff": 0.0,
             "pace_seconds_diff": 0.0,
             "travel_penalty_diff": 0.0,
             "rest_penalty_diff": 0.0,
@@ -11202,12 +11671,32 @@ class FeatureBuilder:
             "prev_point_diff_diff": 0.0,
             "injury_total_diff": 0.0,
             "implied_prob_logit_diff": 0.0,
+            "home_net_epa": 0.0,
+            "away_net_epa": 0.0,
+            "home_net_success_rate": 0.0,
+            "away_net_success_rate": 0.0,
+            "home_net_yards_per_play": 0.0,
+            "away_net_yards_per_play": 0.0,
+            "home_net_td_rate": 0.0,
+            "away_net_td_rate": 0.0,
+            "home_pass_matchup": 0.0,
+            "away_pass_matchup": 0.0,
+            "home_rush_matchup": 0.0,
+            "away_rush_matchup": 0.0,
             "wind_mph": np.nan,
             "humidity": np.nan,
         }
-        for col, default in numeric_placeholders.items():
-            if col not in features.columns:
-                features[col] = default
+        missing_numeric_cols = {
+            col: default
+            for col, default in numeric_placeholders.items()
+            if col not in features.columns
+        }
+        if missing_numeric_cols:
+            filler = pd.DataFrame(
+                {col: default for col, default in missing_numeric_cols.items()},
+                index=features.index,
+            )
+            features = pd.concat([features, filler], axis=1)
 
         loader = getattr(self, "supplemental_loader", None)
         travel_context = None
@@ -11281,6 +11770,19 @@ class FeatureBuilder:
                     features.at[idx, "home_defense_epa"] = strength.get("defense_epa")
                     features.at[idx, "home_offense_success_rate"] = strength.get("offense_success_rate")
                     features.at[idx, "home_defense_success_rate"] = strength.get("defense_success_rate")
+                    features.at[idx, "home_offense_yards_per_play"] = strength.get(
+                        "offense_yards_per_play"
+                    )
+                    features.at[idx, "home_defense_yards_per_play"] = strength.get(
+                        "defense_yards_per_play"
+                    )
+                    features.at[idx, "home_offense_td_rate"] = strength.get("offense_td_rate")
+                    features.at[idx, "home_defense_td_rate"] = strength.get("defense_td_rate")
+                    features.at[idx, "home_pass_rate"] = strength.get("pass_rate")
+                    features.at[idx, "home_rush_rate"] = strength.get("rush_rate")
+                    features.at[idx, "home_pass_rate_over_expectation"] = strength.get(
+                        "pass_rate_over_expectation"
+                    )
                     features.at[idx, "home_travel_penalty"] = strength.get("travel_penalty")
                     features.at[idx, "home_rest_penalty"] = strength.get("rest_penalty")
                     features.at[idx, "home_weather_adjustment"] = strength.get("weather_adjustment")
@@ -11301,6 +11803,12 @@ class FeatureBuilder:
                         features.at[idx, "home_travel_penalty"] = history.get("travel_penalty")
                     if pd.isna(features.at[idx, "home_timezone_diff_hours"]):
                         features.at[idx, "home_timezone_diff_hours"] = history.get("timezone_diff_hours")
+                    latest_elo = history.get("team_elo_post")
+                    if pd.isna(latest_elo):
+                        latest_elo = history.get("team_elo_pre")
+                    features.at[idx, "home_elo_pre"] = latest_elo
+                    features.at[idx, "home_elo_post"] = latest_elo
+                    features.at[idx, "home_elo_change"] = history.get("team_elo_change")
 
                 fallback_home = self._fallback_team_context(
                     home_team,
@@ -11330,6 +11838,19 @@ class FeatureBuilder:
                     features.at[idx, "away_defense_epa"] = strength.get("defense_epa")
                     features.at[idx, "away_offense_success_rate"] = strength.get("offense_success_rate")
                     features.at[idx, "away_defense_success_rate"] = strength.get("defense_success_rate")
+                    features.at[idx, "away_offense_yards_per_play"] = strength.get(
+                        "offense_yards_per_play"
+                    )
+                    features.at[idx, "away_defense_yards_per_play"] = strength.get(
+                        "defense_yards_per_play"
+                    )
+                    features.at[idx, "away_offense_td_rate"] = strength.get("offense_td_rate")
+                    features.at[idx, "away_defense_td_rate"] = strength.get("defense_td_rate")
+                    features.at[idx, "away_pass_rate"] = strength.get("pass_rate")
+                    features.at[idx, "away_rush_rate"] = strength.get("rush_rate")
+                    features.at[idx, "away_pass_rate_over_expectation"] = strength.get(
+                        "pass_rate_over_expectation"
+                    )
                     features.at[idx, "away_travel_penalty"] = strength.get("travel_penalty")
                     features.at[idx, "away_rest_penalty"] = strength.get("rest_penalty")
                     features.at[idx, "away_weather_adjustment"] = strength.get("weather_adjustment")
@@ -11350,6 +11871,12 @@ class FeatureBuilder:
                         features.at[idx, "away_travel_penalty"] = history.get("travel_penalty")
                     if pd.isna(features.at[idx, "away_timezone_diff_hours"]):
                         features.at[idx, "away_timezone_diff_hours"] = history.get("timezone_diff_hours")
+                    latest_elo = history.get("team_elo_post")
+                    if pd.isna(latest_elo):
+                        latest_elo = history.get("team_elo_pre")
+                    features.at[idx, "away_elo_pre"] = latest_elo
+                    features.at[idx, "away_elo_post"] = latest_elo
+                    features.at[idx, "away_elo_change"] = history.get("team_elo_change")
 
                 fallback_away = self._fallback_team_context(
                     away_team,
@@ -11367,14 +11894,47 @@ class FeatureBuilder:
                     if target_col in features.columns and pd.isna(features.at[idx, target_col]):
                         features.at[idx, target_col] = value
 
+        def _elo_expected(home_rating: float, away_rating: float) -> float:
+            return 1.0 / (1.0 + 10 ** ((away_rating - (home_rating + 55.0)) / 400.0))
+
+        if {"home_elo_pre", "away_elo_pre"}.issubset(features.columns):
+            mask = features["home_elo_pre"].notna() & features["away_elo_pre"].notna()
+            if mask.any():
+                home_ratings = features.loc[mask, "home_elo_pre"].astype(float)
+                away_ratings = features.loc[mask, "away_elo_pre"].astype(float)
+                expected = home_ratings.combine(away_ratings, _elo_expected)
+                features.loc[mask, "home_elo_win_prob"] = expected
+                features.loc[mask, "away_elo_win_prob"] = 1.0 - expected
+                features.loc[mask, "home_elo_vs_opponent"] = home_ratings - away_ratings
+                features.loc[mask, "away_elo_vs_opponent"] = away_ratings - home_ratings
+                features.loc[mask, "home_opponent_elo_pre"] = away_ratings
+                features.loc[mask, "away_opponent_elo_pre"] = home_ratings
+                if "home_implied_prob" in features.columns:
+                    features.loc[mask, "home_elo_edge"] = (
+                        features.loc[mask, "home_elo_win_prob"]
+                        - features.loc[mask, "home_implied_prob"].astype(float)
+                    )
+                if "away_implied_prob" in features.columns:
+                    features.loc[mask, "away_elo_edge"] = (
+                        features.loc[mask, "away_elo_win_prob"]
+                        - features.loc[mask, "away_implied_prob"].astype(float)
+                    )
+
         features = self._augment_matchup_features(features)
 
         fill_defaults = {col: 0.0 for col in numeric_placeholders.keys()}
-        features[list(fill_defaults.keys())] = features[list(fill_defaults.keys())].fillna(fill_defaults)
+        features[list(fill_defaults.keys())] = features[list(fill_defaults.keys())].fillna(
+            fill_defaults
+        )
 
-        features["moneyline_diff"] = features["home_moneyline"] - features["away_moneyline"]
-        features["implied_prob_diff"] = features["home_implied_prob"] - features["away_implied_prob"]
-        features["implied_prob_sum"] = features["home_implied_prob"] + features["away_implied_prob"]
+        derived_numeric_cols = {
+            "moneyline_diff": features["home_moneyline"] - features["away_moneyline"],
+            "implied_prob_diff": features["home_implied_prob"]
+            - features["away_implied_prob"],
+            "implied_prob_sum": features["home_implied_prob"]
+            + features["away_implied_prob"],
+        }
+        features = features.assign(**derived_numeric_cols)
 
         return features
 
@@ -12183,6 +12743,15 @@ class FeatureBuilder:
                         row_copy["defense_epa"] = strength.get("defense_epa")
                         row_copy["offense_success_rate"] = strength.get("offense_success_rate")
                         row_copy["defense_success_rate"] = strength.get("defense_success_rate")
+                        row_copy["offense_yards_per_play"] = strength.get("offense_yards_per_play")
+                        row_copy["defense_yards_per_play"] = strength.get("defense_yards_per_play")
+                        row_copy["offense_td_rate"] = strength.get("offense_td_rate")
+                        row_copy["defense_td_rate"] = strength.get("defense_td_rate")
+                        row_copy["pass_rate"] = strength.get("pass_rate")
+                        row_copy["rush_rate"] = strength.get("rush_rate")
+                        row_copy["pass_rate_over_expectation"] = strength.get(
+                            "pass_rate_over_expectation"
+                        )
                         row_copy["travel_penalty"] = strength.get("travel_penalty")
                         row_copy["rest_penalty"] = strength.get("rest_penalty")
                         row_copy["weather_adjustment"] = strength.get("weather_adjustment")
@@ -12221,6 +12790,19 @@ class FeatureBuilder:
                         row_copy["opp_defense_epa"] = opp_strength.get("defense_epa")
                         row_copy["opp_offense_success_rate"] = opp_strength.get("offense_success_rate")
                         row_copy["opp_defense_success_rate"] = opp_strength.get("defense_success_rate")
+                        row_copy["opp_offense_yards_per_play"] = opp_strength.get(
+                            "offense_yards_per_play"
+                        )
+                        row_copy["opp_defense_yards_per_play"] = opp_strength.get(
+                            "defense_yards_per_play"
+                        )
+                        row_copy["opp_offense_td_rate"] = opp_strength.get("offense_td_rate")
+                        row_copy["opp_defense_td_rate"] = opp_strength.get("defense_td_rate")
+                        row_copy["opp_pass_rate"] = opp_strength.get("pass_rate")
+                        row_copy["opp_rush_rate"] = opp_strength.get("rush_rate")
+                        row_copy["opp_pass_rate_over_expectation"] = opp_strength.get(
+                            "pass_rate_over_expectation"
+                        )
                         row_copy["opp_travel_penalty"] = opp_strength.get("travel_penalty")
                         row_copy["opp_rest_penalty"] = opp_strength.get("rest_penalty")
                         row_copy["opp_weather_adjustment"] = opp_strength.get("weather_adjustment")
@@ -12308,8 +12890,9 @@ class FeatureBuilder:
 
         return player_features
 
+    @staticmethod
     def _compute_team_unit_strength(
-        self, player_stats: pd.DataFrame, advanced_metrics: Optional[pd.DataFrame] = None
+        player_stats: pd.DataFrame, advanced_metrics: Optional[pd.DataFrame] = None
     ) -> pd.DataFrame:
         base_columns = [
             "season",
@@ -12324,6 +12907,13 @@ class FeatureBuilder:
             "defense_epa",
             "offense_success_rate",
             "defense_success_rate",
+            "offense_yards_per_play",
+            "defense_yards_per_play",
+            "offense_td_rate",
+            "defense_td_rate",
+            "pass_rate",
+            "rush_rate",
+            "pass_rate_over_expectation",
             "travel_penalty",
             "rest_penalty",
             "weather_adjustment",
@@ -12382,11 +12972,16 @@ class FeatureBuilder:
                 opp_receiving_targets=pd.NamedAgg(column="receiving_targets", aggfunc="sum"),
                 opp_passing_yards=pd.NamedAgg(column="passing_yards", aggfunc="sum"),
                 opp_passing_attempts=pd.NamedAgg(column="passing_attempts", aggfunc="sum"),
+                opp_rushing_tds=pd.NamedAgg(column="rushing_tds", aggfunc="sum"),
+                opp_passing_tds=pd.NamedAgg(column="passing_tds", aggfunc="sum"),
             )
             .rename(columns={"opponent": "team"})
         )
 
         merged = offense.merge(defense, on=["season", "week", "team"], how="left")
+        for td_col in ("opp_rushing_tds", "opp_passing_tds"):
+            if td_col not in merged.columns:
+                merged[td_col] = np.nan
         merged["plays"] = merged["rushing_attempts"] + merged["passing_attempts"]
         merged["yards_per_play"] = np.where(
             merged["plays"] > 0,
@@ -12406,6 +13001,22 @@ class FeatureBuilder:
         merged["pace_seconds_per_play"] = np.where(
             merged["plays"] > 0,
             3600.0 / merged["plays"],
+            np.nan,
+        )
+        merged["offense_yards_per_play"] = merged["yards_per_play"]
+        merged["pass_rate"] = np.where(
+            merged["plays"] > 0,
+            merged["passing_attempts"] / merged["plays"],
+            np.nan,
+        )
+        merged["rush_rate"] = np.where(
+            merged["plays"] > 0,
+            merged["rushing_attempts"] / merged["plays"],
+            np.nan,
+        )
+        merged["offense_td_rate"] = np.where(
+            merged["plays"] > 0,
+            (merged["rushing_tds"] + merged["passing_tds"]) / merged["plays"],
             np.nan,
         )
 
@@ -12442,10 +13053,36 @@ class FeatureBuilder:
             0,
             1,
         )
+        merged["defense_yards_per_play"] = np.where(
+            (merged["opp_rushing_attempts"] + merged["opp_passing_attempts"]) > 0,
+            (merged["opp_rushing_yards"] + merged["opp_passing_yards"]) /
+            (merged["opp_rushing_attempts"] + merged["opp_passing_attempts"]),
+            np.nan,
+        )
+        total_allowed_tds = (
+            merged["opp_rushing_tds"].fillna(0.0) + merged["opp_passing_tds"].fillna(0.0)
+        )
+        merged["defense_td_rate"] = np.where(
+            (merged["opp_rushing_attempts"] + merged["opp_passing_attempts"]) > 0,
+            total_allowed_tds
+            / (merged["opp_rushing_attempts"] + merged["opp_passing_attempts"]),
+            np.nan,
+        )
 
         league = (
             merged.groupby(["season", "week"], as_index=False)[
-                ["rush_per_attempt", "pass_per_attempt", "allowed_rush_per_attempt", "allowed_pass_per_attempt", "yards_per_play"]
+                [
+                    "rush_per_attempt",
+                    "pass_per_attempt",
+                    "allowed_rush_per_attempt",
+                    "allowed_pass_per_attempt",
+                    "yards_per_play",
+                    "defense_yards_per_play",
+                    "pass_rate",
+                    "rush_rate",
+                    "offense_td_rate",
+                    "defense_td_rate",
+                ]
             ]
             .mean()
             .rename(
@@ -12455,6 +13092,11 @@ class FeatureBuilder:
                     "allowed_rush_per_attempt": "league_allowed_rush_per_attempt",
                     "allowed_pass_per_attempt": "league_allowed_pass_per_attempt",
                     "yards_per_play": "league_yards_per_play",
+                    "defense_yards_per_play": "league_defense_yards_per_play",
+                    "pass_rate": "league_pass_rate",
+                    "rush_rate": "league_rush_rate",
+                    "offense_td_rate": "league_offense_td_rate",
+                    "defense_td_rate": "league_defense_td_rate",
                 }
             )
         )
@@ -12472,6 +13114,7 @@ class FeatureBuilder:
         merged["defense_pass_rating"] = (
             merged["league_allowed_pass_per_attempt"] - merged["allowed_pass_per_attempt"]
         )
+        merged["pass_rate_over_expectation"] = merged["pass_rate"] - merged["league_pass_rate"]
 
         merged["offense_epa"] = merged["offense_pass_rating"] + merged["offense_rush_rating"]
         merged["defense_epa"] = merged["defense_pass_rating"] + merged["defense_rush_rating"]
@@ -12495,6 +13138,13 @@ class FeatureBuilder:
             "defense_epa",
             "offense_success_rate",
             "defense_success_rate",
+            "offense_yards_per_play",
+            "defense_yards_per_play",
+            "offense_td_rate",
+            "defense_td_rate",
+            "pass_rate",
+            "rush_rate",
+            "pass_rate_over_expectation",
             "travel_penalty",
             "rest_penalty",
             "weather_adjustment",
@@ -12513,6 +13163,13 @@ class FeatureBuilder:
                 "defense_epa",
                 "offense_success_rate",
                 "defense_success_rate",
+                "offense_yards_per_play",
+                "defense_yards_per_play",
+                "offense_td_rate",
+                "defense_td_rate",
+                "pass_rate",
+                "rush_rate",
+                "pass_rate_over_expectation",
                 "travel_penalty",
                 "rest_penalty",
                 "weather_adjustment",
@@ -12540,6 +13197,13 @@ class FeatureBuilder:
                     "defense_epa",
                     "offense_success_rate",
                     "defense_success_rate",
+                    "offense_yards_per_play",
+                    "defense_yards_per_play",
+                    "offense_td_rate",
+                    "defense_td_rate",
+                    "pass_rate",
+                    "rush_rate",
+                    "pass_rate_over_expectation",
                     "travel_penalty",
                     "rest_penalty",
                     "weather_adjustment",
@@ -12581,8 +13245,103 @@ class FeatureBuilder:
         )
         return context
 
+    @staticmethod
+    def _compute_game_elo_history(games: pd.DataFrame) -> pd.DataFrame:
+        if games.empty:
+            return pd.DataFrame(
+                columns=[
+                    "game_id",
+                    "team",
+                    "opponent",
+                    "team_elo_pre",
+                    "team_elo_post",
+                    "team_elo_change",
+                    "team_elo_win_prob",
+                    "team_elo_vs_opponent",
+                    "opponent_elo_pre",
+                ]
+            )
+
+        ratings: Dict[str, float] = defaultdict(lambda: 1500.0)
+        home_field_advantage = 55.0
+        k_factor = 20.0
+        records: List[Dict[str, Any]] = []
+
+        working = games.copy()
+        working["start_time"] = pd.to_datetime(working["start_time"], utc=True, errors="coerce")
+        working = working.sort_values("start_time")
+
+        def _expected(r_a: float, r_b: float) -> float:
+            return 1.0 / (1.0 + 10 ** ((r_b - r_a) / 400.0))
+
+        def _margin_multiplier(point_diff: float, rating_gap: float) -> float:
+            diff_abs = abs(point_diff)
+            if diff_abs <= 0:
+                return 1.0
+            scaled_gap = max(0.0, abs(rating_gap))
+            return math.log(diff_abs + 1.0) * (2.2 / ((scaled_gap * 0.001) + 2.2))
+
+        for row in working.itertuples(index=False):
+            home_team = normalize_team_abbr(getattr(row, "home_team", None))
+            away_team = normalize_team_abbr(getattr(row, "away_team", None))
+            if not home_team or not away_team:
+                continue
+
+            home_rating = ratings[home_team]
+            away_rating = ratings[away_team]
+
+            expected_home = _expected(home_rating + home_field_advantage, away_rating)
+            expected_away = 1.0 - expected_home
+
+            home_post = home_rating
+            away_post = away_rating
+
+            home_score = getattr(row, "home_score", np.nan)
+            away_score = getattr(row, "away_score", np.nan)
+            if pd.notna(home_score) and pd.notna(away_score):
+                point_diff = float(home_score) - float(away_score)
+                result_home = 1.0 if point_diff > 0 else (0.0 if point_diff < 0 else 0.5)
+                result_away = 1.0 - result_home
+                margin_mult = _margin_multiplier(point_diff, home_rating - away_rating)
+                home_post = home_rating + k_factor * margin_mult * (result_home - expected_home)
+                away_post = away_rating + k_factor * margin_mult * (result_away - expected_away)
+                ratings[home_team] = home_post
+                ratings[away_team] = away_post
+
+            records.append(
+                {
+                    "game_id": getattr(row, "game_id", None),
+                    "team": home_team,
+                    "opponent": away_team,
+                    "team_elo_pre": home_rating,
+                    "team_elo_post": home_post,
+                    "team_elo_win_prob": expected_home,
+                    "opponent_elo_pre": away_rating,
+                }
+            )
+            records.append(
+                {
+                    "game_id": getattr(row, "game_id", None),
+                    "team": away_team,
+                    "opponent": home_team,
+                    "team_elo_pre": away_rating,
+                    "team_elo_post": away_post,
+                    "team_elo_win_prob": expected_away,
+                    "opponent_elo_pre": home_rating,
+                }
+            )
+
+        elo_df = pd.DataFrame.from_records(records)
+        if elo_df.empty:
+            return elo_df
+
+        elo_df["team_elo_change"] = elo_df["team_elo_post"] - elo_df["team_elo_pre"]
+        elo_df["team_elo_vs_opponent"] = elo_df["team_elo_pre"] - elo_df["opponent_elo_pre"]
+        return elo_df
+
     def _compute_team_game_rolling_stats(self, games: pd.DataFrame) -> pd.DataFrame:
         """Create rolling scoring, travel, and rest indicators for each team game."""
+
 
         base_columns = [
             "game_id",
@@ -12603,6 +13362,12 @@ class FeatureBuilder:
             "rest_penalty",
             "timezone_diff_hours",
             "travel_penalty",
+            "team_elo_pre",
+            "team_elo_post",
+            "team_elo_change",
+            "team_elo_win_prob",
+            "team_elo_vs_opponent",
+            "opponent_elo_pre",
         ]
 
         if games.empty:
@@ -12695,6 +13460,26 @@ class FeatureBuilder:
             "game_id",
         ]).reset_index(drop=True)
 
+        elo_history = self._compute_game_elo_history(games)
+        if elo_history.empty:
+            for col in [
+                "team_elo_pre",
+                "team_elo_post",
+                "team_elo_change",
+                "team_elo_win_prob",
+                "team_elo_vs_opponent",
+                "opponent_elo_pre",
+            ]:
+                team_games[col] = np.nan
+        else:
+            elo_history["team"] = elo_history["team"].apply(normalize_team_abbr)
+            elo_history["opponent"] = elo_history["opponent"].apply(normalize_team_abbr)
+            team_games = team_games.merge(
+                elo_history,
+                on=["game_id", "team", "opponent"],
+                how="left",
+            )
+
         def compute_group(group: pd.DataFrame) -> pd.DataFrame:
             group = group.sort_values("start_time").copy()
             win_flag = np.where(
@@ -12779,6 +13564,93 @@ class ModelTrainer:
         self.special_models: Dict[str, Dict[str, Any]] = {}
         self.feature_column_map: Dict[str, List[str]] = {}
         self.supplemental_loader = supplemental_loader
+
+    @staticmethod
+    def _build_confidence_profile(
+        margins: np.ndarray, correct_mask: np.ndarray, bucket_quantiles: Sequence[float] = (0.33, 0.66)
+    ) -> Optional[Dict[str, Any]]:
+        """Summarize how accuracy varies with probability margins."""
+
+        if margins.size == 0 or correct_mask.size == 0:
+            return None
+
+        valid = np.isfinite(margins) & np.isfinite(correct_mask)
+        if not valid.any():
+            return None
+
+        margins = margins[valid]
+        correct_mask = correct_mask[valid]
+        correct_mask = correct_mask.astype(int)
+
+        try:
+            quantiles = np.quantile(margins, bucket_quantiles)
+        except Exception:
+            quantiles = []
+
+        quantiles = [float(q) for q in quantiles if math.isfinite(q)]
+        if not quantiles:
+            quantiles = [0.1, 0.2]
+
+        thresholds = [0.0]
+        for value in quantiles:
+            if value > thresholds[-1]:
+                thresholds.append(value)
+        thresholds.append(float("inf"))
+
+        # Ensure strictly increasing cutpoints
+        for idx in range(1, len(thresholds)):
+            if thresholds[idx] <= thresholds[idx - 1]:
+                thresholds[idx] = thresholds[idx - 1] + 1e-6
+
+        bucket_labels = ["low", "medium", "high"][: len(thresholds) - 1]
+        buckets: List[Dict[str, Any]] = []
+        for label, lower, upper in zip(bucket_labels, thresholds[:-1], thresholds[1:]):
+            mask = (margins >= lower) & (margins < upper)
+            count = int(mask.sum())
+            accuracy = float(correct_mask[mask].mean()) if count > 0 else float("nan")
+            buckets.append(
+                {
+                    "label": label,
+                    "lower": float(lower),
+                    "upper": float(upper),
+                    "accuracy": accuracy,
+                    "count": count,
+                }
+            )
+
+        preferred_label = bucket_labels[-1] if bucket_labels else None
+        margin_threshold = thresholds[-2] if len(thresholds) >= 2 else 0.2
+
+        edge_threshold = max(0.03, float(margin_threshold) / 2.0)
+
+        return {
+            "thresholds": thresholds[: len(bucket_labels) + 1],
+            "buckets": buckets,
+            "preferred_label": preferred_label,
+            "margin_threshold": float(margin_threshold),
+            "edge_threshold": float(edge_threshold),
+        }
+
+    @staticmethod
+    def _build_error_profile(errors: np.ndarray) -> Optional[Dict[str, float]]:
+        if errors.size == 0:
+            return None
+
+        errors = errors[np.isfinite(errors)]
+        if errors.size == 0:
+            return None
+
+        quantile_levels = [0.5, 0.8, 0.9, 0.95]
+        profile = {
+            "mean": float(np.mean(errors)),
+            "median": float(np.median(errors)),
+        }
+        for level in quantile_levels:
+            try:
+                profile[f"q{int(level * 100)}"] = float(np.quantile(errors, level))
+            except Exception:
+                profile[f"q{int(level * 100)}"] = float("nan")
+        return profile
 
     @staticmethod
     def _is_lineup_starter(position: str, rank: Optional[int]) -> bool:
@@ -15491,6 +16363,24 @@ class ModelTrainer:
             f"{winner_brier:.3f}" if not np.isnan(winner_brier) else "nan",
         )
 
+        winner_margin = np.abs(winner_proba - 0.5)
+        confidence_profile = self._build_confidence_profile(
+            winner_margin, (winner_pred == y_winner_test).astype(int)
+        )
+        if confidence_profile:
+            entry = self.special_models.get("game_winner", {}).copy()
+            entry["confidence_profile"] = confidence_profile
+            self.special_models["game_winner"] = entry
+            for bucket in confidence_profile.get("buckets", []):
+                logging.info(
+                    "Winner confidence bucket %-6s | margin >= %.3f < %.3f | accuracy=%s | n=%d",
+                    bucket.get("label"),
+                    bucket.get("lower", float("nan")),
+                    bucket.get("upper", float("nan")),
+                    f"{bucket.get('accuracy'):.3f}" if bucket.get("accuracy") is not None else "nan",
+                    bucket.get("count", 0),
+                )
+
         home_pred = final_home.predict(X_test)
         home_r2 = final_home.score(X_test, y_home_test)
         home_mae = mean_absolute_error(y_home_test, home_pred)
@@ -15512,6 +16402,30 @@ class ModelTrainer:
             away_mae,
             away_rmse,
         )
+
+        home_error_profile = self._build_error_profile(np.abs(home_pred - y_home_test))
+        if home_error_profile:
+            entry = self.special_models.get("home_points", {}).copy()
+            entry["error_profile"] = home_error_profile
+            self.special_models["home_points"] = entry
+            logging.info(
+                "Home score error profile | median=%.2f | q80=%.2f | q95=%.2f",
+                home_error_profile.get("median", float("nan")),
+                home_error_profile.get("q80", float("nan")),
+                home_error_profile.get("q95", float("nan")),
+            )
+
+        away_error_profile = self._build_error_profile(np.abs(away_pred - y_away_test))
+        if away_error_profile:
+            entry = self.special_models.get("away_points", {}).copy()
+            entry["error_profile"] = away_error_profile
+            self.special_models["away_points"] = entry
+            logging.info(
+                "Away score error profile | median=%.2f | q80=%.2f | q95=%.2f",
+                away_error_profile.get("median", float("nan")),
+                away_error_profile.get("q80", float("nan")),
+                away_error_profile.get("q95", float("nan")),
+            )
 
         # Supplemental Poisson totals model for pricing
         try:
@@ -16284,6 +17198,7 @@ def predict_upcoming_games(
     home_predictions = models["home_points"].predict(home_features)
     winner_probs = models["game_winner"].predict_proba(winner_features)[:, 1]
 
+    specials: Dict[str, Any] = {}
     if trainer is not None:
         try:
             specials = getattr(trainer, "special_models", {}) or {}
@@ -16311,6 +17226,90 @@ def predict_upcoming_games(
     scoreboard["away_score"] = away_predictions
     scoreboard["home_score"] = home_predictions
     scoreboard["home_win_probability"] = winner_probs
+    scoreboard["home_win_margin"] = (scoreboard["home_win_probability"] - 0.5).abs()
+    scoreboard["home_win_confidence"] = pd.Series(pd.NA, index=scoreboard.index, dtype="object")
+    scoreboard["home_win_confidence_accuracy"] = np.nan
+    scoreboard["home_win_edge"] = np.nan
+    scoreboard["bet_recommendation"] = "monitor"
+    scoreboard["high_confidence_flag"] = False
+    scoreboard["home_score_expected_error"] = np.nan
+    scoreboard["away_score_expected_error"] = np.nan
+
+    confidence_profile = {}
+    if isinstance(specials, dict):
+        confidence_profile = specials.get("game_winner", {}).get("confidence_profile", {})
+    if confidence_profile:
+        thresholds = confidence_profile.get("thresholds")
+        bucket_records = confidence_profile.get("buckets", [])
+        bucket_labels = [record.get("label") for record in bucket_records if record.get("label")]
+        if thresholds and bucket_labels:
+            try:
+                confidence_series = pd.cut(
+                    scoreboard["home_win_margin"],
+                    bins=thresholds,
+                    labels=bucket_labels,
+                    include_lowest=True,
+                    right=False,
+                )
+                scoreboard["home_win_confidence"] = confidence_series.astype(str)
+                scoreboard.loc[
+                    confidence_series.isna(), "home_win_confidence"
+                ] = pd.NA
+            except Exception:
+                logging.debug("Unable to bucketize win confidence", exc_info=True)
+        acc_map = {record.get("label"): record.get("accuracy") for record in bucket_records}
+        scoreboard["home_win_confidence_accuracy"] = scoreboard["home_win_confidence"].map(acc_map)
+        preferred_label = confidence_profile.get("preferred_label")
+        if preferred_label:
+            scoreboard["high_confidence_flag"] = scoreboard["home_win_confidence"] == preferred_label
+
+    home_error_profile = (specials.get("home_points", {}) or {}).get("error_profile") if isinstance(specials, dict) else None
+    if home_error_profile:
+        scoreboard["home_score_expected_error"] = home_error_profile.get("median")
+
+    away_error_profile = (specials.get("away_points", {}) or {}).get("error_profile") if isinstance(specials, dict) else None
+    if away_error_profile:
+        scoreboard["away_score_expected_error"] = away_error_profile.get("median")
+
+    poisson_entry = specials.get("team_poisson") if isinstance(specials, dict) else None
+    if poisson_entry and not game_features.empty:
+        base_features = _ensure_model_features(
+            game_features,
+            SimpleNamespace(feature_columns=poisson_entry.get("feature_columns", [])),
+        )
+        processed = _transform_with_feature_names(
+            poisson_entry.get("preprocessor"),
+            base_features,
+            poisson_entry.get("feature_names"),
+        )
+        try:
+            lam_home, lam_away = poisson_entry["model"].predict_lambda(processed, processed)
+        except Exception:
+            logging.debug("Unable to score Poisson consensus for upcoming games", exc_info=True)
+            lam_home = lam_away = np.array([])
+        if lam_home.size and lam_away.size:
+            poisson_probs = [
+                TeamPoissonTotals._home_win_probability_pair(float(h), float(a))
+                for h, a in zip(lam_home, lam_away)
+            ]
+            poisson_df = pd.DataFrame(
+                {
+                    "game_id": game_features["game_id"].values,
+                    "home_score_poisson": lam_home,
+                    "away_score_poisson": lam_away,
+                    "home_win_poisson_prob": poisson_probs,
+                }
+            )
+            scoreboard = scoreboard.merge(poisson_df, on="game_id", how="left")
+            scoreboard["home_score_consensus_gap"] = (
+                scoreboard["home_score"] - scoreboard["home_score_poisson"]
+            )
+            scoreboard["away_score_consensus_gap"] = (
+                scoreboard["away_score"] - scoreboard["away_score_poisson"]
+            )
+            scoreboard["home_win_consensus_gap"] = (
+                scoreboard["home_win_probability"] - scoreboard["home_win_poisson_prob"]
+            )
 
     home_unc = (model_uncertainty.get("home_points") or {})
     away_unc = (model_uncertainty.get("away_points") or {})
@@ -16337,31 +17336,6 @@ def predict_upcoming_games(
     scoreboard["home_win_brier"] = winner_unc.get("brier")
     scoreboard["home_win_accuracy"] = winner_unc.get("accuracy")
     scoreboard["date"] = scoreboard["local_start_time"].dt.date.astype(str)
-    scoreboard = scoreboard[
-        [
-            "game_id",
-            "date",
-            "start_time",
-            "local_start_time",
-            "away_team",
-            "home_team",
-            "away_score",
-            "home_score",
-            "away_score_lower",
-            "away_score_upper",
-            "home_score_lower",
-            "home_score_upper",
-            "home_win_probability",
-            "home_win_log_loss",
-            "home_win_brier",
-            "home_win_accuracy",
-        ]
-    ].rename(
-        columns={
-            "away_team": "away_team_abbr",
-            "home_team": "home_team_abbr",
-        }
-    )
 
     odds_columns = [
         "home_moneyline",
@@ -16375,7 +17349,81 @@ def predict_upcoming_games(
         odds_frame = game_features[["game_id", *available_odds]].drop_duplicates("game_id")
         scoreboard = scoreboard.merge(odds_frame, on="game_id", how="left")
 
+    if "home_implied_prob" in scoreboard.columns:
+        scoreboard["home_win_edge"] = scoreboard["home_win_probability"] - scoreboard["home_implied_prob"]
+    if "away_implied_prob" in scoreboard.columns:
+        scoreboard["away_win_edge"] = (1.0 - scoreboard["home_win_probability"]) - scoreboard["away_implied_prob"]
+
+    edge_threshold = 0.05
+    if confidence_profile:
+        edge_threshold = float(confidence_profile.get("edge_threshold", edge_threshold))
+
+    consensus_gap = scoreboard.get("home_win_consensus_gap")
+    if consensus_gap is None:
+        consensus_gap = pd.Series(0.0, index=scoreboard.index)
+    scoreboard["consensus_warning"] = np.where(
+        consensus_gap.abs() >= 0.1,
+        "model_disagrees",
+        "",
+    )
+
+    confidence_text = scoreboard["home_win_confidence"].fillna("")
+    scoreboard["bet_recommendation"] = np.select(
+        [
+            scoreboard["high_confidence_flag"]
+            & scoreboard["home_win_edge"].abs().ge(edge_threshold),
+            scoreboard["high_confidence_flag"],
+        ],
+        ["target", "lean"],
+        default=np.where(confidence_text == "medium", "monitor", "pass"),
+    )
+
     scoreboard = scoreboard.sort_values(["date", "start_time", "game_id"]).reset_index(drop=True)
+
+    base_columns = [
+        "game_id",
+        "date",
+        "start_time",
+        "local_start_time",
+        "away_team",
+        "home_team",
+        "away_score",
+        "home_score",
+        "away_score_lower",
+        "away_score_upper",
+        "home_score_lower",
+        "home_score_upper",
+        "home_score_expected_error",
+        "away_score_expected_error",
+        "home_score_poisson",
+        "away_score_poisson",
+        "home_score_consensus_gap",
+        "away_score_consensus_gap",
+        "home_win_probability",
+        "home_win_poisson_prob",
+        "home_win_consensus_gap",
+        "home_win_margin",
+        "home_win_confidence",
+        "home_win_confidence_accuracy",
+        "home_win_edge",
+        "away_win_edge",
+        "home_win_log_loss",
+        "home_win_brier",
+        "home_win_accuracy",
+        "bet_recommendation",
+        "consensus_warning",
+        "high_confidence_flag",
+    ]
+    odds_cols_present = [col for col in odds_columns if col in scoreboard.columns]
+    final_columns = base_columns + odds_cols_present
+    available_final = [col for col in final_columns if col in scoreboard.columns]
+
+    scoreboard = scoreboard[available_final].rename(
+        columns={
+            "away_team": "away_team_abbr",
+            "home_team": "home_team_abbr",
+        }
+    )
 
     # Player-level predictions
     lineup_df = pd.DataFrame()
@@ -16808,8 +17856,20 @@ def predict_upcoming_games(
 
     lines: List[str] = []
 
+    def _fmt_pct(value: Optional[float], digits: int = 1) -> str:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return "—"
+        return f"{float(value) * 100:.{digits}f}%"
+
+    def _fmt_signed_pct(value: Optional[float], digits: int = 1) -> str:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return "—"
+        return f"{float(value) * 100:+.{digits}f}%"
+
     if not scoreboard.empty:
         scoreboard_rows: List[List[str]] = []
+        reliability_rows: List[List[str]] = []
+
         for row in scoreboard.itertuples(index=False):
             away_low = row.away_score_lower if not pd.isna(row.away_score_lower) else row.away_score
             away_high = row.away_score_upper if not pd.isna(row.away_score_upper) else row.away_score
@@ -16826,6 +17886,35 @@ def predict_upcoming_games(
                 ]
             )
 
+            confidence_label = row.home_win_confidence or "—"
+            confidence_label = confidence_label.capitalize() if confidence_label not in {pd.NA, None, ""} else "—"
+            hist_acc = _fmt_pct(row.home_win_confidence_accuracy, digits=0)
+            if confidence_label == "—" and hist_acc == "—":
+                confidence_display = "—"
+            elif hist_acc == "—":
+                confidence_display = confidence_label
+            elif confidence_label == "—":
+                confidence_display = hist_acc
+            else:
+                confidence_display = f"{confidence_label} ({hist_acc})"
+
+            edge_text = _fmt_signed_pct(row.home_win_edge)
+            consensus_gap = _fmt_signed_pct(getattr(row, "home_win_consensus_gap", np.nan))
+            if getattr(row, "consensus_warning", ""):
+                warning = str(row.consensus_warning).replace("_", " ")
+                consensus_gap = f"{consensus_gap} {warning}" if consensus_gap != "—" else warning
+
+            reliability_rows.append(
+                [
+                    f"{row.away_team_abbr} @ {row.home_team_abbr}",
+                    _fmt_pct(row.home_win_probability),
+                    edge_text,
+                    confidence_display,
+                    consensus_gap,
+                    row.bet_recommendation,
+                ]
+            )
+
         lines.extend(
             _format_table(
                 ["Date", "Away", "Home", "Away Score ±RMSE", "Home Score ±RMSE"],
@@ -16833,6 +17922,43 @@ def predict_upcoming_games(
                 aligns=["left", "left", "left", "right", "right"],
             )
         )
+
+        if reliability_rows:
+            lines.append("")
+            lines.extend(
+                _format_table(
+                    [
+                        "Matchup",
+                        "Home win%",
+                        "Edge vs market",
+                        "Confidence (hist)",
+                        "Consensus gap",
+                        "Action",
+                    ],
+                    reliability_rows,
+                    aligns=["left", "right", "right", "left", "left", "left"],
+                )
+            )
+
+        targets = scoreboard[scoreboard["bet_recommendation"] == "target"]
+        if not targets.empty:
+            lines.append("")
+            lines.append("High-confidence targets:")
+            for game in targets.itertuples(index=False):
+                win_pct = _fmt_pct(game.home_win_probability)
+                edge_txt = _fmt_signed_pct(game.home_win_edge)
+                conf = game.home_win_confidence or "—"
+                hist_acc = _fmt_pct(game.home_win_confidence_accuracy, digits=0)
+                conf_part = conf.capitalize() if conf not in {pd.NA, None, ""} else "—"
+                if hist_acc != "—":
+                    conf_part = f"{conf_part} (~{hist_acc})"
+                implied = _fmt_pct(getattr(game, "home_implied_prob", np.nan))
+                implied_part = f", market {implied}" if implied != "—" else ""
+                lines.append(
+                    "  "
+                    + f"{game.away_team_abbr} @ {game.home_team_abbr}: {win_pct} home win prob, "
+                    + f"edge {edge_txt}{implied_part}, confidence {conf_part}"
+                )
 
     if winner_unc:
         lines.append("")
@@ -17325,7 +18451,14 @@ def main() -> None:
     except Exception:
         logging.exception("Automated closing odds synchronization failed")
 
-    msf_client = MySportsFeedsClient(NFL_API_USER, NFL_API_PASS)
+    msf_client = MySportsFeedsClient(
+        config.msf_user,
+        config.msf_password,
+        timeout=config.msf_timeout_seconds,
+        timeout_retries=config.msf_timeout_retries,
+        timeout_backoff=config.msf_timeout_backoff,
+        http_retries=config.msf_http_retries,
+    )
     odds_client = OddsApiClient(
         ODDS_API_KEY,
         allow_insecure_ssl=config.odds_allow_insecure_ssl,
