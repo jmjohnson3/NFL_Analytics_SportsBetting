@@ -17856,8 +17856,20 @@ def predict_upcoming_games(
 
     lines: List[str] = []
 
+    def _fmt_pct(value: Optional[float], digits: int = 1) -> str:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return "—"
+        return f"{float(value) * 100:.{digits}f}%"
+
+    def _fmt_signed_pct(value: Optional[float], digits: int = 1) -> str:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return "—"
+        return f"{float(value) * 100:+.{digits}f}%"
+
     if not scoreboard.empty:
         scoreboard_rows: List[List[str]] = []
+        reliability_rows: List[List[str]] = []
+
         for row in scoreboard.itertuples(index=False):
             away_low = row.away_score_lower if not pd.isna(row.away_score_lower) else row.away_score
             away_high = row.away_score_upper if not pd.isna(row.away_score_upper) else row.away_score
@@ -17874,6 +17886,35 @@ def predict_upcoming_games(
                 ]
             )
 
+            confidence_label = row.home_win_confidence or "—"
+            confidence_label = confidence_label.capitalize() if confidence_label not in {pd.NA, None, ""} else "—"
+            hist_acc = _fmt_pct(row.home_win_confidence_accuracy, digits=0)
+            if confidence_label == "—" and hist_acc == "—":
+                confidence_display = "—"
+            elif hist_acc == "—":
+                confidence_display = confidence_label
+            elif confidence_label == "—":
+                confidence_display = hist_acc
+            else:
+                confidence_display = f"{confidence_label} ({hist_acc})"
+
+            edge_text = _fmt_signed_pct(row.home_win_edge)
+            consensus_gap = _fmt_signed_pct(getattr(row, "home_win_consensus_gap", np.nan))
+            if getattr(row, "consensus_warning", ""):
+                warning = str(row.consensus_warning).replace("_", " ")
+                consensus_gap = f"{consensus_gap} {warning}" if consensus_gap != "—" else warning
+
+            reliability_rows.append(
+                [
+                    f"{row.away_team_abbr} @ {row.home_team_abbr}",
+                    _fmt_pct(row.home_win_probability),
+                    edge_text,
+                    confidence_display,
+                    consensus_gap,
+                    row.bet_recommendation,
+                ]
+            )
+
         lines.extend(
             _format_table(
                 ["Date", "Away", "Home", "Away Score ±RMSE", "Home Score ±RMSE"],
@@ -17881,6 +17922,43 @@ def predict_upcoming_games(
                 aligns=["left", "left", "left", "right", "right"],
             )
         )
+
+        if reliability_rows:
+            lines.append("")
+            lines.extend(
+                _format_table(
+                    [
+                        "Matchup",
+                        "Home win%",
+                        "Edge vs market",
+                        "Confidence (hist)",
+                        "Consensus gap",
+                        "Action",
+                    ],
+                    reliability_rows,
+                    aligns=["left", "right", "right", "left", "left", "left"],
+                )
+            )
+
+        targets = scoreboard[scoreboard["bet_recommendation"] == "target"]
+        if not targets.empty:
+            lines.append("")
+            lines.append("High-confidence targets:")
+            for game in targets.itertuples(index=False):
+                win_pct = _fmt_pct(game.home_win_probability)
+                edge_txt = _fmt_signed_pct(game.home_win_edge)
+                conf = game.home_win_confidence or "—"
+                hist_acc = _fmt_pct(game.home_win_confidence_accuracy, digits=0)
+                conf_part = conf.capitalize() if conf not in {pd.NA, None, ""} else "—"
+                if hist_acc != "—":
+                    conf_part = f"{conf_part} (~{hist_acc})"
+                implied = _fmt_pct(getattr(game, "home_implied_prob", np.nan))
+                implied_part = f", market {implied}" if implied != "—" else ""
+                lines.append(
+                    "  "
+                    + f"{game.away_team_abbr} @ {game.home_team_abbr}: {win_pct} home win prob, "
+                    + f"edge {edge_txt}{implied_part}, confidence {conf_part}"
+                )
 
     if winner_unc:
         lines.append("")
