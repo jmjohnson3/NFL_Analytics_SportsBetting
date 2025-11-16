@@ -17349,6 +17349,16 @@ def predict_upcoming_games(
         odds_frame = game_features[["game_id", *available_odds]].drop_duplicates("game_id")
         scoreboard = scoreboard.merge(odds_frame, on="game_id", how="left")
 
+    def _sanitize_probabilities(column: str) -> None:
+        if column not in scoreboard.columns:
+            return
+        probs = pd.to_numeric(scoreboard[column], errors="coerce")
+        invalid = ~np.isfinite(probs) | (probs <= 0.0) | (probs >= 1.0)
+        scoreboard[column] = probs.mask(invalid)
+
+    _sanitize_probabilities("home_implied_prob")
+    _sanitize_probabilities("away_implied_prob")
+
     if "home_implied_prob" in scoreboard.columns:
         scoreboard["home_win_edge"] = scoreboard["home_win_probability"] - scoreboard["home_implied_prob"]
     if "away_implied_prob" in scoreboard.columns:
