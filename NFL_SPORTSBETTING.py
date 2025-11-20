@@ -28,6 +28,7 @@ import math
 import os
 import re
 import ssl
+import sys
 import time
 import unicodedata
 import uuid
@@ -14399,7 +14400,7 @@ class ModelTrainer:
 
     def _compute_target_priors(self, df: pd.DataFrame, target: str) -> Dict[str, Any]:
         priors: Dict[str, Any] = {
-            "league": {"mean": np.nan, "weight": 0.0},
+            "league": {"mean": np.nan, "weight": 0.0, "q05": np.nan, "q95": np.nan},
             "position": {},
             "team_position": {},
         }
@@ -14425,9 +14426,27 @@ class ModelTrainer:
             .clip(lower=1e-4)
         )
         values_all = actual[target].astype(float)
+        def _safe_weighted_quantiles(values: np.ndarray, weights: np.ndarray) -> Tuple[float, float]:
+            try:
+                sorter = np.argsort(values)
+                values_sorted = values[sorter]
+                weights_sorted = weights[sorter]
+                cumulative = np.cumsum(weights_sorted)
+                if cumulative[-1] == 0:
+                    return (np.nan, np.nan)
+                cumulative = cumulative / cumulative[-1]
+                q05 = float(np.interp(0.05, cumulative, values_sorted))
+                q95 = float(np.interp(0.95, cumulative, values_sorted))
+                return (q05, q95)
+            except Exception:
+                return (np.nan, np.nan)
+
+        q05_league, q95_league = _safe_weighted_quantiles(values_all.to_numpy(), weights_all.to_numpy())
         priors["league"] = {
             "mean": float(np.average(values_all, weights=weights_all)),
             "weight": float(weights_all.sum()),
+            "q05": q05_league,
+            "q95": q95_league,
         }
 
         for (team, position), group in actual.groupby(["team", "position"]):
@@ -14437,9 +14456,12 @@ class ModelTrainer:
                 .clip(lower=1e-4)
             )
             group_values = group[target].astype(float)
+            q05, q95 = _safe_weighted_quantiles(group_values.to_numpy(), group_weights.to_numpy())
             priors["team_position"][(team, position)] = {
                 "mean": float(np.average(group_values, weights=group_weights)),
                 "weight": float(group_weights.sum()),
+                "q05": q05,
+                "q95": q95,
             }
 
         for position, group in actual.groupby(["position"]):
@@ -14449,9 +14471,12 @@ class ModelTrainer:
                 .clip(lower=1e-4)
             )
             group_values = group[target].astype(float)
+            q05, q95 = _safe_weighted_quantiles(group_values.to_numpy(), group_weights.to_numpy())
             priors["position"][position] = {
                 "mean": float(np.average(group_values, weights=group_weights)),
                 "weight": float(group_weights.sum()),
+                "q05": q05,
+                "q95": q95,
             }
 
         return priors
@@ -14484,6 +14509,32 @@ class ModelTrainer:
             league_entry.get("mean", np.nan),
             league_entry.get("weight", 0.0),
         )
+
+    def _resolve_prior_bounds(
+        self,
+        target: str,
+        team: Optional[str],
+        position: Optional[str],
+    ) -> Tuple[float, float]:
+        priors = self.target_priors.get(target)
+        if not priors:
+            return (np.nan, np.nan)
+
+        team_norm = normalize_team_abbr(team) if team else None
+        pos_norm = normalize_position(position) if position else None
+
+        if team_norm and pos_norm:
+            entry = priors["team_position"].get((team_norm, pos_norm))
+            if entry:
+                return (entry.get("q05", np.nan), entry.get("q95", np.nan))
+
+        if pos_norm:
+            entry = priors["position"].get(pos_norm)
+            if entry:
+                return (entry.get("q05", np.nan), entry.get("q95", np.nan))
+
+        league_entry = priors.get("league", {})
+        return (league_entry.get("q05", np.nan), league_entry.get("q95", np.nan))
 
     def _build_neighbor_engine(
         self,
@@ -14689,6 +14740,16 @@ class ModelTrainer:
                 preds[idx] = combined_mean
             else:
                 preds[idx] = (1 - alpha) * current_pred + alpha * combined_mean
+
+            lower_q, upper_q = self._resolve_prior_bounds(
+                target,
+                row.get("team"),
+                row.get("position"),
+            )
+            if not np.isnan(lower_q) and preds[idx] < lower_q:
+                preds[idx] = lower_q
+            if not np.isnan(upper_q) and preds[idx] > upper_q:
+                preds[idx] = upper_q
 
         if target in NON_NEGATIVE_TARGETS:
             np.maximum(preds, 0.0, out=preds)
@@ -17311,6 +17372,59 @@ def predict_upcoming_games(
                 scoreboard["home_win_probability"] - scoreboard["home_win_poisson_prob"]
             )
 
+    def _blend_with_consensus(
+        primary: pd.Series,
+        consensus: pd.Series,
+        conf_series: pd.Series,
+        gap_series: pd.Series,
+        *,
+        base: float = 0.55,
+    ) -> pd.Series:
+        if consensus is None or consensus.empty:
+            return primary
+        conf_map = {"high": 0.8, "medium": 0.6, "low": 0.45}
+        conf_weights = conf_series.str.lower().map(conf_map).fillna(base)
+        gap_penalty = (gap_series.abs().clip(0.0, 0.3) / 0.3) * 0.2
+        weights = (conf_weights - gap_penalty).clip(0.35, 0.9)
+        blended = weights * primary + (1.0 - weights) * consensus
+        return blended
+
+    if {
+        "home_score_poisson",
+        "away_score_poisson",
+        "home_win_poisson_prob",
+    }.issubset(scoreboard.columns):
+        conf_series = scoreboard["home_win_confidence"].fillna("")
+        scoreboard["home_win_probability"] = _blend_with_consensus(
+            scoreboard["home_win_probability"],
+            scoreboard["home_win_poisson_prob"],
+            conf_series,
+            scoreboard.get("home_win_consensus_gap", pd.Series(0.0, index=scoreboard.index)),
+        )
+        scoreboard["home_score"] = _blend_with_consensus(
+            scoreboard["home_score"],
+            scoreboard["home_score_poisson"],
+            conf_series,
+            scoreboard.get("home_score_consensus_gap", pd.Series(0.0, index=scoreboard.index)),
+            base=0.6,
+        )
+        scoreboard["away_score"] = _blend_with_consensus(
+            scoreboard["away_score"],
+            scoreboard["away_score_poisson"],
+            conf_series,
+            scoreboard.get("away_score_consensus_gap", pd.Series(0.0, index=scoreboard.index)),
+            base=0.6,
+        )
+        scoreboard["home_win_consensus_gap"] = (
+            scoreboard["home_win_probability"] - scoreboard["home_win_poisson_prob"]
+        )
+        scoreboard["home_score_consensus_gap"] = (
+            scoreboard["home_score"] - scoreboard["home_score_poisson"]
+        )
+        scoreboard["away_score_consensus_gap"] = (
+            scoreboard["away_score"] - scoreboard["away_score_poisson"]
+        )
+
     home_unc = (model_uncertainty.get("home_points") or {})
     away_unc = (model_uncertainty.get("away_points") or {})
     winner_unc = (model_uncertainty.get("game_winner") or {})
@@ -17610,6 +17724,138 @@ def predict_upcoming_games(
             player_predictions[value_columns].fillna(0.0).clip(lower=0.0)
         )
 
+        def _apply_position_quantile_brakes(
+            df: pd.DataFrame,
+            trainer_obj: Optional["ModelTrainer"],
+            target_map: Dict[str, Tuple[str, str]],
+        ) -> pd.DataFrame:
+            if trainer_obj is None:
+                return df
+            adjusted = df.copy()
+            for col, (team_col, pos_col) in target_map.items():
+                if col not in adjusted.columns:
+                    continue
+                values = adjusted[col].astype(float)
+                lowers: List[float] = []
+                uppers: List[float] = []
+                for row in adjusted[[team_col, pos_col]].itertuples(index=False):
+                    lower_q, upper_q = trainer_obj._resolve_prior_bounds(
+                        col.replace("pred_", ""), row[0], row[1]
+                    )
+                    lowers.append(lower_q)
+                    uppers.append(upper_q)
+                lower_series = pd.Series(lowers, index=values.index)
+                upper_series = pd.Series(uppers, index=values.index)
+                values = values.mask(values < lower_series, lower_series)
+                values = values.mask(values > upper_series, upper_series)
+                adjusted[col] = values
+            return adjusted
+
+        player_predictions = _apply_position_quantile_brakes(
+            player_predictions,
+            trainer,
+            {
+                "pred_rushing_yards": ("team", "position"),
+                "pred_receiving_yards": ("team", "position"),
+                "pred_receptions": ("team", "position"),
+                "pred_passing_yards": ("team", "position"),
+            },
+        )
+
+        game_script_lookup: Dict[Tuple[str, str], Dict[str, float]] = {}
+        try:
+            if scoreboard is not None and isinstance(scoreboard, pd.DataFrame):
+                for rec in scoreboard.itertuples(index=False):
+                    gid = str(getattr(rec, "game_id", ""))
+                    home_team = normalize_team_abbr(getattr(rec, "home_team", ""))
+                    away_team = normalize_team_abbr(getattr(rec, "away_team", ""))
+                    home_score = float(getattr(rec, "home_score", np.nan))
+                    away_score = float(getattr(rec, "away_score", np.nan))
+                    home_prob = float(getattr(rec, "home_win_probability", np.nan))
+                    if home_team:
+                        game_script_lookup[(gid, home_team)] = {
+                            "win_prob": home_prob,
+                            "expected_margin": home_score - away_score,
+                        }
+                    if away_team:
+                        game_script_lookup[(gid, away_team)] = {
+                            "win_prob": 1.0 - home_prob if pd.notna(home_prob) else np.nan,
+                            "expected_margin": away_score - home_score,
+                        }
+        except Exception:
+            logging.debug("Unable to build game script lookup", exc_info=True)
+
+        def _scale_by_script(row: pd.Series, column: str, lead_bias: float, trail_bias: float) -> float:
+            base_val = float(row.get(column, 0.0))
+            if base_val <= 0 or not game_script_lookup:
+                return base_val
+            key = (str(row.get("game_id", "")), normalize_team_abbr(row.get("team", "")))
+            script = game_script_lookup.get(key)
+            if not script:
+                return base_val
+            margin = script.get("expected_margin")
+            if not pd.isfinite(margin):
+                return base_val
+            margin_scale = np.clip(margin / 21.0, -1.0, 1.0)
+            bias = lead_bias if margin_scale > 0 else trail_bias
+            scaled = base_val * (1.0 + bias * margin_scale)
+            return float(max(0.0, scaled))
+
+        league_pass_avg = float(player_features.get("opp_defense_pass_rating", pd.Series(dtype=float)).mean())
+        league_pass_std = float(player_features.get("opp_defense_pass_rating", pd.Series(dtype=float)).std()) or 1.0
+        league_rush_avg = float(player_features.get("opp_defense_rush_rating", pd.Series(dtype=float)).mean())
+        league_rush_std = float(player_features.get("opp_defense_rush_rating", pd.Series(dtype=float)).std()) or 1.0
+
+        def _defense_scale(row: pd.Series, column: str, avg: float, std: float, weight: float) -> float:
+            base_val = float(row.get(column, 0.0))
+            if base_val <= 0:
+                return base_val
+            rating = row.get("opp_defense_pass_rating") if "receiving" in column or "passing" in column else row.get("opp_defense_rush_rating")
+            if rating is None or not pd.isfinite(float(rating)):
+                return base_val
+            z = (float(rating) - avg) / std
+            scaled = base_val * (1.0 - weight * z)
+            return float(max(0.0, scaled))
+
+        script_scaled = player_predictions.copy()
+
+        for col in ["pred_rushing_yards", "pred_rushing_tds"]:
+            script_scaled[col] = script_scaled.apply(
+                _scale_by_script, axis=1, column=col, lead_bias=0.35, trail_bias=-0.25
+            )
+
+        for col in ["pred_receiving_yards", "pred_receptions", "pred_receiving_tds", "pred_passing_yards"]:
+            script_scaled[col] = script_scaled.apply(
+                _scale_by_script, axis=1, column=col, lead_bias=-0.25, trail_bias=0.20
+            )
+
+        for col in [
+            "pred_receiving_yards",
+            "pred_receptions",
+            "pred_receiving_tds",
+            "pred_passing_yards",
+        ]:
+            script_scaled[col] = script_scaled.apply(
+                _defense_scale,
+                axis=1,
+                column=col,
+                avg=league_pass_avg,
+                std=league_pass_std,
+                weight=0.12,
+            )
+
+        for col in ["pred_rushing_yards", "pred_rushing_tds"]:
+            script_scaled[col] = script_scaled.apply(
+                _defense_scale,
+                axis=1,
+                column=col,
+                avg=league_rush_avg,
+                std=league_rush_std,
+                weight=0.12,
+            )
+
+        player_predictions = script_scaled
+
         qb_mask = player_predictions["position"] == "QB"
         rb_mask = player_predictions["position"] == "RB"
         wr_mask = player_predictions["position"] == "WR"
@@ -17640,6 +17886,34 @@ def predict_upcoming_games(
             "pred_passing_yards",
             "pred_passing_tds",
         ]] = 0.0
+
+        # Apply conservative position ceilings to smooth outliers that slip through priors
+        position_caps: Dict[str, Dict[str, float]] = {
+            "pred_passing_yards": {"QB": 450.0, "RB": 70.0, "WR": 40.0, "TE": 40.0},
+            "pred_passing_tds": {"QB": 6.0, "RB": 0.0, "WR": 0.0, "TE": 0.0},
+            "pred_rushing_yards": {"QB": 150.0, "RB": 180.0, "WR": 70.0, "TE": 50.0},
+            "pred_rushing_tds": {"QB": 3.0, "RB": 3.0, "WR": 2.0, "TE": 2.0},
+            "pred_receiving_yards": {"RB": 130.0, "WR": 220.0, "TE": 160.0, "QB": 0.0},
+            "pred_receptions": {"RB": 15.0, "WR": 20.0, "TE": 15.0, "QB": 0.0},
+            "pred_receiving_tds": {"RB": 2.0, "WR": 3.0, "TE": 3.0, "QB": 0.0},
+        }
+
+        def _apply_position_caps(df: pd.DataFrame, caps: Dict[str, Dict[str, float]]) -> pd.DataFrame:
+            if "position" not in df.columns:
+                return df
+            adjusted = df.copy()
+            positions = adjusted["position"].astype(str)
+            for column, cap_map in caps.items():
+                if column not in adjusted.columns:
+                    continue
+                upper = positions.map(cap_map).astype(float)
+                mask = upper.notna()
+                adjusted.loc[mask, column] = np.minimum(
+                    adjusted.loc[mask, column].astype(float), upper.loc[mask]
+                )
+            return adjusted
+
+        player_predictions = _apply_position_caps(player_predictions, position_caps)
 
         player_predictions["pred_touchdowns"] = (
             player_predictions["pred_rushing_tds"].fillna(0)
@@ -18452,7 +18726,16 @@ def main() -> None:
     setup_logging(config.log_level)
 
     logging.info("Connecting to PostgreSQL at %s", config.pg_url)
-    engine = create_engine(config.pg_url, future=True)
+    try:
+        engine = create_engine(config.pg_url, future=True)
+    except ModuleNotFoundError as exc:
+        if exc.name == "psycopg2":
+            logging.error(
+                "psycopg2 is not installed; install it with `pip install psycopg2-binary` "
+                "in your virtualenv before running the script."
+            )
+            sys.exit(1)
+        raise
     db = NFLDatabase(engine)
 
     try:

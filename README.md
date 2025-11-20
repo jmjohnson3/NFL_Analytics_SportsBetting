@@ -119,6 +119,28 @@ The key principle is that you should never fabricate or forward-fill closing
 prices. Either find the real numbers or exclude the affected games from any
 evaluation you intend to trust for live betting decisions.
 
+## Play-by-play simulation vs. current scope
+
+This repo does **not** attempt to forecast every snap in sequence. The models are
+trained and calibrated at the game and player-prop level, which is the granularity
+of the available historical feeds. Predicting each play would require a different
+data asset (full play-by-play with personnel, formation, coverage, and motion
+labels), a stateful simulator that updates win probability after every snap, and
+an action-policy model to decide run/pass tendencies on the fly. If you need more
+granular script sensitivity today, the closest option is to:
+
+- Run the existing game-level projections to get expected score margin and total.
+- Use those margins to scale team rush/pass rates (already supported in
+  `NFL_SPORTSBETTING.py`) so trailing teams throw more and leading teams run more.
+- Optionally layer in opponent positional strengths (e.g., CB/edge/IDL ratings) to
+  tilt targets and yards per play for specific skill players.
+
+With the current inputs, this yields drive-level realism—who scores, by how much,
+and how usage shifts when a team is leading or trailing—without pretending to know
+the exact sequence of snaps. To move toward true play-by-play simulation, you would
+first need reliable historical play-level data, then fit a conditional play-caller
+model that can roll forward the game state on every down.
+
 ### Automating the closing-odds backfill
 
 To simplify the backfill, the driver script can now download and normalize
