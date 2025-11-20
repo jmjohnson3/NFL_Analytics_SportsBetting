@@ -17659,6 +17659,52 @@ def predict_upcoming_games(
         upcoming,
         lineup_rows=lineup_df if not lineup_df.empty else None,
     )
+
+    # Backfill opponent defensive ratings for upcoming players from game-level
+    # features when team strength snapshots are missing. This keeps the
+    # defensive matchup scaling effective even if the opponent team strength
+    # table has gaps for future games.
+    if not player_features.empty and game_features is not None and not game_features.empty:
+        matchup_rows: List[Dict[str, Any]] = []
+        for rec in game_features.itertuples(index=False):
+            gid = getattr(rec, "game_id", None)
+            home_team = normalize_team_abbr(getattr(rec, "home_team", ""))
+            away_team = normalize_team_abbr(getattr(rec, "away_team", ""))
+            matchup_rows.append(
+                {
+                    "game_id": gid,
+                    "team": home_team,
+                    "opp_defense_pass_rating": getattr(rec, "away_defense_pass_rating", np.nan),
+                    "opp_defense_rush_rating": getattr(rec, "away_defense_rush_rating", np.nan),
+                }
+            )
+            matchup_rows.append(
+                {
+                    "game_id": gid,
+                    "team": away_team,
+                    "opp_defense_pass_rating": getattr(rec, "home_defense_pass_rating", np.nan),
+                    "opp_defense_rush_rating": getattr(rec, "home_defense_rush_rating", np.nan),
+                }
+            )
+
+        matchup_df = pd.DataFrame(matchup_rows)
+        if not matchup_df.empty:
+            player_features = player_features.merge(
+                matchup_df,
+                on=["game_id", "team"],
+                how="left",
+                suffixes=("", "_from_game"),
+            )
+            for col in ["opp_defense_pass_rating", "opp_defense_rush_rating"]:
+                from_game_col = f"{col}_from_game"
+                if from_game_col in player_features.columns:
+                    player_features[col] = player_features[col].combine_first(
+                        player_features[from_game_col]
+                    )
+            player_features = player_features.drop(
+                columns=[c for c in player_features.columns if c.endswith("_from_game")],
+                errors="ignore",
+            )
     respect_lineups = True if config is None else bool(config.respect_lineups)
     if trainer is not None:
         player_features = trainer.apply_lineup_gate(
