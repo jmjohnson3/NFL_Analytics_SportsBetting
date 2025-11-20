@@ -17887,6 +17887,34 @@ def predict_upcoming_games(
             "pred_passing_tds",
         ]] = 0.0
 
+        # Apply conservative position ceilings to smooth outliers that slip through priors
+        position_caps: Dict[str, Dict[str, float]] = {
+            "pred_passing_yards": {"QB": 450.0, "RB": 70.0, "WR": 40.0, "TE": 40.0},
+            "pred_passing_tds": {"QB": 6.0, "RB": 0.0, "WR": 0.0, "TE": 0.0},
+            "pred_rushing_yards": {"QB": 150.0, "RB": 180.0, "WR": 70.0, "TE": 50.0},
+            "pred_rushing_tds": {"QB": 3.0, "RB": 3.0, "WR": 2.0, "TE": 2.0},
+            "pred_receiving_yards": {"RB": 130.0, "WR": 220.0, "TE": 160.0, "QB": 0.0},
+            "pred_receptions": {"RB": 15.0, "WR": 20.0, "TE": 15.0, "QB": 0.0},
+            "pred_receiving_tds": {"RB": 2.0, "WR": 3.0, "TE": 3.0, "QB": 0.0},
+        }
+
+        def _apply_position_caps(df: pd.DataFrame, caps: Dict[str, Dict[str, float]]) -> pd.DataFrame:
+            if "position" not in df.columns:
+                return df
+            adjusted = df.copy()
+            positions = adjusted["position"].astype(str)
+            for column, cap_map in caps.items():
+                if column not in adjusted.columns:
+                    continue
+                upper = positions.map(cap_map).astype(float)
+                mask = upper.notna()
+                adjusted.loc[mask, column] = np.minimum(
+                    adjusted.loc[mask, column].astype(float), upper.loc[mask]
+                )
+            return adjusted
+
+        player_predictions = _apply_position_caps(player_predictions, position_caps)
+
         player_predictions["pred_touchdowns"] = (
             player_predictions["pred_rushing_tds"].fillna(0)
             + player_predictions["pred_receiving_tds"].fillna(0)
