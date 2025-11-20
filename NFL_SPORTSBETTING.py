@@ -17716,11 +17716,15 @@ def predict_upcoming_games(
         logging.warning(
             "Respect-lineups flag enabled but no trainer provided; skipping roster gating",
         )
-    player_predictions = pd.DataFrame()
+        player_predictions = pd.DataFrame()
     if not player_features.empty:
-        player_predictions = player_features[
-            ["game_id", "team", "player_id", "player_name", "position"]
-        ].copy()
+        base_columns = ["game_id", "team", "player_id", "player_name", "position"]
+        defensive_cols = [
+            col
+            for col in ["opp_defense_pass_rating", "opp_defense_rush_rating"]
+            if col in player_features.columns
+        ]
+        player_predictions = player_features[base_columns + defensive_cols].copy()
         if "_usage_confidence" in player_features.columns:
             player_predictions["_usage_confidence"] = player_features[
                 "_usage_confidence"
