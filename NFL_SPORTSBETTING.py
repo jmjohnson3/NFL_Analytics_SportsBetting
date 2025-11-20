@@ -17762,6 +17762,100 @@ def predict_upcoming_games(
             },
         )
 
+        game_script_lookup: Dict[Tuple[str, str], Dict[str, float]] = {}
+        try:
+            if scoreboard is not None and isinstance(scoreboard, pd.DataFrame):
+                for rec in scoreboard.itertuples(index=False):
+                    gid = str(getattr(rec, "game_id", ""))
+                    home_team = normalize_team_abbr(getattr(rec, "home_team", ""))
+                    away_team = normalize_team_abbr(getattr(rec, "away_team", ""))
+                    home_score = float(getattr(rec, "home_score", np.nan))
+                    away_score = float(getattr(rec, "away_score", np.nan))
+                    home_prob = float(getattr(rec, "home_win_probability", np.nan))
+                    if home_team:
+                        game_script_lookup[(gid, home_team)] = {
+                            "win_prob": home_prob,
+                            "expected_margin": home_score - away_score,
+                        }
+                    if away_team:
+                        game_script_lookup[(gid, away_team)] = {
+                            "win_prob": 1.0 - home_prob if pd.notna(home_prob) else np.nan,
+                            "expected_margin": away_score - home_score,
+                        }
+        except Exception:
+            logging.debug("Unable to build game script lookup", exc_info=True)
+
+        def _scale_by_script(row: pd.Series, column: str, lead_bias: float, trail_bias: float) -> float:
+            base_val = float(row.get(column, 0.0))
+            if base_val <= 0 or not game_script_lookup:
+                return base_val
+            key = (str(row.get("game_id", "")), normalize_team_abbr(row.get("team", "")))
+            script = game_script_lookup.get(key)
+            if not script:
+                return base_val
+            margin = script.get("expected_margin")
+            if not pd.isfinite(margin):
+                return base_val
+            margin_scale = np.clip(margin / 21.0, -1.0, 1.0)
+            bias = lead_bias if margin_scale > 0 else trail_bias
+            scaled = base_val * (1.0 + bias * margin_scale)
+            return float(max(0.0, scaled))
+
+        league_pass_avg = float(player_features.get("opp_defense_pass_rating", pd.Series(dtype=float)).mean())
+        league_pass_std = float(player_features.get("opp_defense_pass_rating", pd.Series(dtype=float)).std()) or 1.0
+        league_rush_avg = float(player_features.get("opp_defense_rush_rating", pd.Series(dtype=float)).mean())
+        league_rush_std = float(player_features.get("opp_defense_rush_rating", pd.Series(dtype=float)).std()) or 1.0
+
+        def _defense_scale(row: pd.Series, column: str, avg: float, std: float, weight: float) -> float:
+            base_val = float(row.get(column, 0.0))
+            if base_val <= 0:
+                return base_val
+            rating = row.get("opp_defense_pass_rating") if "receiving" in column or "passing" in column else row.get("opp_defense_rush_rating")
+            if rating is None or not pd.isfinite(float(rating)):
+                return base_val
+            z = (float(rating) - avg) / std
+            scaled = base_val * (1.0 - weight * z)
+            return float(max(0.0, scaled))
+
+        script_scaled = player_predictions.copy()
+
+        for col in ["pred_rushing_yards", "pred_rushing_tds"]:
+            script_scaled[col] = script_scaled.apply(
+                _scale_by_script, axis=1, column=col, lead_bias=0.35, trail_bias=-0.25
+            )
+
+        for col in ["pred_receiving_yards", "pred_receptions", "pred_receiving_tds", "pred_passing_yards"]:
+            script_scaled[col] = script_scaled.apply(
+                _scale_by_script, axis=1, column=col, lead_bias=-0.25, trail_bias=0.20
+            )
+
+        for col in [
+            "pred_receiving_yards",
+            "pred_receptions",
+            "pred_receiving_tds",
+            "pred_passing_yards",
+        ]:
+            script_scaled[col] = script_scaled.apply(
+                _defense_scale,
+                axis=1,
+                column=col,
+                avg=league_pass_avg,
+                std=league_pass_std,
+                weight=0.12,
+            )
+
+        for col in ["pred_rushing_yards", "pred_rushing_tds"]:
+            script_scaled[col] = script_scaled.apply(
+                _defense_scale,
+                axis=1,
+                column=col,
+                avg=league_rush_avg,
+                std=league_rush_std,
+                weight=0.12,
+            )
+
+        player_predictions = script_scaled
+
         qb_mask = player_predictions["position"] == "QB"
         rb_mask = player_predictions["position"] == "RB"
         wr_mask = player_predictions["position"] == "WR"
