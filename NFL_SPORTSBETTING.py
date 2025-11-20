@@ -17879,7 +17879,8 @@ def predict_upcoming_games(
             if base_val <= 0:
                 return base_val
             rating = row.get("opp_defense_pass_rating") if "receiving" in column or "passing" in column else row.get("opp_defense_rush_rating")
-            if rating is None or not pd.isfinite(float(rating)):
+            # pandas does not expose isfinite; guard with numpy to avoid AttributeError
+            if rating is None or not np.isfinite(float(rating)):
                 return base_val
             z = (float(rating) - avg) / std
             scaled = base_val * (1.0 - weight * z)
