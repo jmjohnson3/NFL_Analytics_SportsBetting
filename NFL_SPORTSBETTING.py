@@ -137,28 +137,23 @@ DEFAULT_TRAVEL_CONTEXT_PATH = _default_data_file("team_travel_context.csv")
 
 # ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
 def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
+    """Return True when a frame has no usable rows/cols so concat can skip it."""
+
     if df is None:
         return True
     if not isinstance(df, pd.DataFrame):
         return True
-    if df.empty:
+    # Empty rows or columns mean there is nothing to contribute
+    if df.shape[0] == 0 or df.shape[1] == 0:
         return True
-    # all columns all-NA
+
+    # Drop rows/cols that are entirely NA; if nothing remains it is effectively empty
     try:
-        if df.shape[1] == 0:
-            return True
-        # Explicitly drop rows where every column is NA to catch frames that carry
-        # column metadata but no actual values (the scenario pandas warns about).
-        if df.dropna(how="all").empty:
-            return True
-        # Some extension dtypes can surface NaN-like sentinels that bypass the
-        # per-column check above; fall back to a full-frame isna scan as a final
-        # guard before allowing concat to proceed.
-        if pd.isna(df.to_numpy()).all():
-            return True
+        trimmed = df.dropna(how="all").dropna(axis=1, how="all")
     except Exception:
-        pass
-    return False
+        return True
+
+    return trimmed.empty
 
 def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
     """Concat that ignores None/empty/all-NA frames to avoid FutureWarnings and dtype drift."""
