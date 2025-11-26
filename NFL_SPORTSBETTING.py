@@ -147,7 +147,14 @@ def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
     try:
         if df.shape[1] == 0:
             return True
-        if all(df[col].isna().all() for col in df.columns):
+        # Explicitly drop rows where every column is NA to catch frames that carry
+        # column metadata but no actual values (the scenario pandas warns about).
+        if df.dropna(how="all").empty:
+            return True
+        # Some extension dtypes can surface NaN-like sentinels that bypass the
+        # per-column check above; fall back to a full-frame isna scan as a final
+        # guard before allowing concat to proceed.
+        if pd.isna(df.to_numpy()).all():
             return True
     except Exception:
         pass
