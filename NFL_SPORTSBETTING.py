@@ -147,6 +147,20 @@ def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
     if df.shape[0] == 0 or df.shape[1] == 0:
         return True
 
+    # If every cell is NA, it contributes nothing to concat
+    try:
+        if df.isna().to_numpy().all():
+            return True
+    except Exception:
+        return True
+
+    # If pandas counts zero non-NA values, the frame is effectively empty
+    try:
+        if df.count().sum() == 0:
+            return True
+    except Exception:
+        return True
+
     # Drop rows/cols that are entirely NA; if nothing remains it is effectively empty
     try:
         trimmed = df.dropna(how="all").dropna(axis=1, how="all")
