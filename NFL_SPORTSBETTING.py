@@ -17705,6 +17705,26 @@ def predict_upcoming_games(
                 columns=[c for c in player_features.columns if c.endswith("_from_game")],
                 errors="ignore",
             )
+
+    # Ensure opponent defensive ratings are always populated so matchup scaling
+    # is effective. When both the team-strength snapshot and the game-level
+    # backfill are missing, fall back to the league average for that column.
+    if not player_features.empty:
+        for col in ["opp_defense_pass_rating", "opp_defense_rush_rating"]:
+            if col not in player_features.columns:
+                continue
+            league_avg = float(player_features[col].dropna().mean())
+            if np.isnan(league_avg):
+                league_avg = 0.0
+            missing = int(player_features[col].isna().sum())
+            if missing:
+                logging.debug(
+                    "Imputing %s for %s missing values with league average %.3f",
+                    col,
+                    missing,
+                    league_avg,
+                )
+                player_features[col] = player_features[col].fillna(league_avg)
     respect_lineups = True if config is None else bool(config.respect_lineups)
     if trainer is not None:
         player_features = trainer.apply_lineup_gate(
@@ -17853,6 +17873,15 @@ def predict_upcoming_games(
         except Exception:
             logging.debug("Unable to build game script lookup", exc_info=True)
 
+        stat_cols = [
+            "pred_rushing_yards",
+            "pred_rushing_tds",
+            "pred_receiving_yards",
+            "pred_receptions",
+            "pred_receiving_tds",
+            "pred_passing_yards",
+        ]
+
         def _scale_by_script(row: pd.Series, column: str, lead_bias: float, trail_bias: float) -> float:
             base_val = float(row.get(column, 0.0))
             if base_val <= 0 or not game_script_lookup:
@@ -17874,7 +17903,17 @@ def predict_upcoming_games(
         league_rush_avg = float(player_features.get("opp_defense_rush_rating", pd.Series(dtype=float)).mean())
         league_rush_std = float(player_features.get("opp_defense_rush_rating", pd.Series(dtype=float)).std()) or 1.0
 
-        def _defense_scale(row: pd.Series, column: str, avg: float, std: float, weight: float) -> float:
+        pass_weight_base = float(getattr(config, "defense_scaling_weight_pass", 0.18) or 0.18)
+        rush_weight_base = float(getattr(config, "defense_scaling_weight_rush", 0.16) or 0.16)
+        position_weight_caps = {"WR": 0.22, "TE": 0.22, "RB": 0.16, "QB": 0.12}
+
+        def _defense_scale(
+            row: pd.Series,
+            column: str,
+            avg: float,
+            std: float,
+            base_weight: float,
+        ) -> float:
             base_val = float(row.get(column, 0.0))
             if base_val <= 0:
                 return base_val
@@ -17882,11 +17921,15 @@ def predict_upcoming_games(
             # pandas does not expose isfinite; guard with numpy to avoid AttributeError
             if rating is None or not np.isfinite(float(rating)):
                 return base_val
-            z = (float(rating) - avg) / std
+            z = np.clip((float(rating) - avg) / std, -2.5, 2.5)
+            position = str(row.get("position", "")).upper()
+            weight_cap = position_weight_caps.get(position, base_weight)
+            weight = min(base_weight, weight_cap)
             scaled = base_val * (1.0 - weight * z)
             return float(max(0.0, scaled))
 
         script_scaled = player_predictions.copy()
+        pre_script_means = {col: float(script_scaled[col].mean()) for col in stat_cols if col in script_scaled}
 
         for col in ["pred_rushing_yards", "pred_rushing_tds"]:
             script_scaled[col] = script_scaled.apply(
@@ -17897,6 +17940,12 @@ def predict_upcoming_games(
             script_scaled[col] = script_scaled.apply(
                 _scale_by_script, axis=1, column=col, lead_bias=-0.25, trail_bias=0.20
             )
+
+        post_script_means = {col: float(script_scaled[col].mean()) for col in stat_cols if col in script_scaled}
+        logging.debug(
+            "Script scaling deltas: %s",
+            {k: post_script_means.get(k, 0.0) - pre_script_means.get(k, 0.0) for k in post_script_means},
+        )
 
         for col in [
             "pred_receiving_yards",
@@ -17910,7 +17959,7 @@ def predict_upcoming_games(
                 column=col,
                 avg=league_pass_avg,
                 std=league_pass_std,
-                weight=0.12,
+                base_weight=pass_weight_base,
             )
 
         for col in ["pred_rushing_yards", "pred_rushing_tds"]:
@@ -17920,8 +17969,14 @@ def predict_upcoming_games(
                 column=col,
                 avg=league_rush_avg,
                 std=league_rush_std,
-                weight=0.12,
+                base_weight=rush_weight_base,
             )
+
+        post_defense_means = {col: float(script_scaled[col].mean()) for col in stat_cols if col in script_scaled}
+        logging.debug(
+            "Defense scaling deltas: %s",
+            {k: post_defense_means.get(k, 0.0) - post_script_means.get(k, 0.0) for k in post_defense_means},
+        )
 
         player_predictions = script_scaled
 
