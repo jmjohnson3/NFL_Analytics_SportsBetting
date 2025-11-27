@@ -137,31 +137,64 @@ DEFAULT_TRAVEL_CONTEXT_PATH = _default_data_file("team_travel_context.csv")
 
 # ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
 def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
+    """Return True when a frame has no usable rows/cols so concat can skip it."""
+
     if df is None:
         return True
     if not isinstance(df, pd.DataFrame):
         return True
-    if df.empty:
+    # Empty rows or columns mean there is nothing to contribute
+    if df.shape[0] == 0 or df.shape[1] == 0:
         return True
-    # all columns all-NA
+
+    # If every cell is NA, it contributes nothing to concat
     try:
-        if df.shape[1] == 0:
-            return True
-        if all(df[col].isna().all() for col in df.columns):
+        if df.isna().to_numpy().all():
             return True
     except Exception:
-        pass
-    return False
+        return True
+
+    # If pandas counts zero non-NA values, the frame is effectively empty
+    try:
+        if df.count().sum() == 0:
+            return True
+    except Exception:
+        return True
+
+    # Drop rows/cols that are entirely NA; if nothing remains it is effectively empty
+    try:
+        trimmed = df.dropna(how="all").dropna(axis=1, how="all")
+    except Exception:
+        return True
+
+    return trimmed.empty
 
 def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
     """Concat that ignores None/empty/all-NA frames to avoid FutureWarnings and dtype drift."""
-    cleaned = [f for f in frames if not _is_effectively_empty_df(f)]
+    cleaned: List[pd.DataFrame] = []
+    for f in frames:
+        if _is_effectively_empty_df(f):
+            continue
+
+        # Remove fully empty rows/cols so we don't pass all-NA blocks to concat
+        try:
+            trimmed = f.dropna(how="all").dropna(axis=1, how="all")
+        except Exception:
+            # If anything goes wrong, skip the frame rather than risk warnings downstream
+            continue
+
+        if trimmed.empty:
+            continue
+
+        # Avoid returning a view that upstream callers might mutate
+        cleaned.append(trimmed.copy())
+
     if not cleaned:
         # Return an empty but stable DataFrame if everything is empty
         return pd.DataFrame()
     if len(cleaned) == 1:
-        # Avoid returning a view into the input DataFrame which could be mutated upstream
-        return cleaned[0].copy()
+        # Already copied above, so we can return the single frame directly
+        return cleaned[0]
     return pd.concat(cleaned, **kwargs)
 
 
