@@ -171,13 +171,30 @@ def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
 
 def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
     """Concat that ignores None/empty/all-NA frames to avoid FutureWarnings and dtype drift."""
-    cleaned = [f for f in frames if not _is_effectively_empty_df(f)]
+    cleaned: List[pd.DataFrame] = []
+    for f in frames:
+        if _is_effectively_empty_df(f):
+            continue
+
+        # Remove fully empty rows/cols so we don't pass all-NA blocks to concat
+        try:
+            trimmed = f.dropna(how="all").dropna(axis=1, how="all")
+        except Exception:
+            # If anything goes wrong, skip the frame rather than risk warnings downstream
+            continue
+
+        if trimmed.empty:
+            continue
+
+        # Avoid returning a view that upstream callers might mutate
+        cleaned.append(trimmed.copy())
+
     if not cleaned:
         # Return an empty but stable DataFrame if everything is empty
         return pd.DataFrame()
     if len(cleaned) == 1:
-        # Avoid returning a view into the input DataFrame which could be mutated upstream
-        return cleaned[0].copy()
+        # Already copied above, so we can return the single frame directly
+        return cleaned[0]
     return pd.concat(cleaned, **kwargs)
 
 
