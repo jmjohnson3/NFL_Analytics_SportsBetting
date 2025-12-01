@@ -11730,13 +11730,9 @@ class FeatureBuilder:
             if col not in features.columns
         }
         if missing_numeric_cols:
-            # Populate the missing columns in one concat to avoid fragmenting the frame
+            # Populate missing columns in a single assign to avoid fragmenting the frame
             # (repeated `frame.insert` calls can be very slow and emit PerformanceWarnings).
-            defaults_df = pd.DataFrame(
-                {col: default for col, default in missing_numeric_cols.items()},
-                index=features.index,
-            )
-            features = pd.concat([features, defaults_df], axis=1)
+            features = features.assign(**missing_numeric_cols)
             # De-fragment after the bulk add so downstream assignments don't warn.
             features = features.copy()
 
