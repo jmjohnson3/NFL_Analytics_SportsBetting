@@ -11730,11 +11730,10 @@ class FeatureBuilder:
             if col not in features.columns
         }
         if missing_numeric_cols:
-            filler = pd.DataFrame(
-                {col: default for col, default in missing_numeric_cols.items()},
-                index=features.index,
-            )
-            features = safe_concat([features, filler], axis=1)
+            for col, default in missing_numeric_cols.items():
+                # Populate the missing column with the broadcast default even if it is all
+                # NA/zero so downstream fill operations can target the column safely.
+                features[col] = default
 
         loader = getattr(self, "supplemental_loader", None)
         travel_context = None
