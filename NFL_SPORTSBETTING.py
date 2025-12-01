@@ -11737,6 +11737,8 @@ class FeatureBuilder:
                 index=features.index,
             )
             features = pd.concat([features, defaults_df], axis=1)
+            # De-fragment after the bulk add so downstream assignments don't warn.
+            features = features.copy()
 
         loader = getattr(self, "supplemental_loader", None)
         travel_context = None
