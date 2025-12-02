@@ -11730,11 +11730,11 @@ class FeatureBuilder:
             if col not in features.columns
         }
         if missing_numeric_cols:
-            # Populate missing columns in a single assign to avoid fragmenting the frame
-            # (repeated `frame.insert` calls can be very slow and emit PerformanceWarnings).
-            features = features.assign(**missing_numeric_cols)
-            # De-fragment after the bulk add so downstream assignments don't warn.
-            features = features.copy()
+            # De-fragment before appending placeholders, then add them in one concat to avoid
+            # repeated insert churn that triggers pandas fragmentation warnings.
+            base = features.copy()
+            missing_df = pd.DataFrame(missing_numeric_cols, index=base.index)
+            features = pd.concat([base, missing_df], axis=1)
 
         loader = getattr(self, "supplemental_loader", None)
         travel_context = None
