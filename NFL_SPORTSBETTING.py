@@ -11734,7 +11734,7 @@ class FeatureBuilder:
             # repeated insert churn that triggers pandas fragmentation warnings.
             base = features.copy()
             missing_df = pd.DataFrame(missing_numeric_cols, index=base.index)
-            features = pd.concat([base, missing_df], axis=1)
+            features = pd.concat([base, missing_df], axis=1, copy=False).copy()
 
         loader = getattr(self, "supplemental_loader", None)
         travel_context = None
