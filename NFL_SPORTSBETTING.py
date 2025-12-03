@@ -11730,11 +11730,12 @@ class FeatureBuilder:
             if col not in features.columns
         }
         if missing_numeric_cols:
-            # De-fragment before appending placeholders, then add them in one concat to avoid
-            # repeated insert churn that triggers pandas fragmentation warnings.
-            base = features.copy()
-            missing_df = pd.DataFrame(missing_numeric_cols, index=base.index)
-            features = pd.concat([base, missing_df], axis=1, copy=False).copy()
+            # De-fragment the frame before appending placeholders, then add them in one
+            # concat to avoid repeated insert churn that triggers pandas fragmentation
+            # warnings when the upstream merges leave a fragmented BlockManager.
+            features = features.copy()
+            missing_df = pd.DataFrame(missing_numeric_cols, index=features.index)
+            features = pd.concat([features, missing_df], axis=1, copy=False).copy()
 
         loader = getattr(self, "supplemental_loader", None)
         travel_context = None
