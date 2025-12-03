@@ -95,7 +95,10 @@ samples with real, validated records before relying on any model output.
 Player stat forecasts now explicitly down-weight single-game volatility. For each
 player we blend three signals: the most recent game (~5%), a rolling five-game
 average (~25% scaled down when fewer games are available), and the full-season
-average for stability (~70%). You can adjust the weights or window in
+average for stability (~70%). Forecasts are also capped to roughly a 95th
+percentile of the player's own historical production (with modest headroom) so
+backups cannot inherit starter-level stat lines. You can adjust the weights or
+window in
 `NFL_SPORTSBETTING.py` via `RECENT_FORM_LAST_GAME_WEIGHT`,
 `RECENT_FORM_WINDOW_WEIGHT`, and `RECENT_FORM_GAMES` if you want a different
 balance between short- and long-term form.

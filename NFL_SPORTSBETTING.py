@@ -5871,6 +5871,13 @@ RECENT_FORM_GAMES = 5
 RECENT_FORM_LAST_GAME_WEIGHT = 0.05
 RECENT_FORM_WINDOW_WEIGHT = 0.25
 
+# Historical guardrail: clamp forecasts to stay within a reasonable band of the
+# player's own production history so backups do not inherit starter-level
+# projections. A 95th percentile cap with mild headroom leaves room for growth
+# while blocking multi-sigma blowups.
+PLAYER_HISTORY_CAP_QUANTILE = 0.95
+PLAYER_HISTORY_CAP_HEADROOM = 1.35
+
 
 _NAME_PUNCT_RE = re.compile(r"[^\w\s]")
 _NAME_SPACE_RE = re.compile(r"\s+")
@@ -12113,10 +12120,49 @@ class FeatureBuilder:
                 .reset_index()
             )
 
+            # Capture historical ceilings so we can cap projections for backups
+            # that have never produced starter-level stat lines.
+            quantile_caps = (
+                recent_source.groupby("player_id")[present_stats]
+                .quantile(PLAYER_HISTORY_CAP_QUANTILE)
+                .rename(columns=lambda c: f"cap_{c}")
+                .reset_index()
+            )
+            max_caps = (
+                recent_source.groupby("player_id")[present_stats]
+                .max()
+                .rename(columns=lambda c: f"cap_{c}_max")
+                .reset_index()
+            )
+            mean_caps = (
+                recent_source.groupby("player_id")[present_stats]
+                .mean()
+                .rename(columns=lambda c: f"cap_{c}_mean")
+                .reset_index()
+            )
+            historical_caps = quantile_caps.merge(max_caps, on="player_id", how="outer")
+            historical_caps = historical_caps.merge(mean_caps, on="player_id", how="outer")
+            for col in present_stats:
+                quant_col = f"cap_{col}"
+                historical_caps[quant_col] = (
+                    historical_caps.get(quant_col)
+                    .fillna(historical_caps.get(f"cap_{col}_max"))
+                    .fillna(historical_caps.get(f"cap_{col}_mean"))
+                )
+
+            drop_helpers = [
+                c
+                for c in historical_caps.columns
+                if c.endswith("_max") or c.endswith("_mean")
+            ]
+            historical_caps = historical_caps.drop(columns=drop_helpers, errors="ignore")
+
             latest_players = latest_players.merge(
                 recent_means, on="player_id", how="left"
             ).merge(recent_counts, on="player_id", how="left").merge(
                 season_means, on="player_id", how="left"
+            ).merge(
+                historical_caps, on="player_id", how="left"
             )
 
             season_weight = max(
@@ -12184,6 +12230,20 @@ class FeatureBuilder:
                 blended = blended.where(blended.notna(), latest_values)
                 latest_players[col] = blended
 
+                cap_col = f"cap_{col}"
+                if cap_col in latest_players.columns:
+                    caps = pd.to_numeric(
+                        latest_players.get(cap_col), errors="coerce"
+                    )
+                    if caps.notna().any():
+                        latest_players[col] = latest_players[col].where(
+                            latest_players[col].isna(),
+                            np.minimum(
+                                latest_players[col],
+                                caps * PLAYER_HISTORY_CAP_HEADROOM,
+                            ),
+                        )
+
             drop_temp_cols = [
                 col
                 for col in latest_players.columns
@@ -12193,6 +12253,12 @@ class FeatureBuilder:
                 latest_players = latest_players.drop(
                     columns=drop_temp_cols, errors="ignore"
                 )
+
+        else:
+            recent_counts = pd.DataFrame({"player_id": [], "recent_games": []})
+            recent_means = pd.DataFrame({"player_id": [], "recent_avg_dummy": []})
+            season_means = pd.DataFrame({"player_id": [], "season_avg_dummy": []})
+            historical_caps = pd.DataFrame({"player_id": []})
 
         season_source = base_players.copy()
         season_source["team"] = season_source["team"].apply(normalize_team_abbr)
