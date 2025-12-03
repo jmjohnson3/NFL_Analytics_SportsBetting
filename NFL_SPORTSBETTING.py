@@ -5864,7 +5864,12 @@ LINEUP_STALENESS_DAYS = 7
 LINEUP_MAX_AGE_BEFORE_GAME_DAYS = 21  # allow expected lineups up to 3 weeks old relative to kickoff
 
 RECENT_FORM_GAMES = 5
-RECENT_FORM_WEIGHT = 0.7
+# Weighting scheme for player stat smoothing
+# - last game keeps a small footprint to avoid single-week overreaction
+# - recent window anchors short-term form
+# - season average provides long-term stability
+RECENT_FORM_LAST_GAME_WEIGHT = 0.1
+RECENT_FORM_WINDOW_WEIGHT = 0.6
 
 
 _NAME_PUNCT_RE = re.compile(r"[^\w\s]")
@@ -12096,36 +12101,70 @@ class FeatureBuilder:
                 .rename(columns=lambda c: f"recent_avg_{c}")
                 .reset_index()
             )
+            season_means = (
+                recent_source.groupby("player_id")[present_stats]
+                .mean()
+                .rename(columns=lambda c: f"season_avg_{c}")
+                .reset_index()
+            )
+
             latest_players = latest_players.merge(
                 recent_means, on="player_id", how="left"
+            ).merge(season_means, on="player_id", how="left")
+
+            season_weight = max(
+                0.0, 1.0 - RECENT_FORM_WINDOW_WEIGHT - RECENT_FORM_LAST_GAME_WEIGHT
             )
 
             for col in present_stats:
                 recent_col = f"recent_avg_{col}"
-                if recent_col not in latest_players.columns:
+                season_col = f"season_avg_{col}"
+                if recent_col not in latest_players.columns and season_col not in latest_players.columns:
                     continue
 
                 latest_values = pd.to_numeric(
                     latest_players[col], errors="coerce"
                 )
                 recent_values = pd.to_numeric(
-                    latest_players[recent_col], errors="coerce"
+                    latest_players.get(recent_col), errors="coerce"
+                )
+                season_values = pd.to_numeric(
+                    latest_players.get(season_col), errors="coerce"
                 )
 
-                blended = (
-                    RECENT_FORM_WEIGHT * recent_values
-                    + (1 - RECENT_FORM_WEIGHT) * latest_values
+                components: list[tuple[pd.Series, float]] = []
+                if latest_values.notna().any():
+                    components.append((latest_values, RECENT_FORM_LAST_GAME_WEIGHT))
+                if recent_values.notna().any():
+                    components.append((recent_values, RECENT_FORM_WINDOW_WEIGHT))
+                if season_values.notna().any() and season_weight > 0:
+                    components.append((season_values, season_weight))
+
+                if not components:
+                    continue
+
+                weights = [w for _, w in components]
+                weight_sum = sum(weights)
+                normalized = [w / weight_sum for w in weights]
+                weighted_values = sum(
+                    series * weight for series, weight in zip((c[0] for c in components), normalized)
                 )
-                blended = blended.where(recent_values.notna(), latest_values)
+
+                # Where data is missing, fall back gracefully in priority order: season -> recent -> latest
+                blended = weighted_values
+                blended = blended.where(weighted_values.notna(), season_values)
                 blended = blended.where(blended.notna(), recent_values)
+                blended = blended.where(blended.notna(), latest_values)
                 latest_players[col] = blended
 
-            drop_recent_cols = [
-                col for col in latest_players.columns if col.startswith("recent_avg_")
+            drop_temp_cols = [
+                col
+                for col in latest_players.columns
+                if col.startswith("recent_avg_") or col.startswith("season_avg_")
             ]
-            if drop_recent_cols:
+            if drop_temp_cols:
                 latest_players = latest_players.drop(
-                    columns=drop_recent_cols, errors="ignore"
+                    columns=drop_temp_cols, errors="ignore"
                 )
 
         season_source = base_players.copy()

@@ -90,6 +90,15 @@ pipeline continues to run.
 Both files ship with example rows to illustrate the required schema. Replace the
 samples with real, validated records before relying on any model output.
 
+### Player projection smoothing
+
+Player stat forecasts now explicitly down-weight single-game volatility. For each
+player we blend three signals: the most recent game (10%), a rolling five-game
+average (60%), and the full-season average for stability (30%). You can adjust
+the weights or window in `NFL_SPORTSBETTING.py` via `RECENT_FORM_LAST_GAME_WEIGHT`,
+`RECENT_FORM_WINDOW_WEIGHT`, and `RECENT_FORM_GAMES` if you want a different
+balance between short- and long-term form.
+
 ### If you cannot locate closing odds for certain games
 
 The guardrails are intentionally strict: any matchup without a verified
