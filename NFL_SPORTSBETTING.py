@@ -12258,6 +12258,14 @@ class FeatureBuilder:
                     caps = pd.to_numeric(
                         latest_players.get(cap_col), errors="coerce"
                     )
+                    # If no per-game history exists, fall back to observed season or
+                    # recent averages so backups still get a sensible ceiling rather
+                    # than inheriting starter-level roles.
+                    observed_ceiling = pd.concat(
+                        [latest_values, recent_values, season_values], axis=1
+                    ).max(axis=1, skipna=True)
+                    caps = caps.fillna(observed_ceiling)
+
                     if caps.notna().any():
                         latest_players[col] = latest_players[col].where(
                             latest_players[col].isna(),
