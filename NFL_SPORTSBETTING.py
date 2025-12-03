@@ -3639,8 +3639,27 @@ def _merge_player_prop_on_key(
 def build_player_prop_candidates(
     pred_df: pd.DataFrame, odds_df: pd.DataFrame
 ) -> pd.DataFrame:
+    base_columns = [
+        "market",
+        "player_id",
+        "player",
+        "team",
+        "opp",
+        "side",
+        "line",
+        "fair_prob",
+        "fair_american",
+        "best_american",
+        "ev",
+        "kelly_quarter",
+        "implied_prob",
+        "consensus_gap",
+        "confidence",
+        "action",
+    ]
+
     if pred_df.empty or odds_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=base_columns)
 
     pred_df = pred_df.copy().reset_index(drop=True)
     odds_df = odds_df.copy().reset_index(drop=True)
@@ -4013,7 +4032,16 @@ def build_player_prop_candidates(
             for ev, conf, gap in zip(result["ev"], result["confidence"], result["consensus_gap"])
         ]
         result = result.sort_values(["confidence", "ev"], ascending=[True, False])
-    return result
+    else:
+        for col in base_columns:
+            if col not in result:
+                result[col] = np.nan
+
+    missing_cols = [col for col in base_columns if col not in result.columns]
+    for col in missing_cols:
+        result[col] = np.nan
+
+    return result.loc[:, [c for c in base_columns if c in result.columns]]
 
 
 def build_game_totals_candidates(
@@ -4624,7 +4652,9 @@ DEFAULT_NFL_API_HTTP_RETRIES = 3
 DEFAULT_NFL_API_TIMEOUT_BACKOFF = 1.5
 
 # Hard-code the Odds API key; replace with your key if you want live odds ingestion.
-ODDS_API_KEY = "REPLACE_WITH_ODDS_API_KEY"
+# NOTE: The odds key is intentionally hard-coded for this pipeline run.
+# Replace it if you need to use your own The Odds API credential.
+ODDS_API_KEY = "5b6f0290e265c3329b3ed27897d79eaf"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 NFL_SPORT_KEY = "americanfootball_nfl"
 ODDS_GAME_REGIONS = ["us"]

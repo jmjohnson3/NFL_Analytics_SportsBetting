@@ -75,10 +75,10 @@ and auditable:
 ### Odds API configuration
 
 The optional live odds fetcher in `odds_extract.py` (and the main driver)
-hard-codes an `ODDS_API_KEY` string. Replace the placeholder value in the code
-with your The Odds API key when you want live odds ingestion. Leaving the
-placeholder intact keeps the odds pull disabled while the rest of the pipeline
-continues to run.
+ships with the key `5b6f0290e265c3329b3ed27897d79eaf` already hard-coded so
+ingestion works out of the box. Replace this value with your own The Odds API
+credential if needed; leaving it untouched keeps the bundled key in use for
+both live and historical odds pulls.
 
 Both files ship with example rows to illustrate the required schema. Replace the
 samples with real, validated records before relying on any model output.

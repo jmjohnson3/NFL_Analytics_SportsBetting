@@ -12,7 +12,9 @@ from urllib.parse import urlencode
 log = logging.getLogger(__name__)
 
 # Hard-code the Odds API key; replace with your key if you want live odds ingestion.
-ODDS_API_KEY = "REPLACE_WITH_ODDS_API_KEY"
+# NOTE: The odds key is intentionally hard-coded for this pipeline run.
+# Replace it if you need to use your own The Odds API credential.
+ODDS_API_KEY = "5b6f0290e265c3329b3ed27897d79eaf"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 NFL_SPORT_KEY = "americanfootball_nfl"
 ODDS_FORMAT = "american"
