@@ -4601,7 +4601,7 @@ DEFAULT_NFL_API_TIMEOUT_RETRIES = 2
 DEFAULT_NFL_API_HTTP_RETRIES = 3
 DEFAULT_NFL_API_TIMEOUT_BACKOFF = 1.5
 
-ODDS_API_KEY = "5b6f0290e265c3329b3ed27897d79eaf"
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 NFL_SPORT_KEY = "americanfootball_nfl"
 ODDS_GAME_REGIONS = ["us"]
@@ -4834,11 +4834,19 @@ async def _odds_get_json(
     retry_statuses: Optional[Set[int]] = None,
     **params: Any,
 ) -> Optional[Any]:
-    params = {"apiKey": api_key or ODDS_API_KEY, **params}
+    resolved_key = api_key or ODDS_API_KEY
+    params = {"apiKey": resolved_key, **params}
     url = _odds_build_url(path, params)
     retries_remaining = max_retries
     retryable = retry_statuses or {429, 500, 502, 503, 504}
     backoff = ODDS_RATE_LIMIT_DELAY
+
+    if not resolved_key:
+        odds_logger.warning(
+            "ODDS_API_KEY is not set; skipping odds request to %s and returning empty payload.",
+            path,
+        )
+        return None
 
     while True:
         try:
@@ -7686,6 +7694,11 @@ class OddsApiClient:
         include_historical: bool,
     ) -> List[Dict[str, Any]]:
         api_key = self.api_key or ODDS_API_KEY
+        if not api_key:
+            odds_logger.warning(
+                "ODDS_API_KEY is not set; skipping odds ingestion (live + historical)."
+            )
+            return []
         timeout = aiohttp.ClientTimeout(total=self.timeout)
 
         async def run_fetch(allow_insecure: bool) -> List[Dict[str, Any]]:

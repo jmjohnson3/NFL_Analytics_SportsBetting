@@ -74,10 +74,11 @@ and auditable:
 
 ### Odds API configuration
 
-The optional live odds fetcher in `odds_extract.py` now reads your The Odds API key
-from the `ODDS_API_KEY` environment variable. If the variable is missing, the
-fetcher logs a warning and returns an empty frame instead of sending unauthenticated
-requests that would fail. Export the key before running any odds collection steps:
+The optional live odds fetcher in `odds_extract.py` (and the main driver) reads
+your The Odds API key from the `ODDS_API_KEY` environment variable. If the
+variable is missing, the odds pipeline logs a warning, skips the external calls,
+and returns empty frames instead of sending unauthenticated requests that would
+fail. Export the key before running any odds collection steps:
 
 ```bash
 export ODDS_API_KEY="your-api-key"
