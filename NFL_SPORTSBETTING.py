@@ -136,58 +136,62 @@ DEFAULT_TRAVEL_CONTEXT_PATH = _default_data_file("team_travel_context.csv")
 
 
 # ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
-def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
-    """Return True when a frame has no usable rows/cols so concat can skip it."""
+def _sanitize_frame_for_concat(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Return a cleaned frame ready for concatenation or None if it should be skipped."""
 
-    if df is None:
-        return True
-    if not isinstance(df, pd.DataFrame):
-        return True
-    # Empty rows or columns mean there is nothing to contribute
-    if df.shape[0] == 0 or df.shape[1] == 0:
-        return True
+    if df is None or not isinstance(df, pd.DataFrame):
+        return None
 
-    # If every cell is NA, it contributes nothing to concat
-    try:
-        if df.isna().to_numpy().all():
-            return True
-    except Exception:
-        return True
-
-    # If pandas counts zero non-NA values, the frame is effectively empty
-    try:
-        if df.count().sum() == 0:
-            return True
-    except Exception:
-        return True
-
-    # Drop rows/cols that are entirely NA; if nothing remains it is effectively empty
+    # Drop rows/cols that are entirely NA so we only keep meaningful data
     try:
         trimmed = df.dropna(how="all").dropna(axis=1, how="all")
     except Exception:
-        return True
+        return None
 
-    return trimmed.empty
+    # Immediately discard if shape collapsed
+    if trimmed.shape[0] == 0 or trimmed.shape[1] == 0:
+        return None
+
+    # If pandas counts zero non-NA values, the frame is effectively empty
+    try:
+        if trimmed.count().sum() == 0:
+            return None
+    except Exception:
+        return None
+
+    # Remove columns that still have zero usable values to avoid all-NA entries in concat
+    try:
+        trimmed = trimmed.loc[:, trimmed.count(axis=0) > 0]
+    except Exception:
+        return None
+
+    if trimmed.shape[0] == 0 or trimmed.shape[1] == 0:
+        return None
+
+    # If every remaining cell is NA, it contributes nothing to concat
+    try:
+        if trimmed.isna().to_numpy().all():
+            return None
+    except Exception:
+        return None
+
+    return trimmed.copy()
+
+
+def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
+    """Compatibility wrapper used by legacy call sites to detect empty/NA frames."""
+
+    return _sanitize_frame_for_concat(df) is None
 
 def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
     """Concat that ignores None/empty/all-NA frames to avoid FutureWarnings and dtype drift."""
     cleaned: List[pd.DataFrame] = []
     for f in frames:
-        if _is_effectively_empty_df(f):
+        sanitized = _sanitize_frame_for_concat(f)
+        if sanitized is None or sanitized.empty:
             continue
 
-        # Remove fully empty rows/cols so we don't pass all-NA blocks to concat
-        try:
-            trimmed = f.dropna(how="all").dropna(axis=1, how="all")
-        except Exception:
-            # If anything goes wrong, skip the frame rather than risk warnings downstream
-            continue
-
-        if trimmed.empty:
-            continue
-
-        # Avoid returning a view that upstream callers might mutate
-        cleaned.append(trimmed.copy())
+        cleaned.append(sanitized)
 
     if not cleaned:
         # Return an empty but stable DataFrame if everything is empty
@@ -3924,7 +3928,7 @@ def build_player_prop_candidates(
         )
         return pd.DataFrame()
 
-    merged = pd.concat(merged_frames, ignore_index=True, sort=False)
+    merged = safe_concat(merged_frames, ignore_index=True, sort=False)
     logging.info(
         "Player prop odds merge matched %d predictions to %d sportsbook offers (pred_rows=%d, odds_rows=%d)",
         merged["_pred_index"].nunique(),
@@ -4087,7 +4091,7 @@ def emit_priced_picks(
             fallback["range_low"] = fallback.get("q10")
             fallback["range_high"] = fallback.get("q90")
         fallback_tables.append(fallback)
-    preds_all = pd.concat(stacked, ignore_index=True) if stacked else pd.DataFrame()
+    preds_all = safe_concat(stacked, ignore_index=True) if stacked else pd.DataFrame()
 
     props_priced = build_player_prop_candidates(preds_all, odds_players) if not preds_all.empty else pd.DataFrame()
     props_filtered = filter_ev(props_priced, EV_MIN_PROPS)
@@ -4095,7 +4099,7 @@ def emit_priced_picks(
 
     model_props = pd.DataFrame()
     if fallback_tables:
-        model_props = pd.concat(fallback_tables, ignore_index=True)
+        model_props = safe_concat(fallback_tables, ignore_index=True)
         columns_order = [
             col
             for col in [
@@ -7740,7 +7744,7 @@ class OddsApiClient:
 
                 events_meta = pd.DataFrame()
                 if events_meta_frames:
-                    events_meta = pd.concat(events_meta_frames, ignore_index=True)
+                    events_meta = safe_concat(events_meta_frames, ignore_index=True)
                     if 'event_id' in events_meta.columns:
                         events_meta['event_id'] = events_meta['event_id'].astype(str)
                     else:
@@ -7835,7 +7839,7 @@ class OddsApiClient:
                                         history_games['commence_dt'], errors='coerce', utc=True
                                     )
                                 game_df = (
-                                    pd.concat([game_df, history_games], ignore_index=True)
+                                    safe_concat([game_df, history_games], ignore_index=True)
                                     if not game_df.empty
                                     else history_games
                                 )
@@ -7960,7 +7964,7 @@ class OddsApiClient:
                                         history_props['commence_dt'] <= end_bound
                                     ]
                                 prop_df = (
-                                    pd.concat([prop_df, history_props], ignore_index=True)
+                                    safe_concat([prop_df, history_props], ignore_index=True)
                                     if not prop_df.empty
                                     else history_props
                                 )
@@ -11726,11 +11730,12 @@ class FeatureBuilder:
             if col not in features.columns
         }
         if missing_numeric_cols:
-            filler = pd.DataFrame(
-                {col: default for col, default in missing_numeric_cols.items()},
-                index=features.index,
-            )
-            features = pd.concat([features, filler], axis=1)
+            # De-fragment the frame before appending placeholders, then add them in one
+            # concat to avoid repeated insert churn that triggers pandas fragmentation
+            # warnings when the upstream merges leave a fragmented BlockManager.
+            features = features.copy()
+            missing_df = pd.DataFrame(missing_numeric_cols, index=features.index)
+            features = pd.concat([features, missing_df], axis=1, copy=False).copy()
 
         loader = getattr(self, "supplemental_loader", None)
         travel_context = None
@@ -12498,7 +12503,7 @@ class FeatureBuilder:
             if not part.empty:
                 extra_hist.append(part)
         if extra_hist:
-            extra_hist = pd.concat(extra_hist, ignore_index=True)
+            extra_hist = safe_concat(extra_hist, ignore_index=True)
             extra_hist = extra_hist.groupby("player_id")["extra_hist_game_count"].sum().reset_index()
             latest_players = latest_players.merge(extra_hist, on="player_id", how="left")
             latest_players["extra_hist_game_count"] = latest_players["extra_hist_game_count"].fillna(0).astype(int)
@@ -15521,7 +15526,7 @@ class ModelTrainer:
 
                 if not picks:
                     return None
-                return pd.concat(picks, ignore_index=True)
+                return safe_concat(picks, ignore_index=True)
 
             candidate_thresholds: List[float] = []
             seen_thresholds: Set[float] = set()
