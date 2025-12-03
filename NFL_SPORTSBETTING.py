@@ -5865,11 +5865,11 @@ LINEUP_MAX_AGE_BEFORE_GAME_DAYS = 21  # allow expected lineups up to 3 weeks old
 
 RECENT_FORM_GAMES = 5
 # Weighting scheme for player stat smoothing
-# - last game keeps a small footprint to avoid single-week overreaction
-# - recent window anchors short-term form
+# - last game keeps a tiny footprint to avoid single-week overreaction
+# - recent window anchors short-term form but is shrunk when few games exist
 # - season average provides long-term stability
-RECENT_FORM_LAST_GAME_WEIGHT = 0.1
-RECENT_FORM_WINDOW_WEIGHT = 0.6
+RECENT_FORM_LAST_GAME_WEIGHT = 0.05
+RECENT_FORM_WINDOW_WEIGHT = 0.25
 
 
 _NAME_PUNCT_RE = re.compile(r"[^\w\s]")
@@ -12095,6 +12095,11 @@ class FeatureBuilder:
                 .groupby("player_id")
                 .tail(RECENT_FORM_GAMES)
             )
+            recent_counts = (
+                recent_stats.groupby("player_id")["start_time"].size()
+                .rename("recent_games")
+                .reset_index()
+            )
             recent_means = (
                 recent_stats.groupby("player_id")[present_stats]
                 .mean()
@@ -12110,7 +12115,9 @@ class FeatureBuilder:
 
             latest_players = latest_players.merge(
                 recent_means, on="player_id", how="left"
-            ).merge(season_means, on="player_id", how="left")
+            ).merge(recent_counts, on="player_id", how="left").merge(
+                season_means, on="player_id", how="left"
+            )
 
             season_weight = max(
                 0.0, 1.0 - RECENT_FORM_WINDOW_WEIGHT - RECENT_FORM_LAST_GAME_WEIGHT
@@ -12132,23 +12139,43 @@ class FeatureBuilder:
                     latest_players.get(season_col), errors="coerce"
                 )
 
-                components: list[tuple[pd.Series, float]] = []
+                recent_games = pd.to_numeric(
+                    latest_players.get("recent_games"), errors="coerce"
+                ).fillna(0)
+                recent_scale = (recent_games / RECENT_FORM_GAMES).clip(lower=0.0, upper=1.0)
+
+                components: list[tuple[pd.Series, pd.Series]] = []
                 if latest_values.notna().any():
-                    components.append((latest_values, RECENT_FORM_LAST_GAME_WEIGHT))
+                    components.append(
+                        (
+                            latest_values,
+                            pd.Series(RECENT_FORM_LAST_GAME_WEIGHT, index=latest_players.index),
+                        )
+                    )
                 if recent_values.notna().any():
-                    components.append((recent_values, RECENT_FORM_WINDOW_WEIGHT))
+                    components.append(
+                        (
+                            recent_values,
+                            pd.Series(RECENT_FORM_WINDOW_WEIGHT, index=latest_players.index)
+                            * recent_scale,
+                        )
+                    )
                 if season_values.notna().any() and season_weight > 0:
-                    components.append((season_values, season_weight))
+                    components.append(
+                        (
+                            season_values,
+                            pd.Series(season_weight, index=latest_players.index),
+                        )
+                    )
 
                 if not components:
                     continue
 
                 weights = [w for _, w in components]
                 weight_sum = sum(weights)
-                normalized = [w / weight_sum for w in weights]
-                weighted_values = sum(
-                    series * weight for series, weight in zip((c[0] for c in components), normalized)
-                )
+                weight_sum = weight_sum.replace(0, np.nan)
+                weighted_values = sum(series * weight for series, weight in components)
+                weighted_values = weighted_values / weight_sum
 
                 # Where data is missing, fall back gracefully in priority order: season -> recent -> latest
                 blended = weighted_values
