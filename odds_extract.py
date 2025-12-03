@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Iterable, Sequence
 
 import aiohttp
@@ -11,7 +12,7 @@ from urllib.parse import urlencode
 
 log = logging.getLogger(__name__)
 
-ODDS_API_KEY = ""
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 NFL_SPORT_KEY = "americanfootball_nfl"
 ODDS_FORMAT = "american"
@@ -87,6 +88,24 @@ async def fetch_nfl_game_odds(
     odds_format: str = ODDS_FORMAT,
     date_format: str = "iso",
 ) -> pd.DataFrame:
+    if not ODDS_API_KEY:
+        log.warning("ODDS_API_KEY is not set; skipping odds fetch and returning empty frame.")
+        return pd.DataFrame(
+            columns=[
+                "event_id",
+                "commence_time",
+                "home_team",
+                "away_team",
+                "book",
+                "market",
+                "side",
+                "line",
+                "american_odds",
+                "decimal_odds",
+                "imp_prob",
+            ]
+        )
+
     if isinstance(regions, (list, tuple)):
         regions = ",".join(regions)
     if isinstance(markets, (list, tuple)):

@@ -72,6 +72,20 @@ and auditable:
   and timezone adjustments for each team/week. These values flow directly into the
   situational feature set so the models stop learning on `NaN` placeholders.
 
+### Odds API configuration
+
+The optional live odds fetcher in `odds_extract.py` now reads your The Odds API key
+from the `ODDS_API_KEY` environment variable. If the variable is missing, the
+fetcher logs a warning and returns an empty frame instead of sending unauthenticated
+requests that would fail. Export the key before running any odds collection steps:
+
+```bash
+export ODDS_API_KEY="your-api-key"
+```
+
+Leaving the variable unset will keep the odds pull disabled while the rest of the
+pipeline continues to run.
+
 Both files ship with example rows to illustrate the required schema. Replace the
 samples with real, validated records before relying on any model output.
 
