@@ -136,32 +136,69 @@ DEFAULT_TRAVEL_CONTEXT_PATH = _default_data_file("team_travel_context.csv")
 
 
 # ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
-def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
-    if df is None:
-        return True
-    if not isinstance(df, pd.DataFrame):
-        return True
-    if df.empty:
-        return True
-    # all columns all-NA
+def _sanitize_frame_for_concat(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Return a cleaned frame ready for concatenation or None if it should be skipped."""
+
+    if df is None or not isinstance(df, pd.DataFrame):
+        return None
+
+    # Drop rows/cols that are entirely NA so we only keep meaningful data
     try:
-        if df.shape[1] == 0:
-            return True
-        if all(df[col].isna().all() for col in df.columns):
-            return True
+        trimmed = df.dropna(how="all").dropna(axis=1, how="all")
     except Exception:
-        pass
-    return False
+        return None
+
+    # Immediately discard if shape collapsed
+    if trimmed.shape[0] == 0 or trimmed.shape[1] == 0:
+        return None
+
+    # If pandas counts zero non-NA values, the frame is effectively empty
+    try:
+        if trimmed.count().sum() == 0:
+            return None
+    except Exception:
+        return None
+
+    # Remove columns that still have zero usable values to avoid all-NA entries in concat
+    try:
+        trimmed = trimmed.loc[:, trimmed.count(axis=0) > 0]
+    except Exception:
+        return None
+
+    if trimmed.shape[0] == 0 or trimmed.shape[1] == 0:
+        return None
+
+    # If every remaining cell is NA, it contributes nothing to concat
+    try:
+        if trimmed.isna().to_numpy().all():
+            return None
+    except Exception:
+        return None
+
+    return trimmed.copy()
+
+
+def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
+    """Compatibility wrapper used by legacy call sites to detect empty/NA frames."""
+
+    return _sanitize_frame_for_concat(df) is None
 
 def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
     """Concat that ignores None/empty/all-NA frames to avoid FutureWarnings and dtype drift."""
-    cleaned = [f for f in frames if not _is_effectively_empty_df(f)]
+    cleaned: List[pd.DataFrame] = []
+    for f in frames:
+        sanitized = _sanitize_frame_for_concat(f)
+        if sanitized is None or sanitized.empty:
+            continue
+
+        cleaned.append(sanitized)
+
     if not cleaned:
         # Return an empty but stable DataFrame if everything is empty
         return pd.DataFrame()
     if len(cleaned) == 1:
-        # Avoid returning a view into the input DataFrame which could be mutated upstream
-        return cleaned[0].copy()
+        # Already copied above, so we can return the single frame directly
+        return cleaned[0]
     return pd.concat(cleaned, **kwargs)
 
 
@@ -3891,7 +3928,7 @@ def build_player_prop_candidates(
         )
         return pd.DataFrame()
 
-    merged = pd.concat(merged_frames, ignore_index=True, sort=False)
+    merged = safe_concat(merged_frames, ignore_index=True, sort=False)
     logging.info(
         "Player prop odds merge matched %d predictions to %d sportsbook offers (pred_rows=%d, odds_rows=%d)",
         merged["_pred_index"].nunique(),
@@ -4054,7 +4091,7 @@ def emit_priced_picks(
             fallback["range_low"] = fallback.get("q10")
             fallback["range_high"] = fallback.get("q90")
         fallback_tables.append(fallback)
-    preds_all = pd.concat(stacked, ignore_index=True) if stacked else pd.DataFrame()
+    preds_all = safe_concat(stacked, ignore_index=True) if stacked else pd.DataFrame()
 
     props_priced = build_player_prop_candidates(preds_all, odds_players) if not preds_all.empty else pd.DataFrame()
     props_filtered = filter_ev(props_priced, EV_MIN_PROPS)
@@ -4062,7 +4099,7 @@ def emit_priced_picks(
 
     model_props = pd.DataFrame()
     if fallback_tables:
-        model_props = pd.concat(fallback_tables, ignore_index=True)
+        model_props = safe_concat(fallback_tables, ignore_index=True)
         columns_order = [
             col
             for col in [
@@ -7707,7 +7744,7 @@ class OddsApiClient:
 
                 events_meta = pd.DataFrame()
                 if events_meta_frames:
-                    events_meta = pd.concat(events_meta_frames, ignore_index=True)
+                    events_meta = safe_concat(events_meta_frames, ignore_index=True)
                     if 'event_id' in events_meta.columns:
                         events_meta['event_id'] = events_meta['event_id'].astype(str)
                     else:
@@ -7802,7 +7839,7 @@ class OddsApiClient:
                                         history_games['commence_dt'], errors='coerce', utc=True
                                     )
                                 game_df = (
-                                    pd.concat([game_df, history_games], ignore_index=True)
+                                    safe_concat([game_df, history_games], ignore_index=True)
                                     if not game_df.empty
                                     else history_games
                                 )
@@ -7927,7 +7964,7 @@ class OddsApiClient:
                                         history_props['commence_dt'] <= end_bound
                                     ]
                                 prop_df = (
-                                    pd.concat([prop_df, history_props], ignore_index=True)
+                                    safe_concat([prop_df, history_props], ignore_index=True)
                                     if not prop_df.empty
                                     else history_props
                                 )
@@ -11693,11 +11730,12 @@ class FeatureBuilder:
             if col not in features.columns
         }
         if missing_numeric_cols:
-            filler = pd.DataFrame(
-                {col: default for col, default in missing_numeric_cols.items()},
-                index=features.index,
-            )
-            features = pd.concat([features, filler], axis=1)
+            # De-fragment the frame before appending placeholders, then add them in one
+            # concat to avoid repeated insert churn that triggers pandas fragmentation
+            # warnings when the upstream merges leave a fragmented BlockManager.
+            features = features.copy()
+            missing_df = pd.DataFrame(missing_numeric_cols, index=features.index)
+            features = pd.concat([features, missing_df], axis=1, copy=False).copy()
 
         loader = getattr(self, "supplemental_loader", None)
         travel_context = None
@@ -12465,7 +12503,7 @@ class FeatureBuilder:
             if not part.empty:
                 extra_hist.append(part)
         if extra_hist:
-            extra_hist = pd.concat(extra_hist, ignore_index=True)
+            extra_hist = safe_concat(extra_hist, ignore_index=True)
             extra_hist = extra_hist.groupby("player_id")["extra_hist_game_count"].sum().reset_index()
             latest_players = latest_players.merge(extra_hist, on="player_id", how="left")
             latest_players["extra_hist_game_count"] = latest_players["extra_hist_game_count"].fillna(0).astype(int)
@@ -12758,6 +12796,53 @@ class FeatureBuilder:
                         row_copy["weather_adjustment"] = strength.get("weather_adjustment")
                         row_copy["avg_timezone_diff_hours"] = strength.get("avg_timezone_diff_hours")
 
+                    opp_strength = self._get_latest_team_strength(opponent, season)
+                    if opp_strength is not None:
+                        row_copy["opp_offense_pass_rating"] = opp_strength.get(
+                            "offense_pass_rating"
+                        )
+                        row_copy["opp_offense_rush_rating"] = opp_strength.get(
+                            "offense_rush_rating"
+                        )
+                        row_copy["opp_defense_pass_rating"] = opp_strength.get(
+                            "defense_pass_rating"
+                        )
+                        row_copy["opp_defense_rush_rating"] = opp_strength.get(
+                            "defense_rush_rating"
+                        )
+                        row_copy["opp_pace_seconds_per_play"] = opp_strength.get(
+                            "pace_seconds_per_play"
+                        )
+                        row_copy["opp_offense_epa"] = opp_strength.get("offense_epa")
+                        row_copy["opp_defense_epa"] = opp_strength.get("defense_epa")
+                        row_copy["opp_offense_success_rate"] = opp_strength.get(
+                            "offense_success_rate"
+                        )
+                        row_copy["opp_defense_success_rate"] = opp_strength.get(
+                            "defense_success_rate"
+                        )
+                        row_copy["opp_offense_yards_per_play"] = opp_strength.get(
+                            "offense_yards_per_play"
+                        )
+                        row_copy["opp_defense_yards_per_play"] = opp_strength.get(
+                            "defense_yards_per_play"
+                        )
+                        row_copy["opp_offense_td_rate"] = opp_strength.get("offense_td_rate")
+                        row_copy["opp_defense_td_rate"] = opp_strength.get("defense_td_rate")
+                        row_copy["opp_pass_rate"] = opp_strength.get("pass_rate")
+                        row_copy["opp_rush_rate"] = opp_strength.get("rush_rate")
+                        row_copy["opp_pass_rate_over_expectation"] = opp_strength.get(
+                            "pass_rate_over_expectation"
+                        )
+                        row_copy["opp_travel_penalty"] = opp_strength.get("travel_penalty")
+                        row_copy["opp_rest_penalty"] = opp_strength.get("rest_penalty")
+                        row_copy["opp_weather_adjustment"] = opp_strength.get(
+                            "weather_adjustment"
+                        )
+                        row_copy["opp_timezone_diff_hours"] = opp_strength.get(
+                            "avg_timezone_diff_hours"
+                        )
+
                     history = self._get_latest_team_history(team, season, start_time)
                     if history is not None:
                         if pd.isna(row_copy.get("rest_penalty")):
@@ -12779,35 +12864,6 @@ class FeatureBuilder:
                         target_key = key if key != "avg_timezone_diff_hours" else "avg_timezone_diff_hours"
                         if target_key in row_copy and pd.isna(row_copy.get(target_key)):
                             row_copy[target_key] = value
-
-                    opp_strength = self._get_latest_team_strength(opponent, season)
-                    if opp_strength is not None:
-                        row_copy["opp_offense_pass_rating"] = opp_strength.get("offense_pass_rating")
-                        row_copy["opp_offense_rush_rating"] = opp_strength.get("offense_rush_rating")
-                        row_copy["opp_defense_pass_rating"] = opp_strength.get("defense_pass_rating")
-                        row_copy["opp_defense_rush_rating"] = opp_strength.get("defense_rush_rating")
-                        row_copy["opp_pace_seconds_per_play"] = opp_strength.get("pace_seconds_per_play")
-                        row_copy["opp_offense_epa"] = opp_strength.get("offense_epa")
-                        row_copy["opp_defense_epa"] = opp_strength.get("defense_epa")
-                        row_copy["opp_offense_success_rate"] = opp_strength.get("offense_success_rate")
-                        row_copy["opp_defense_success_rate"] = opp_strength.get("defense_success_rate")
-                        row_copy["opp_offense_yards_per_play"] = opp_strength.get(
-                            "offense_yards_per_play"
-                        )
-                        row_copy["opp_defense_yards_per_play"] = opp_strength.get(
-                            "defense_yards_per_play"
-                        )
-                        row_copy["opp_offense_td_rate"] = opp_strength.get("offense_td_rate")
-                        row_copy["opp_defense_td_rate"] = opp_strength.get("defense_td_rate")
-                        row_copy["opp_pass_rate"] = opp_strength.get("pass_rate")
-                        row_copy["opp_rush_rate"] = opp_strength.get("rush_rate")
-                        row_copy["opp_pass_rate_over_expectation"] = opp_strength.get(
-                            "pass_rate_over_expectation"
-                        )
-                        row_copy["opp_travel_penalty"] = opp_strength.get("travel_penalty")
-                        row_copy["opp_rest_penalty"] = opp_strength.get("rest_penalty")
-                        row_copy["opp_weather_adjustment"] = opp_strength.get("weather_adjustment")
-                        row_copy["opp_timezone_diff_hours"] = opp_strength.get("avg_timezone_diff_hours")
 
                     opp_history = self._get_latest_team_history(opponent, season, start_time)
                     if opp_history is not None:
@@ -15470,7 +15526,7 @@ class ModelTrainer:
 
                 if not picks:
                     return None
-                return pd.concat(picks, ignore_index=True)
+                return safe_concat(picks, ignore_index=True)
 
             candidate_thresholds: List[float] = []
             seen_thresholds: Set[float] = set()
@@ -17641,6 +17697,72 @@ def predict_upcoming_games(
         upcoming,
         lineup_rows=lineup_df if not lineup_df.empty else None,
     )
+
+    # Backfill opponent defensive ratings for upcoming players from game-level
+    # features when team strength snapshots are missing. This keeps the
+    # defensive matchup scaling effective even if the opponent team strength
+    # table has gaps for future games.
+    if not player_features.empty and game_features is not None and not game_features.empty:
+        matchup_rows: List[Dict[str, Any]] = []
+        for rec in game_features.itertuples(index=False):
+            gid = getattr(rec, "game_id", None)
+            home_team = normalize_team_abbr(getattr(rec, "home_team", ""))
+            away_team = normalize_team_abbr(getattr(rec, "away_team", ""))
+            matchup_rows.append(
+                {
+                    "game_id": gid,
+                    "team": home_team,
+                    "opp_defense_pass_rating": getattr(rec, "away_defense_pass_rating", np.nan),
+                    "opp_defense_rush_rating": getattr(rec, "away_defense_rush_rating", np.nan),
+                }
+            )
+            matchup_rows.append(
+                {
+                    "game_id": gid,
+                    "team": away_team,
+                    "opp_defense_pass_rating": getattr(rec, "home_defense_pass_rating", np.nan),
+                    "opp_defense_rush_rating": getattr(rec, "home_defense_rush_rating", np.nan),
+                }
+            )
+
+        matchup_df = pd.DataFrame(matchup_rows)
+        if not matchup_df.empty:
+            player_features = player_features.merge(
+                matchup_df,
+                on=["game_id", "team"],
+                how="left",
+                suffixes=("", "_from_game"),
+            )
+            for col in ["opp_defense_pass_rating", "opp_defense_rush_rating"]:
+                from_game_col = f"{col}_from_game"
+                if from_game_col in player_features.columns:
+                    player_features[col] = player_features[col].combine_first(
+                        player_features[from_game_col]
+                    )
+            player_features = player_features.drop(
+                columns=[c for c in player_features.columns if c.endswith("_from_game")],
+                errors="ignore",
+            )
+
+    # Ensure opponent defensive ratings are always populated so matchup scaling
+    # is effective. When both the team-strength snapshot and the game-level
+    # backfill are missing, fall back to the league average for that column.
+    if not player_features.empty:
+        for col in ["opp_defense_pass_rating", "opp_defense_rush_rating"]:
+            if col not in player_features.columns:
+                continue
+            league_avg = float(player_features[col].dropna().mean())
+            if np.isnan(league_avg):
+                league_avg = 0.0
+            missing = int(player_features[col].isna().sum())
+            if missing:
+                logging.debug(
+                    "Imputing %s for %s missing values with league average %.3f",
+                    col,
+                    missing,
+                    league_avg,
+                )
+                player_features[col] = player_features[col].fillna(league_avg)
     respect_lineups = True if config is None else bool(config.respect_lineups)
     if trainer is not None:
         player_features = trainer.apply_lineup_gate(
@@ -17652,11 +17774,15 @@ def predict_upcoming_games(
         logging.warning(
             "Respect-lineups flag enabled but no trainer provided; skipping roster gating",
         )
-    player_predictions = pd.DataFrame()
+        player_predictions = pd.DataFrame()
     if not player_features.empty:
-        player_predictions = player_features[
-            ["game_id", "team", "player_id", "player_name", "position"]
-        ].copy()
+        base_columns = ["game_id", "team", "player_id", "player_name", "position"]
+        defensive_cols = [
+            col
+            for col in ["opp_defense_pass_rating", "opp_defense_rush_rating"]
+            if col in player_features.columns
+        ]
+        player_predictions = player_features[base_columns + defensive_cols].copy()
         if "_usage_confidence" in player_features.columns:
             player_predictions["_usage_confidence"] = player_features[
                 "_usage_confidence"
@@ -17785,6 +17911,15 @@ def predict_upcoming_games(
         except Exception:
             logging.debug("Unable to build game script lookup", exc_info=True)
 
+        stat_cols = [
+            "pred_rushing_yards",
+            "pred_rushing_tds",
+            "pred_receiving_yards",
+            "pred_receptions",
+            "pred_receiving_tds",
+            "pred_passing_yards",
+        ]
+
         def _scale_by_script(row: pd.Series, column: str, lead_bias: float, trail_bias: float) -> float:
             base_val = float(row.get(column, 0.0))
             if base_val <= 0 or not game_script_lookup:
@@ -17806,18 +17941,33 @@ def predict_upcoming_games(
         league_rush_avg = float(player_features.get("opp_defense_rush_rating", pd.Series(dtype=float)).mean())
         league_rush_std = float(player_features.get("opp_defense_rush_rating", pd.Series(dtype=float)).std()) or 1.0
 
-        def _defense_scale(row: pd.Series, column: str, avg: float, std: float, weight: float) -> float:
+        pass_weight_base = float(getattr(config, "defense_scaling_weight_pass", 0.18) or 0.18)
+        rush_weight_base = float(getattr(config, "defense_scaling_weight_rush", 0.16) or 0.16)
+        position_weight_caps = {"WR": 0.22, "TE": 0.22, "RB": 0.16, "QB": 0.12}
+
+        def _defense_scale(
+            row: pd.Series,
+            column: str,
+            avg: float,
+            std: float,
+            base_weight: float,
+        ) -> float:
             base_val = float(row.get(column, 0.0))
             if base_val <= 0:
                 return base_val
             rating = row.get("opp_defense_pass_rating") if "receiving" in column or "passing" in column else row.get("opp_defense_rush_rating")
-            if rating is None or not pd.isfinite(float(rating)):
+            # pandas does not expose isfinite; guard with numpy to avoid AttributeError
+            if rating is None or not np.isfinite(float(rating)):
                 return base_val
-            z = (float(rating) - avg) / std
+            z = np.clip((float(rating) - avg) / std, -2.5, 2.5)
+            position = str(row.get("position", "")).upper()
+            weight_cap = position_weight_caps.get(position, base_weight)
+            weight = min(base_weight, weight_cap)
             scaled = base_val * (1.0 - weight * z)
             return float(max(0.0, scaled))
 
         script_scaled = player_predictions.copy()
+        pre_script_means = {col: float(script_scaled[col].mean()) for col in stat_cols if col in script_scaled}
 
         for col in ["pred_rushing_yards", "pred_rushing_tds"]:
             script_scaled[col] = script_scaled.apply(
@@ -17828,6 +17978,12 @@ def predict_upcoming_games(
             script_scaled[col] = script_scaled.apply(
                 _scale_by_script, axis=1, column=col, lead_bias=-0.25, trail_bias=0.20
             )
+
+        post_script_means = {col: float(script_scaled[col].mean()) for col in stat_cols if col in script_scaled}
+        logging.debug(
+            "Script scaling deltas: %s",
+            {k: post_script_means.get(k, 0.0) - pre_script_means.get(k, 0.0) for k in post_script_means},
+        )
 
         for col in [
             "pred_receiving_yards",
@@ -17841,7 +17997,7 @@ def predict_upcoming_games(
                 column=col,
                 avg=league_pass_avg,
                 std=league_pass_std,
-                weight=0.12,
+                base_weight=pass_weight_base,
             )
 
         for col in ["pred_rushing_yards", "pred_rushing_tds"]:
@@ -17851,8 +18007,14 @@ def predict_upcoming_games(
                 column=col,
                 avg=league_rush_avg,
                 std=league_rush_std,
-                weight=0.12,
+                base_weight=rush_weight_base,
             )
+
+        post_defense_means = {col: float(script_scaled[col].mean()) for col in stat_cols if col in script_scaled}
+        logging.debug(
+            "Defense scaling deltas: %s",
+            {k: post_defense_means.get(k, 0.0) - post_script_means.get(k, 0.0) for k in post_defense_means},
+        )
 
         player_predictions = script_scaled
 
