@@ -74,18 +74,11 @@ and auditable:
 
 ### Odds API configuration
 
-The optional live odds fetcher in `odds_extract.py` (and the main driver) reads
-your The Odds API key from the `ODDS_API_KEY` environment variable. If the
-variable is missing, the odds pipeline logs a warning, skips the external calls,
-and returns empty frames instead of sending unauthenticated requests that would
-fail. Export the key before running any odds collection steps:
-
-```bash
-export ODDS_API_KEY="your-api-key"
-```
-
-Leaving the variable unset will keep the odds pull disabled while the rest of the
-pipeline continues to run.
+The optional live odds fetcher in `odds_extract.py` (and the main driver)
+hard-codes an `ODDS_API_KEY` string. Replace the placeholder value in the code
+with your The Odds API key when you want live odds ingestion. Leaving the
+placeholder intact keeps the odds pull disabled while the rest of the pipeline
+continues to run.
 
 Both files ship with example rows to illustrate the required schema. Replace the
 samples with real, validated records before relying on any model output.
@@ -102,6 +95,11 @@ window in
 `NFL_SPORTSBETTING.py` via `RECENT_FORM_LAST_GAME_WEIGHT`,
 `RECENT_FORM_WINDOW_WEIGHT`, and `RECENT_FORM_GAMES` if you want a different
 balance between short- and long-term form.
+
+Player prop outputs now mirror the game-level tables by carrying `confidence`
+labels, a `consensus_gap` (model minus market implied probability), and an
+`action` recommendation (`target`, `lean`, `monitor`, or `pass`). These columns
+are included in the priced CSVs and the "Top player props" log snippet.
 
 ### If you cannot locate closing odds for certain games
 

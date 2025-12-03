@@ -3991,8 +3991,26 @@ def build_player_prop_candidates(
 
     result = pd.DataFrame(rows)
     if not result.empty:
+        result["implied_prob"] = result["best_american"].apply(odds_american_to_prob)
+        result["consensus_gap"] = result["fair_prob"] - result["implied_prob"]
         result["confidence"] = [
             confidence_bucket(ev, prob) for ev, prob in zip(result["ev"], result["fair_prob"])
+        ]
+        def _prop_action(ev: float, confidence: str, consensus_gap: float) -> str:
+            if not np.isfinite(ev) or not np.isfinite(consensus_gap):
+                return "pass"
+            conf_norm = (confidence or "").upper()
+            if ev >= 0.05 and consensus_gap > 0 and conf_norm == "A":
+                return "target"
+            if ev >= 0.035 and consensus_gap > 0 and conf_norm in {"A", "B"}:
+                return "lean"
+            if ev >= EV_MIN_PROPS and consensus_gap > 0:
+                return "monitor"
+            return "pass"
+
+        result["action"] = [
+            _prop_action(ev, conf, gap)
+            for ev, conf, gap in zip(result["ev"], result["confidence"], result["consensus_gap"])
         ]
         result = result.sort_values(["confidence", "ev"], ascending=[True, False])
     return result
@@ -4179,6 +4197,8 @@ def emit_priced_picks(
                     "fair_american": row.get("fair_american"),
                     "ev": row.get("ev"),
                     "confidence": row.get("confidence"),
+                    "consensus_gap": row.get("consensus_gap"),
+                    "action": row.get("action"),
                     "kelly_quarter": row.get("kelly_quarter"),
                     "event_id": row.get("event_id") or row.get("game_id"),
                 }
@@ -4227,6 +4247,8 @@ def emit_priced_picks(
                         "fair_american",
                         "ev",
                         "confidence",
+                        "consensus_gap",
+                        "action",
                         "kelly_quarter",
                     ]
                 ]
@@ -4601,7 +4623,8 @@ DEFAULT_NFL_API_TIMEOUT_RETRIES = 2
 DEFAULT_NFL_API_HTTP_RETRIES = 3
 DEFAULT_NFL_API_TIMEOUT_BACKOFF = 1.5
 
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+# Hard-code the Odds API key; replace with your key if you want live odds ingestion.
+ODDS_API_KEY = "REPLACE_WITH_ODDS_API_KEY"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 NFL_SPORT_KEY = "americanfootball_nfl"
 ODDS_GAME_REGIONS = ["us"]

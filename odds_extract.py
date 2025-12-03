@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Iterable, Sequence
 
 import aiohttp
@@ -12,7 +11,8 @@ from urllib.parse import urlencode
 
 log = logging.getLogger(__name__)
 
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+# Hard-code the Odds API key; replace with your key if you want live odds ingestion.
+ODDS_API_KEY = "REPLACE_WITH_ODDS_API_KEY"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 NFL_SPORT_KEY = "americanfootball_nfl"
 ODDS_FORMAT = "american"
