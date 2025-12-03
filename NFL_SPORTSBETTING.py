@@ -5863,6 +5863,9 @@ NON_NEGATIVE_TARGETS: set[str] = set(TARGET_ALLOWED_POSITIONS.keys())
 LINEUP_STALENESS_DAYS = 7
 LINEUP_MAX_AGE_BEFORE_GAME_DAYS = 21  # allow expected lineups up to 3 weeks old relative to kickoff
 
+RECENT_FORM_GAMES = 5
+RECENT_FORM_WEIGHT = 0.7
+
 
 _NAME_PUNCT_RE = re.compile(r"[^\w\s]")
 _NAME_SPACE_RE = re.compile(r"\s+")
@@ -12061,6 +12064,69 @@ class FeatureBuilder:
             latest_players["position"] = latest_players["position"].apply(
                 normalize_position
             )
+
+        stat_columns = [
+            "passing_attempts",
+            "passing_yards",
+            "passing_tds",
+            "rushing_attempts",
+            "rushing_yards",
+            "rushing_tds",
+            "receiving_targets",
+            "receiving_yards",
+            "receptions",
+            "receiving_tds",
+        ]
+
+        recent_source = base_players.copy()
+        recent_source["start_time"] = pd.to_datetime(
+            recent_source.get("start_time"), errors="coerce"
+        )
+        present_stats = [col for col in stat_columns if col in recent_source.columns]
+
+        if present_stats:
+            recent_stats = (
+                recent_source.sort_values("start_time")
+                .groupby("player_id")
+                .tail(RECENT_FORM_GAMES)
+            )
+            recent_means = (
+                recent_stats.groupby("player_id")[present_stats]
+                .mean()
+                .rename(columns=lambda c: f"recent_avg_{c}")
+                .reset_index()
+            )
+            latest_players = latest_players.merge(
+                recent_means, on="player_id", how="left"
+            )
+
+            for col in present_stats:
+                recent_col = f"recent_avg_{col}"
+                if recent_col not in latest_players.columns:
+                    continue
+
+                latest_values = pd.to_numeric(
+                    latest_players[col], errors="coerce"
+                )
+                recent_values = pd.to_numeric(
+                    latest_players[recent_col], errors="coerce"
+                )
+
+                blended = (
+                    RECENT_FORM_WEIGHT * recent_values
+                    + (1 - RECENT_FORM_WEIGHT) * latest_values
+                )
+                blended = blended.where(recent_values.notna(), latest_values)
+                blended = blended.where(blended.notna(), recent_values)
+                latest_players[col] = blended
+
+            drop_recent_cols = [
+                col for col in latest_players.columns if col.startswith("recent_avg_")
+            ]
+            if drop_recent_cols:
+                latest_players = latest_players.drop(
+                    columns=drop_recent_cols, errors="ignore"
+                )
 
         season_source = base_players.copy()
         season_source["team"] = season_source["team"].apply(normalize_team_abbr)
