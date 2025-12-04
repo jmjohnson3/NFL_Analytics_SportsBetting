@@ -4136,6 +4136,15 @@ def emit_priced_picks(
             fallback["recommended_line"] = fallback.get("pred_median")
             fallback["range_low"] = fallback.get("q10")
             fallback["range_high"] = fallback.get("q90")
+        # Keep reliability columns present even when no sportsbook odds matched.
+        for col in (
+            "implied_prob",
+            "consensus_gap",
+            "confidence",
+            "action",
+        ):
+            if col not in fallback:
+                fallback[col] = np.nan
         fallback_tables.append(fallback)
     preds_all = safe_concat(stacked, ignore_index=True) if stacked else pd.DataFrame()
 
@@ -4159,6 +4168,10 @@ def emit_priced_picks(
                 "range_low",
                 "range_high",
                 "model_probability",
+                "implied_prob",
+                "consensus_gap",
+                "confidence",
+                "action",
             ]
             if col in model_props.columns
         ]
@@ -5930,6 +5943,17 @@ RECENT_FORM_WINDOW_WEIGHT = 0.25
 # while blocking multi-sigma blowups.
 PLAYER_HISTORY_CAP_QUANTILE = 0.95
 PLAYER_HISTORY_CAP_HEADROOM = 1.35
+
+# When a player has no usable per-game history (common for deep backups), fall back to
+# conservative position ceilings so quantile projections cannot explode to
+# starter-level stat lines.
+POSITION_HISTORY_CAP_FALLBACK: Dict[str, float] = {
+    "QB": 275.0,
+    "RB": 70.0,
+    "WR": 90.0,
+    "TE": 45.0,
+}
+DEFAULT_HISTORY_CAP_FALLBACK = 40.0
 
 
 _NAME_PUNCT_RE = re.compile(r"[^\w\s]")
@@ -18352,25 +18376,59 @@ def predict_upcoming_games(
         def _apply_history_caps_to_quantiles(
             table: pd.DataFrame, market: str, features_df: pd.DataFrame
         ) -> pd.DataFrame:
-            if table.empty or "player_id" not in table.columns:
+            if table.empty:
                 return table
+
             cap_col = f"cap_{market}"
-            if cap_col not in features_df.columns:
+            usable_caps = features_df.copy() if features_df is not None else pd.DataFrame()
+            if usable_caps.empty or cap_col not in usable_caps.columns:
                 return table
-            caps = features_df[["player_id", cap_col]].dropna()
-            if caps.empty:
-                return table
-            merged = table.merge(caps, on="player_id", how="left")
-            cap_values = pd.to_numeric(merged[cap_col], errors="coerce")
-            if cap_values.notna().any():
-                inflated_caps = cap_values * PLAYER_HISTORY_CAP_HEADROOM
-                for col in ("q10", "pred_median", "q90"):
-                    if col in merged.columns:
-                        merged[col] = merged[col].where(
-                            merged[col].isna(),
-                            np.minimum(merged[col].astype(float), inflated_caps),
-                        )
-            return merged.drop(columns=[cap_col], errors="ignore")
+
+            usable_caps = usable_caps[[col for col in usable_caps.columns if col in {cap_col, "player_id", "player_name", "team", "position"}]].copy()
+            usable_caps["player_name_key"] = usable_caps.get("player_name", "").apply(robust_player_name_key)
+            usable_caps["team_norm"] = usable_caps.get("team").apply(normalize_team_abbr)
+            usable_caps["team_norm"] = usable_caps["team_norm"].fillna(usable_caps.get("team"))
+            usable_caps["name_team_key"] = usable_caps.apply(
+                lambda r: f"{r.get('player_name_key', '')}::{r.get('team_norm', '')}", axis=1
+            )
+
+            cap_by_id = dict(
+                usable_caps.dropna(subset=["player_id", cap_col])[["player_id", cap_col]].values
+            )
+            cap_by_name = dict(
+                usable_caps.dropna(subset=["name_team_key", cap_col])[["name_team_key", cap_col]].values
+            )
+
+            def _lookup_cap(row: pd.Series) -> float:
+                pid = row.get("player_id")
+                name_key = robust_player_name_key(row.get("player_name") or row.get("player"))
+                team_key = normalize_team_abbr(row.get("team")) or row.get("team") or ""
+                composite = f"{name_key}::{team_key}" if name_key else ""
+
+                raw_cap = np.nan
+                if pid in cap_by_id:
+                    raw_cap = cap_by_id.get(pid)
+                elif composite in cap_by_name:
+                    raw_cap = cap_by_name.get(composite)
+
+                if not np.isfinite(raw_cap):
+                    pos = str(row.get("position") or "").upper()
+                    raw_cap = POSITION_HISTORY_CAP_FALLBACK.get(
+                        pos, DEFAULT_HISTORY_CAP_FALLBACK
+                    )
+                return float(raw_cap)
+
+            capped = table.copy()
+            cap_series = capped.apply(_lookup_cap, axis=1)
+            inflated_caps = cap_series * PLAYER_HISTORY_CAP_HEADROOM
+            for col in ("q10", "pred_median", "q90"):
+                if col not in capped.columns:
+                    continue
+                capped[col] = capped[col].where(
+                    capped[col].isna(),
+                    np.minimum(pd.to_numeric(capped[col], errors="coerce"), inflated_caps),
+                )
+            return capped
 
         player_predictions["pred_touchdowns"] = (
             player_predictions["pred_rushing_tds"].fillna(0)
