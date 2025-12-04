@@ -3342,7 +3342,7 @@ def filter_ev(df: pd.DataFrame, min_ev: float) -> pd.DataFrame:
 
 def write_csv_safely(df: pd.DataFrame, path: str) -> None:
     try:
-        if df is None or df.empty:
+        if df is None:
             logging.info("No rows to write for %s", path)
             return
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -3945,7 +3945,7 @@ def build_player_prop_candidates(
             len(pred_df),
             len(odds_df),
         )
-        return pd.DataFrame()
+        return pd.DataFrame(columns=base_columns)
 
     merged = safe_concat(merged_frames, ignore_index=True, sort=False)
     logging.info(
@@ -18349,6 +18349,29 @@ def predict_upcoming_games(
 
         player_predictions = _apply_position_caps(player_predictions, position_caps)
 
+        def _apply_history_caps_to_quantiles(
+            table: pd.DataFrame, market: str, features_df: pd.DataFrame
+        ) -> pd.DataFrame:
+            if table.empty or "player_id" not in table.columns:
+                return table
+            cap_col = f"cap_{market}"
+            if cap_col not in features_df.columns:
+                return table
+            caps = features_df[["player_id", cap_col]].dropna()
+            if caps.empty:
+                return table
+            merged = table.merge(caps, on="player_id", how="left")
+            cap_values = pd.to_numeric(merged[cap_col], errors="coerce")
+            if cap_values.notna().any():
+                inflated_caps = cap_values * PLAYER_HISTORY_CAP_HEADROOM
+                for col in ("q10", "pred_median", "q90"):
+                    if col in merged.columns:
+                        merged[col] = merged[col].where(
+                            merged[col].isna(),
+                            np.minimum(merged[col].astype(float), inflated_caps),
+                        )
+            return merged.drop(columns=[cap_col], errors="ignore")
+
         player_predictions["pred_touchdowns"] = (
             player_predictions["pred_rushing_tds"].fillna(0)
             + player_predictions["pred_receiving_tds"].fillna(0)
@@ -18402,6 +18425,9 @@ def predict_upcoming_games(
                 target,
             )
             if not table.empty:
+                table = _apply_history_caps_to_quantiles(
+                    table, target, player_features
+                )
                 player_pred_tables[target] = table
 
         anytime_table = pd.DataFrame()
