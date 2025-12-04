@@ -3639,6 +3639,38 @@ def _merge_player_prop_on_key(
 def build_player_prop_candidates(
     pred_df: pd.DataFrame, odds_df: pd.DataFrame
 ) -> pd.DataFrame:
+    def _apply_position_fallback_caps(frame: pd.DataFrame) -> pd.DataFrame:
+        """Clamp quantile outputs with position-based ceilings when history is thin."""
+
+        if frame.empty or "position" not in frame.columns or "market" not in frame.columns:
+            return frame
+
+        capped = frame.copy()
+
+        def _cap_value(row: pd.Series, value: float) -> float:
+            market = str(row.get("market") or "").lower()
+            if market not in {"receiving_yards", "receptions", "passing_yards"}:
+                return value
+
+            pos = str(row.get("position") or "").upper()
+            fallback_cap = POSITION_HISTORY_CAP_FALLBACK.get(
+                pos, DEFAULT_HISTORY_CAP_FALLBACK
+            )
+            limit = fallback_cap * PLAYER_HISTORY_CAP_HEADROOM
+            try:
+                return float(min(value, limit))
+            except Exception:
+                return value
+
+        for col in ("q10", "pred_median", "q90"):
+            if col not in capped.columns:
+                continue
+            capped[col] = capped.apply(
+                lambda r: _cap_value(r, r.get(col)), axis=1
+            )
+
+        return capped
+
     base_columns = [
         "market",
         "player_id",
@@ -3663,6 +3695,10 @@ def build_player_prop_candidates(
 
     pred_df = pred_df.copy().reset_index(drop=True)
     odds_df = odds_df.copy().reset_index(drop=True)
+
+    # Enforce a conservative cap based solely on position so deep backups cannot
+    # inherit starter-sized quantiles when history is absent.
+    pred_df = _apply_position_fallback_caps(pred_df)
 
     def _normalize_identifier(value: Any) -> str:
         if pd.isna(value):
@@ -4175,6 +4211,10 @@ def emit_priced_picks(
             ]
             if col in model_props.columns
         ]
+        if "confidence" in model_props.columns and model_props["confidence"].isna().all():
+            model_props["confidence"] = "model"
+        if "action" in model_props.columns and model_props["action"].isna().all():
+            model_props["action"] = "pass"
         model_props = model_props.loc[:, columns_order]
         model_props_path = out_dir / f"player_props_model_{week_key}.csv"
         write_csv_safely(model_props, str(model_props_path))
