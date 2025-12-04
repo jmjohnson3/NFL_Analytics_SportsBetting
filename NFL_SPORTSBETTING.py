@@ -3387,8 +3387,6 @@ def extract_pricing_odds(
         game_id = str(event.get("id") or "")
         if not game_id:
             continue
-        if valid_ids is not None and game_id not in valid_ids:
-            continue
 
         teams = [team for team in (event.get("teams") or []) if team]
         home_raw = event.get("home_team") or (teams[0] if teams else None)
