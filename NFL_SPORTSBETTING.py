@@ -4211,10 +4211,30 @@ def emit_priced_picks(
             ]
             if col in model_props.columns
         ]
-        if "confidence" in model_props.columns and model_props["confidence"].isna().all():
+        # Always include reliability fields with sensible defaults so downstream
+        # consumers (and CSV readers) never see empty confidence/action columns
+        # when sportsbook odds are missing.
+        if "confidence" not in model_props.columns:
             model_props["confidence"] = "model"
-        if "action" in model_props.columns and model_props["action"].isna().all():
+        else:
+            model_props["confidence"] = model_props["confidence"].fillna("model")
+        if "action" not in model_props.columns:
             model_props["action"] = "pass"
+        else:
+            model_props["action"] = model_props["action"].fillna("pass")
+        if "consensus_gap" not in model_props.columns:
+            model_props["consensus_gap"] = 0.0
+        else:
+            model_props["consensus_gap"] = model_props["consensus_gap"].fillna(0.0)
+        if "implied_prob" not in model_props.columns:
+            model_props["implied_prob"] = model_props.get("model_probability", np.nan)
+        else:
+            model_props["implied_prob"] = model_props["implied_prob"].fillna(
+                model_props.get("model_probability", np.nan)
+            )
+        for col in ("implied_prob", "consensus_gap", "confidence", "action"):
+            if col not in columns_order and col in model_props.columns:
+                columns_order.append(col)
         model_props = model_props.loc[:, columns_order]
         model_props_path = out_dir / f"player_props_model_{week_key}.csv"
         write_csv_safely(model_props, str(model_props_path))
