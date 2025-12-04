@@ -11,7 +11,10 @@ from urllib.parse import urlencode
 
 log = logging.getLogger(__name__)
 
-ODDS_API_KEY = ""
+# Hard-code the Odds API key; replace with your key if you want live odds ingestion.
+# NOTE: The odds key is intentionally hard-coded for this pipeline run.
+# Replace it if you need to use your own The Odds API credential.
+ODDS_API_KEY = "5b6f0290e265c3329b3ed27897d79eaf"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 NFL_SPORT_KEY = "americanfootball_nfl"
 ODDS_FORMAT = "american"
@@ -87,6 +90,24 @@ async def fetch_nfl_game_odds(
     odds_format: str = ODDS_FORMAT,
     date_format: str = "iso",
 ) -> pd.DataFrame:
+    if not ODDS_API_KEY:
+        log.warning("ODDS_API_KEY is not set; skipping odds fetch and returning empty frame.")
+        return pd.DataFrame(
+            columns=[
+                "event_id",
+                "commence_time",
+                "home_team",
+                "away_team",
+                "book",
+                "market",
+                "side",
+                "line",
+                "american_odds",
+                "decimal_odds",
+                "imp_prob",
+            ]
+        )
+
     if isinstance(regions, (list, tuple)):
         regions = ",".join(regions)
     if isinstance(markets, (list, tuple)):

@@ -72,8 +72,34 @@ and auditable:
   and timezone adjustments for each team/week. These values flow directly into the
   situational feature set so the models stop learning on `NaN` placeholders.
 
+### Odds API configuration
+
+The optional live odds fetcher in `odds_extract.py` (and the main driver)
+ships with the key `5b6f0290e265c3329b3ed27897d79eaf` already hard-coded so
+ingestion works out of the box. Replace this value with your own The Odds API
+credential if needed; leaving it untouched keeps the bundled key in use for
+both live and historical odds pulls.
+
 Both files ship with example rows to illustrate the required schema. Replace the
 samples with real, validated records before relying on any model output.
+
+### Player projection smoothing
+
+Player stat forecasts now explicitly down-weight single-game volatility. For each
+player we blend three signals: the most recent game (~5%), a rolling five-game
+average (~25% scaled down when fewer games are available), and the full-season
+average for stability (~70%). Forecasts are also capped to roughly a 95th
+percentile of the player's own historical production (with modest headroom) so
+backups cannot inherit starter-level stat lines. You can adjust the weights or
+window in
+`NFL_SPORTSBETTING.py` via `RECENT_FORM_LAST_GAME_WEIGHT`,
+`RECENT_FORM_WINDOW_WEIGHT`, and `RECENT_FORM_GAMES` if you want a different
+balance between short- and long-term form.
+
+Player prop outputs now mirror the game-level tables by carrying `confidence`
+labels, a `consensus_gap` (model minus market implied probability), and an
+`action` recommendation (`target`, `lean`, `monitor`, or `pass`). These columns
+are included in the priced CSVs and the "Top player props" log snippet.
 
 ### If you cannot locate closing odds for certain games
 

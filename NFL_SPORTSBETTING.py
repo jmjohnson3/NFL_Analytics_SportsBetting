@@ -3342,7 +3342,7 @@ def filter_ev(df: pd.DataFrame, min_ev: float) -> pd.DataFrame:
 
 def write_csv_safely(df: pd.DataFrame, path: str) -> None:
     try:
-        if df is None or df.empty:
+        if df is None:
             logging.info("No rows to write for %s", path)
             return
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -3387,8 +3387,6 @@ def extract_pricing_odds(
         game_id = str(event.get("id") or "")
         if not game_id:
             continue
-        if valid_ids is not None and game_id not in valid_ids:
-            continue
 
         teams = [team for team in (event.get("teams") or []) if team]
         home_raw = event.get("home_team") or (teams[0] if teams else None)
@@ -3404,10 +3402,11 @@ def extract_pricing_odds(
             sportsbook = bookmaker.get("key") or bookmaker.get("title") or "unknown"
             last_update = parse_dt(bookmaker.get("last_update"))
             for market in bookmaker.get("markets", []):
-                key = (market.get("key") or "").lower()
+                key_raw = (market.get("key") or "").lower()
+                canonical_key = canonical_prop_market_key(key_raw)
                 outcomes = market.get("outcomes", []) or []
 
-                if key == "totals":
+                if canonical_key == "totals":
                     for outcome in outcomes:
                         side = (outcome.get("name") or "").title()
                         total_line = outcome.get("point")
@@ -3439,8 +3438,10 @@ def extract_pricing_odds(
                             }
                         )
 
-                if key in PLAYER_PROP_MARKET_COLUMN_MAP:
-                    stat_key = PLAYER_PROP_MARKET_COLUMN_MAP[key].replace("line_", "")
+                if canonical_key in PLAYER_PROP_MARKET_COLUMN_MAP:
+                    stat_key = PLAYER_PROP_MARKET_COLUMN_MAP[canonical_key].replace(
+                        "line_", ""
+                    )
                     player_buckets: Dict[str, Dict[str, Any]] = {}
                     for outcome in outcomes:
                         name_raw = str(outcome.get("name") or "").strip()
@@ -3475,6 +3476,9 @@ def extract_pricing_odds(
                             player_name = name_raw[: -len(tokens[1])].strip()
                         elif participant:
                             player_name = participant
+
+                        if canonical_key == "player_anytime_td" and side in {"Yes", "No"}:
+                            side = {"Yes": "Over", "No": "Under"}.get(side, side)
 
                         if not player_name or side is None:
                             continue
@@ -3601,12 +3605,6 @@ def _merge_player_prop_on_key(
 
     key_cols: List[str] = ["market", key_col]
 
-    # Include event-level context when available so duplicate matchups resolve cleanly.
-    if not key_col.endswith("_event_key"):
-        if "_event_key" in preds.columns and "_event_key" in offers.columns:
-            if preds["_event_key"].astype(bool).any() and offers["_event_key"].astype(bool).any():
-                key_cols.append("_event_key")
-
     if "line" in offers.columns:
         key_cols.append("line")
     if "side" in offers.columns:
@@ -3639,11 +3637,66 @@ def _merge_player_prop_on_key(
 def build_player_prop_candidates(
     pred_df: pd.DataFrame, odds_df: pd.DataFrame
 ) -> pd.DataFrame:
+    def _apply_position_fallback_caps(frame: pd.DataFrame) -> pd.DataFrame:
+        """Clamp quantile outputs with position-based ceilings when history is thin."""
+
+        if frame.empty or "position" not in frame.columns or "market" not in frame.columns:
+            return frame
+
+        capped = frame.copy()
+
+        def _cap_value(row: pd.Series, value: float) -> float:
+            market = str(row.get("market") or "").lower()
+            if market not in {"receiving_yards", "receptions", "passing_yards"}:
+                return value
+
+            pos = str(row.get("position") or "").upper()
+            fallback_cap = POSITION_HISTORY_CAP_FALLBACK.get(
+                pos, DEFAULT_HISTORY_CAP_FALLBACK
+            )
+            limit = fallback_cap * PLAYER_HISTORY_CAP_HEADROOM
+            try:
+                return float(min(value, limit))
+            except Exception:
+                return value
+
+        for col in ("q10", "pred_median", "q90"):
+            if col not in capped.columns:
+                continue
+            capped[col] = capped.apply(
+                lambda r: _cap_value(r, r.get(col)), axis=1
+            )
+
+        return capped
+
+    base_columns = [
+        "market",
+        "player_id",
+        "player",
+        "team",
+        "opp",
+        "side",
+        "line",
+        "fair_prob",
+        "fair_american",
+        "best_american",
+        "ev",
+        "kelly_quarter",
+        "implied_prob",
+        "consensus_gap",
+        "confidence",
+        "action",
+    ]
+
     if pred_df.empty or odds_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=base_columns)
 
     pred_df = pred_df.copy().reset_index(drop=True)
     odds_df = odds_df.copy().reset_index(drop=True)
+
+    # Enforce a conservative cap based solely on position so deep backups cannot
+    # inherit starter-sized quantiles when history is absent.
+    pred_df = _apply_position_fallback_caps(pred_df)
 
     def _normalize_identifier(value: Any) -> str:
         if pd.isna(value):
@@ -3926,7 +3979,7 @@ def build_player_prop_candidates(
             len(pred_df),
             len(odds_df),
         )
-        return pd.DataFrame()
+        return pd.DataFrame(columns=base_columns)
 
     merged = safe_concat(merged_frames, ignore_index=True, sort=False)
     logging.info(
@@ -3991,11 +4044,38 @@ def build_player_prop_candidates(
 
     result = pd.DataFrame(rows)
     if not result.empty:
+        result["implied_prob"] = result["best_american"].apply(odds_american_to_prob)
+        result["consensus_gap"] = result["fair_prob"] - result["implied_prob"]
         result["confidence"] = [
             confidence_bucket(ev, prob) for ev, prob in zip(result["ev"], result["fair_prob"])
         ]
+        def _prop_action(ev: float, confidence: str, consensus_gap: float) -> str:
+            if not np.isfinite(ev) or not np.isfinite(consensus_gap):
+                return "pass"
+            conf_norm = (confidence or "").upper()
+            if ev >= 0.05 and consensus_gap > 0 and conf_norm == "A":
+                return "target"
+            if ev >= 0.035 and consensus_gap > 0 and conf_norm in {"A", "B"}:
+                return "lean"
+            if ev >= EV_MIN_PROPS and consensus_gap > 0:
+                return "monitor"
+            return "pass"
+
+        result["action"] = [
+            _prop_action(ev, conf, gap)
+            for ev, conf, gap in zip(result["ev"], result["confidence"], result["consensus_gap"])
+        ]
         result = result.sort_values(["confidence", "ev"], ascending=[True, False])
-    return result
+    else:
+        for col in base_columns:
+            if col not in result:
+                result[col] = np.nan
+
+    missing_cols = [col for col in base_columns if col not in result.columns]
+    for col in missing_cols:
+        result[col] = np.nan
+
+    return result.loc[:, [c for c in base_columns if c in result.columns]]
 
 
 def build_game_totals_candidates(
@@ -4090,6 +4170,15 @@ def emit_priced_picks(
             fallback["recommended_line"] = fallback.get("pred_median")
             fallback["range_low"] = fallback.get("q10")
             fallback["range_high"] = fallback.get("q90")
+        # Keep reliability columns present even when no sportsbook odds matched.
+        for col in (
+            "implied_prob",
+            "consensus_gap",
+            "confidence",
+            "action",
+        ):
+            if col not in fallback:
+                fallback[col] = np.nan
         fallback_tables.append(fallback)
     preds_all = safe_concat(stacked, ignore_index=True) if stacked else pd.DataFrame()
 
@@ -4113,9 +4202,37 @@ def emit_priced_picks(
                 "range_low",
                 "range_high",
                 "model_probability",
+                "implied_prob",
+                "consensus_gap",
+                "confidence",
+                "action",
             ]
             if col in model_props.columns
         ]
+        # Always include reliability fields with sensible defaults so downstream
+        # consumers (and CSV readers) never see empty confidence/action columns
+        # when sportsbook odds are missing.
+        if "confidence" not in model_props.columns:
+            model_props["confidence"] = "model"
+        else:
+            model_props["confidence"] = model_props["confidence"].fillna("model")
+        if "action" not in model_props.columns:
+            model_props["action"] = "pass"
+        else:
+            model_props["action"] = model_props["action"].fillna("pass")
+        if "consensus_gap" not in model_props.columns:
+            model_props["consensus_gap"] = 0.0
+        else:
+            model_props["consensus_gap"] = model_props["consensus_gap"].fillna(0.0)
+        if "implied_prob" not in model_props.columns:
+            model_props["implied_prob"] = model_props.get("model_probability", np.nan)
+        else:
+            model_props["implied_prob"] = model_props["implied_prob"].fillna(
+                model_props.get("model_probability", np.nan)
+            )
+        for col in ("implied_prob", "consensus_gap", "confidence", "action"):
+            if col not in columns_order and col in model_props.columns:
+                columns_order.append(col)
         model_props = model_props.loc[:, columns_order]
         model_props_path = out_dir / f"player_props_model_{week_key}.csv"
         write_csv_safely(model_props, str(model_props_path))
@@ -4179,6 +4296,8 @@ def emit_priced_picks(
                     "fair_american": row.get("fair_american"),
                     "ev": row.get("ev"),
                     "confidence": row.get("confidence"),
+                    "consensus_gap": row.get("consensus_gap"),
+                    "action": row.get("action"),
                     "kelly_quarter": row.get("kelly_quarter"),
                     "event_id": row.get("event_id") or row.get("game_id"),
                 }
@@ -4227,6 +4346,8 @@ def emit_priced_picks(
                         "fair_american",
                         "ev",
                         "confidence",
+                        "consensus_gap",
+                        "action",
                         "kelly_quarter",
                     ]
                 ]
@@ -4601,6 +4722,9 @@ DEFAULT_NFL_API_TIMEOUT_RETRIES = 2
 DEFAULT_NFL_API_HTTP_RETRIES = 3
 DEFAULT_NFL_API_TIMEOUT_BACKOFF = 1.5
 
+# Hard-code the Odds API key; replace with your key if you want live odds ingestion.
+# NOTE: The odds key is intentionally hard-coded for this pipeline run.
+# Replace it if you need to use your own The Odds API credential.
 ODDS_API_KEY = "5b6f0290e265c3329b3ed27897d79eaf"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 NFL_SPORT_KEY = "americanfootball_nfl"
@@ -4834,11 +4958,19 @@ async def _odds_get_json(
     retry_statuses: Optional[Set[int]] = None,
     **params: Any,
 ) -> Optional[Any]:
-    params = {"apiKey": api_key or ODDS_API_KEY, **params}
+    resolved_key = api_key or ODDS_API_KEY
+    params = {"apiKey": resolved_key, **params}
     url = _odds_build_url(path, params)
     retries_remaining = max_retries
     retryable = retry_statuses or {429, 500, 502, 503, 504}
     backoff = ODDS_RATE_LIMIT_DELAY
+
+    if not resolved_key:
+        odds_logger.warning(
+            "ODDS_API_KEY is not set; skipping odds request to %s and returning empty payload.",
+            path,
+        )
+        return None
 
     while True:
         try:
@@ -5854,6 +5986,32 @@ NON_NEGATIVE_TARGETS: set[str] = set(TARGET_ALLOWED_POSITIONS.keys())
 
 LINEUP_STALENESS_DAYS = 7
 LINEUP_MAX_AGE_BEFORE_GAME_DAYS = 21  # allow expected lineups up to 3 weeks old relative to kickoff
+
+RECENT_FORM_GAMES = 5
+# Weighting scheme for player stat smoothing
+# - last game keeps a tiny footprint to avoid single-week overreaction
+# - recent window anchors short-term form but is shrunk when few games exist
+# - season average provides long-term stability
+RECENT_FORM_LAST_GAME_WEIGHT = 0.05
+RECENT_FORM_WINDOW_WEIGHT = 0.25
+
+# Historical guardrail: clamp forecasts to stay within a reasonable band of the
+# player's own production history so backups do not inherit starter-level
+# projections. A 95th percentile cap with mild headroom leaves room for growth
+# while blocking multi-sigma blowups.
+PLAYER_HISTORY_CAP_QUANTILE = 0.95
+PLAYER_HISTORY_CAP_HEADROOM = 1.35
+
+# When a player has no usable per-game history (common for deep backups), fall back to
+# conservative position ceilings so quantile projections cannot explode to
+# starter-level stat lines.
+POSITION_HISTORY_CAP_FALLBACK: Dict[str, float] = {
+    "QB": 275.0,
+    "RB": 70.0,
+    "WR": 90.0,
+    "TE": 45.0,
+}
+DEFAULT_HISTORY_CAP_FALLBACK = 40.0
 
 
 _NAME_PUNCT_RE = re.compile(r"[^\w\s]")
@@ -7686,6 +7844,11 @@ class OddsApiClient:
         include_historical: bool,
     ) -> List[Dict[str, Any]]:
         api_key = self.api_key or ODDS_API_KEY
+        if not api_key:
+            odds_logger.warning(
+                "ODDS_API_KEY is not set; skipping odds ingestion (live + historical)."
+            )
+            return []
         timeout = aiohttp.ClientTimeout(total=self.timeout)
 
         async def run_fetch(allow_insecure: bool) -> List[Dict[str, Any]]:
@@ -12048,6 +12211,197 @@ class FeatureBuilder:
             latest_players["position"] = latest_players["position"].apply(
                 normalize_position
             )
+
+        stat_columns = [
+            "passing_attempts",
+            "passing_yards",
+            "passing_tds",
+            "rushing_attempts",
+            "rushing_yards",
+            "rushing_tds",
+            "receiving_targets",
+            "receiving_yards",
+            "receptions",
+            "receiving_tds",
+        ]
+
+        recent_source = base_players.copy()
+        recent_source["start_time"] = pd.to_datetime(
+            recent_source.get("start_time"), errors="coerce"
+        )
+        present_stats = [col for col in stat_columns if col in recent_source.columns]
+
+        if present_stats:
+            recent_stats = (
+                recent_source.sort_values("start_time")
+                .groupby("player_id")
+                .tail(RECENT_FORM_GAMES)
+            )
+            recent_counts = (
+                recent_stats.groupby("player_id")["start_time"].size()
+                .rename("recent_games")
+                .reset_index()
+            )
+            recent_means = (
+                recent_stats.groupby("player_id")[present_stats]
+                .mean()
+                .rename(columns=lambda c: f"recent_avg_{c}")
+                .reset_index()
+            )
+            season_means = (
+                recent_source.groupby("player_id")[present_stats]
+                .mean()
+                .rename(columns=lambda c: f"season_avg_{c}")
+                .reset_index()
+            )
+
+            # Capture historical ceilings so we can cap projections for backups
+            # that have never produced starter-level stat lines.
+            quantile_caps = (
+                recent_source.groupby("player_id")[present_stats]
+                .quantile(PLAYER_HISTORY_CAP_QUANTILE)
+                .rename(columns=lambda c: f"cap_{c}")
+                .reset_index()
+            )
+            max_caps = (
+                recent_source.groupby("player_id")[present_stats]
+                .max()
+                .rename(columns=lambda c: f"cap_{c}_max")
+                .reset_index()
+            )
+            mean_caps = (
+                recent_source.groupby("player_id")[present_stats]
+                .mean()
+                .rename(columns=lambda c: f"cap_{c}_mean")
+                .reset_index()
+            )
+            historical_caps = quantile_caps.merge(max_caps, on="player_id", how="outer")
+            historical_caps = historical_caps.merge(mean_caps, on="player_id", how="outer")
+            for col in present_stats:
+                quant_col = f"cap_{col}"
+                historical_caps[quant_col] = (
+                    historical_caps.get(quant_col)
+                    .fillna(historical_caps.get(f"cap_{col}_max"))
+                    .fillna(historical_caps.get(f"cap_{col}_mean"))
+                )
+
+            drop_helpers = [
+                c
+                for c in historical_caps.columns
+                if c.endswith("_max") or c.endswith("_mean")
+            ]
+            historical_caps = historical_caps.drop(columns=drop_helpers, errors="ignore")
+
+            latest_players = latest_players.merge(
+                recent_means, on="player_id", how="left"
+            ).merge(recent_counts, on="player_id", how="left").merge(
+                season_means, on="player_id", how="left"
+            ).merge(
+                historical_caps, on="player_id", how="left"
+            )
+
+            season_weight = max(
+                0.0, 1.0 - RECENT_FORM_WINDOW_WEIGHT - RECENT_FORM_LAST_GAME_WEIGHT
+            )
+
+            for col in present_stats:
+                recent_col = f"recent_avg_{col}"
+                season_col = f"season_avg_{col}"
+                if recent_col not in latest_players.columns and season_col not in latest_players.columns:
+                    continue
+
+                latest_values = pd.to_numeric(
+                    latest_players[col], errors="coerce"
+                )
+                recent_values = pd.to_numeric(
+                    latest_players.get(recent_col), errors="coerce"
+                )
+                season_values = pd.to_numeric(
+                    latest_players.get(season_col), errors="coerce"
+                )
+
+                recent_games = pd.to_numeric(
+                    latest_players.get("recent_games"), errors="coerce"
+                ).fillna(0)
+                recent_scale = (recent_games / RECENT_FORM_GAMES).clip(lower=0.0, upper=1.0)
+
+                components: list[tuple[pd.Series, pd.Series]] = []
+                if latest_values.notna().any():
+                    components.append(
+                        (
+                            latest_values,
+                            pd.Series(RECENT_FORM_LAST_GAME_WEIGHT, index=latest_players.index),
+                        )
+                    )
+                if recent_values.notna().any():
+                    components.append(
+                        (
+                            recent_values,
+                            pd.Series(RECENT_FORM_WINDOW_WEIGHT, index=latest_players.index)
+                            * recent_scale,
+                        )
+                    )
+                if season_values.notna().any() and season_weight > 0:
+                    components.append(
+                        (
+                            season_values,
+                            pd.Series(season_weight, index=latest_players.index),
+                        )
+                    )
+
+                if not components:
+                    continue
+
+                weights = [w for _, w in components]
+                weight_sum = sum(weights)
+                weight_sum = weight_sum.replace(0, np.nan)
+                weighted_values = sum(series * weight for series, weight in components)
+                weighted_values = weighted_values / weight_sum
+
+                # Where data is missing, fall back gracefully in priority order: season -> recent -> latest
+                blended = weighted_values
+                blended = blended.where(weighted_values.notna(), season_values)
+                blended = blended.where(blended.notna(), recent_values)
+                blended = blended.where(blended.notna(), latest_values)
+                latest_players[col] = blended
+
+                cap_col = f"cap_{col}"
+                if cap_col in latest_players.columns:
+                    caps = pd.to_numeric(
+                        latest_players.get(cap_col), errors="coerce"
+                    )
+                    # If no per-game history exists, fall back to observed season or
+                    # recent averages so backups still get a sensible ceiling rather
+                    # than inheriting starter-level roles.
+                    observed_ceiling = pd.concat(
+                        [latest_values, recent_values, season_values], axis=1
+                    ).max(axis=1, skipna=True)
+                    caps = caps.fillna(observed_ceiling)
+
+                    if caps.notna().any():
+                        latest_players[col] = latest_players[col].where(
+                            latest_players[col].isna(),
+                            np.minimum(
+                                latest_players[col],
+                                caps * PLAYER_HISTORY_CAP_HEADROOM,
+                            ),
+                        )
+
+            drop_temp_cols = [
+                col
+                for col in latest_players.columns
+                if col.startswith("recent_avg_") or col.startswith("season_avg_")
+            ]
+            if drop_temp_cols:
+                latest_players = latest_players.drop(
+                    columns=drop_temp_cols, errors="ignore"
+                )
+
+        else:
+            recent_counts = pd.DataFrame({"player_id": [], "recent_games": []})
+            recent_means = pd.DataFrame({"player_id": [], "recent_avg_dummy": []})
+            season_means = pd.DataFrame({"player_id": [], "season_avg_dummy": []})
+            historical_caps = pd.DataFrame({"player_id": []})
 
         season_source = base_players.copy()
         season_source["team"] = season_source["team"].apply(normalize_team_abbr)
@@ -18077,6 +18431,63 @@ def predict_upcoming_games(
 
         player_predictions = _apply_position_caps(player_predictions, position_caps)
 
+        def _apply_history_caps_to_quantiles(
+            table: pd.DataFrame, market: str, features_df: pd.DataFrame
+        ) -> pd.DataFrame:
+            if table.empty:
+                return table
+
+            cap_col = f"cap_{market}"
+            usable_caps = features_df.copy() if features_df is not None else pd.DataFrame()
+            if usable_caps.empty or cap_col not in usable_caps.columns:
+                return table
+
+            usable_caps = usable_caps[[col for col in usable_caps.columns if col in {cap_col, "player_id", "player_name", "team", "position"}]].copy()
+            usable_caps["player_name_key"] = usable_caps.get("player_name", "").apply(robust_player_name_key)
+            usable_caps["team_norm"] = usable_caps.get("team").apply(normalize_team_abbr)
+            usable_caps["team_norm"] = usable_caps["team_norm"].fillna(usable_caps.get("team"))
+            usable_caps["name_team_key"] = usable_caps.apply(
+                lambda r: f"{r.get('player_name_key', '')}::{r.get('team_norm', '')}", axis=1
+            )
+
+            cap_by_id = dict(
+                usable_caps.dropna(subset=["player_id", cap_col])[["player_id", cap_col]].values
+            )
+            cap_by_name = dict(
+                usable_caps.dropna(subset=["name_team_key", cap_col])[["name_team_key", cap_col]].values
+            )
+
+            def _lookup_cap(row: pd.Series) -> float:
+                pid = row.get("player_id")
+                name_key = robust_player_name_key(row.get("player_name") or row.get("player"))
+                team_key = normalize_team_abbr(row.get("team")) or row.get("team") or ""
+                composite = f"{name_key}::{team_key}" if name_key else ""
+
+                raw_cap = np.nan
+                if pid in cap_by_id:
+                    raw_cap = cap_by_id.get(pid)
+                elif composite in cap_by_name:
+                    raw_cap = cap_by_name.get(composite)
+
+                if not np.isfinite(raw_cap):
+                    pos = str(row.get("position") or "").upper()
+                    raw_cap = POSITION_HISTORY_CAP_FALLBACK.get(
+                        pos, DEFAULT_HISTORY_CAP_FALLBACK
+                    )
+                return float(raw_cap)
+
+            capped = table.copy()
+            cap_series = capped.apply(_lookup_cap, axis=1)
+            inflated_caps = cap_series * PLAYER_HISTORY_CAP_HEADROOM
+            for col in ("q10", "pred_median", "q90"):
+                if col not in capped.columns:
+                    continue
+                capped[col] = capped[col].where(
+                    capped[col].isna(),
+                    np.minimum(pd.to_numeric(capped[col], errors="coerce"), inflated_caps),
+                )
+            return capped
+
         player_predictions["pred_touchdowns"] = (
             player_predictions["pred_rushing_tds"].fillna(0)
             + player_predictions["pred_receiving_tds"].fillna(0)
@@ -18130,6 +18541,9 @@ def predict_upcoming_games(
                 target,
             )
             if not table.empty:
+                table = _apply_history_caps_to_quantiles(
+                    table, target, player_features
+                )
                 player_pred_tables[target] = table
 
         anytime_table = pd.DataFrame()
