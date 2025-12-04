@@ -3402,10 +3402,11 @@ def extract_pricing_odds(
             sportsbook = bookmaker.get("key") or bookmaker.get("title") or "unknown"
             last_update = parse_dt(bookmaker.get("last_update"))
             for market in bookmaker.get("markets", []):
-                key = (market.get("key") or "").lower()
+                key_raw = (market.get("key") or "").lower()
+                canonical_key = canonical_prop_market_key(key_raw)
                 outcomes = market.get("outcomes", []) or []
 
-                if key == "totals":
+                if canonical_key == "totals":
                     for outcome in outcomes:
                         side = (outcome.get("name") or "").title()
                         total_line = outcome.get("point")
@@ -3437,8 +3438,10 @@ def extract_pricing_odds(
                             }
                         )
 
-                if key in PLAYER_PROP_MARKET_COLUMN_MAP:
-                    stat_key = PLAYER_PROP_MARKET_COLUMN_MAP[key].replace("line_", "")
+                if canonical_key in PLAYER_PROP_MARKET_COLUMN_MAP:
+                    stat_key = PLAYER_PROP_MARKET_COLUMN_MAP[canonical_key].replace(
+                        "line_", ""
+                    )
                     player_buckets: Dict[str, Dict[str, Any]] = {}
                     for outcome in outcomes:
                         name_raw = str(outcome.get("name") or "").strip()
@@ -3473,6 +3476,9 @@ def extract_pricing_odds(
                             player_name = name_raw[: -len(tokens[1])].strip()
                         elif participant:
                             player_name = participant
+
+                        if canonical_key == "player_anytime_td" and side in {"Yes", "No"}:
+                            side = {"Yes": "Over", "No": "Under"}.get(side, side)
 
                         if not player_name or side is None:
                             continue
@@ -3598,12 +3604,6 @@ def _merge_player_prop_on_key(
     allowed_lookup = allowed_side_map or PLAYER_PROP_ALLOWED_SIDES
 
     key_cols: List[str] = ["market", key_col]
-
-    # Include event-level context when available so duplicate matchups resolve cleanly.
-    if not key_col.endswith("_event_key"):
-        if "_event_key" in preds.columns and "_event_key" in offers.columns:
-            if preds["_event_key"].astype(bool).any() and offers["_event_key"].astype(bool).any():
-                key_cols.append("_event_key")
 
     if "line" in offers.columns:
         key_cols.append("line")
