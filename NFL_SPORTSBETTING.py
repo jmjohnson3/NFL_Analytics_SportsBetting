@@ -134,6 +134,11 @@ def _default_data_file(name: str) -> Optional[str]:
 DEFAULT_CLOSING_ODDS_PATH = _default_data_file("closing_odds_history.csv")
 DEFAULT_TRAVEL_CONTEXT_PATH = _default_data_file("team_travel_context.csv")
 
+# Guardrails used to decide when paper trading is mandatory due to incomplete
+# market/situational coverage.
+CLOSING_ODDS_COVERAGE_GUARDRAIL = 0.90
+SITUATIONAL_COVERAGE_GUARDRAIL = 0.90
+
 
 # ==== BEGIN LINEUP + PANDAS PATCH HELPERS ===================================
 def _sanitize_frame_for_concat(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
@@ -6810,6 +6815,19 @@ class NFLConfig:
     paper_trade_edge_threshold: float = 0.02
     paper_trade_bankroll: float = 1_000.0
     paper_trade_max_fraction: float = 0.05
+    recent_form_games: int = int(os.getenv("NFL_RECENT_FORM_GAMES", str(RECENT_FORM_GAMES)))
+    recent_form_last_game_weight: float = float(
+        os.getenv("NFL_RECENT_FORM_LAST_WEIGHT", str(RECENT_FORM_LAST_GAME_WEIGHT))
+    )
+    recent_form_window_weight: float = float(
+        os.getenv("NFL_RECENT_FORM_WINDOW_WEIGHT", str(RECENT_FORM_WINDOW_WEIGHT))
+    )
+    player_history_cap_quantile: float = float(
+        os.getenv("NFL_PLAYER_HISTORY_CAP_QUANTILE", str(PLAYER_HISTORY_CAP_QUANTILE))
+    )
+    player_history_cap_headroom: float = float(
+        os.getenv("NFL_PLAYER_HISTORY_CAP_HEADROOM", str(PLAYER_HISTORY_CAP_HEADROOM))
+    )
     closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER") or "local"
     closing_odds_timeout: int = int(os.getenv("NFL_CLOSING_ODDS_TIMEOUT", "45"))
     closing_odds_download_dir: Optional[str] = os.getenv("NFL_CLOSING_ODDS_DOWNLOAD_DIR")
@@ -8626,6 +8644,13 @@ class NFLIngestor:
             include_player_props=True,
             include_historical=True,
         )
+        if not odds_data:
+            provider_hint = (self.config.closing_odds_provider or "").strip().lower()
+            if provider_hint in {"none", "off", "disable", "disabled", "local", "csv", "file", "history", "offline", ""}:
+                logging.warning(
+                    "No sportsbook odds were returned. Enable NFL_CLOSING_ODDS_PROVIDER=oddsportal or populate %s with verified closes.",
+                    self.config.closing_odds_history_path or "data/closing_odds_history.csv",
+                )
         logging.info("Fetched %d odds entries", len(odds_data))
 
         historical_rows = [
@@ -19292,6 +19317,41 @@ def load_config(path: Optional[str]) -> NFLConfig:
     return config
 
 
+def apply_runtime_config_overrides(config: NFLConfig) -> None:
+    """Apply config-driven overrides for smoothing and historical caps."""
+
+    global RECENT_FORM_GAMES, RECENT_FORM_LAST_GAME_WEIGHT, RECENT_FORM_WINDOW_WEIGHT
+    global PLAYER_HISTORY_CAP_QUANTILE, PLAYER_HISTORY_CAP_HEADROOM
+
+    RECENT_FORM_GAMES = max(1, int(config.recent_form_games))
+    RECENT_FORM_LAST_GAME_WEIGHT = max(0.0, float(config.recent_form_last_game_weight))
+    RECENT_FORM_WINDOW_WEIGHT = max(0.0, float(config.recent_form_window_weight))
+
+    weight_sum = RECENT_FORM_LAST_GAME_WEIGHT + RECENT_FORM_WINDOW_WEIGHT
+    if weight_sum >= 1.0:
+        scale = 0.99 / weight_sum
+        RECENT_FORM_LAST_GAME_WEIGHT *= scale
+        RECENT_FORM_WINDOW_WEIGHT *= scale
+        logging.warning(
+            "Recent-form weights summed to >=1; rescaled to keep season stability (last=%.3f, window=%.3f).",
+            RECENT_FORM_LAST_GAME_WEIGHT,
+            RECENT_FORM_WINDOW_WEIGHT,
+        )
+
+    PLAYER_HISTORY_CAP_QUANTILE = float(np.clip(config.player_history_cap_quantile, 0.5, 0.99))
+    PLAYER_HISTORY_CAP_HEADROOM = max(0.1, float(config.player_history_cap_headroom))
+
+    logging.info(
+        "Player smoothing -> games=%d last=%.3f window=%.3f season=%.3f | cap quantile=%.3f headroom=%.2f",
+        RECENT_FORM_GAMES,
+        RECENT_FORM_LAST_GAME_WEIGHT,
+        RECENT_FORM_WINDOW_WEIGHT,
+        max(0.0, 1.0 - RECENT_FORM_LAST_GAME_WEIGHT - RECENT_FORM_WINDOW_WEIGHT),
+        PLAYER_HISTORY_CAP_QUANTILE,
+        PLAYER_HISTORY_CAP_HEADROOM,
+    )
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -19300,6 +19360,8 @@ def main() -> None:
     if getattr(args, "paper_trade", False):
         config.enable_paper_trading = True
     setup_logging(config.log_level)
+
+    apply_runtime_config_overrides(config)
 
     logging.info("Connecting to PostgreSQL at %s", config.pg_url)
     try:
@@ -19615,7 +19677,34 @@ def main() -> None:
             )
             closing_gap_summary_logged = True
 
-    if not config.enable_paper_trading and closing_coverage < 0.86:
+    provider_flag = (config.closing_odds_provider or "").strip().lower()
+    closing_history_path = config.closing_odds_history_path or "data/closing_odds_history.csv"
+    provider_remedy_logged = False
+
+    def _log_closing_provider_remedy() -> None:
+        nonlocal provider_remedy_logged
+
+        if provider_remedy_logged or closing_coverage >= CLOSING_ODDS_COVERAGE_GUARDRAIL:
+            return
+
+        provider_remedy_logged = True
+
+        if provider_flag in {"none", "off", "disable", "disabled"}:
+            logging.warning(
+                "Closing odds provider is disabled (NFL_CLOSING_ODDS_PROVIDER=%s). Set it to 'oddsportal' to auto-download verified closing lines or populate %s manually.",
+                provider_flag or "off",
+                closing_history_path,
+            )
+        elif provider_flag in {"local", "csv", "file", "history", "offline"}:
+            path_obj = Path(closing_history_path)
+            if not path_obj.exists():
+                logging.warning(
+                    "Closing odds provider is '%s' but %s does not exist. Provide a CSV with verified closers or switch NFL_CLOSING_ODDS_PROVIDER to 'oddsportal'.",
+                    provider_flag or "local",
+                    closing_history_path,
+                )
+
+    if not config.enable_paper_trading and closing_coverage < CLOSING_ODDS_COVERAGE_GUARDRAIL:
         logging.warning(
             "Closing odds coverage is %.1f%%. Falling back to paper trading until verified sportsbook closings are loaded.",
             closing_coverage * 100.0,
@@ -19623,11 +19712,12 @@ def main() -> None:
         config.enable_paper_trading = True
         _log_gap_location()
         _log_summary_location()
+        _log_closing_provider_remedy()
 
     if (
-        closing_coverage < 0.86
-        or rest_coverage < 0.9
-        or timezone_coverage < 0.9
+        closing_coverage < CLOSING_ODDS_COVERAGE_GUARDRAIL
+        or rest_coverage < SITUATIONAL_COVERAGE_GUARDRAIL
+        or timezone_coverage < SITUATIONAL_COVERAGE_GUARDRAIL
     ):
         if not config.enable_paper_trading:
             logging.warning(
@@ -19637,9 +19727,10 @@ def main() -> None:
                 timezone_coverage * 100.0,
             )
             config.enable_paper_trading = True
-            if closing_coverage < 0.86:
+            if closing_coverage < CLOSING_ODDS_COVERAGE_GUARDRAIL:
                 _log_gap_location()
                 _log_summary_location()
+                _log_closing_provider_remedy()
         else:
             logging.warning(
                 "Data coverage is incomplete (closing=%.1f%%, rest=%.1f%%, timezone=%.1f%%); remain in paper trading mode.",
@@ -19647,9 +19738,23 @@ def main() -> None:
                 rest_coverage * 100.0,
                 timezone_coverage * 100.0,
             )
-            if closing_coverage < 0.86:
+            if closing_coverage < CLOSING_ODDS_COVERAGE_GUARDRAIL:
                 _log_gap_location()
                 _log_summary_location()
+                _log_closing_provider_remedy()
+
+        if rest_coverage < SITUATIONAL_COVERAGE_GUARDRAIL:
+            logging.warning(
+                "Rest/travel context missing for %.1f%% of completed games. Populate %s to raise coverage.",
+                (1.0 - rest_coverage) * 100.0,
+                config.rest_travel_context_path or "data/team_travel_context.csv",
+            )
+        if timezone_coverage < SITUATIONAL_COVERAGE_GUARDRAIL:
+            logging.warning(
+                "Timezone offsets missing for %.1f%% of completed games. Update %s with verified kickoff offsets.",
+                (1.0 - timezone_coverage) * 100.0,
+                config.rest_travel_context_path or "data/team_travel_context.csv",
+            )
 
     paper_summary: Optional[PaperTradeSummary] = None
     if config.enable_paper_trading:
@@ -19675,7 +19780,7 @@ def main() -> None:
         graded = paper_summary.graded_bets
         cumulative_roi = paper_summary.cumulative_roi or 0.0
         if (
-            paper_summary.closing_coverage < 0.86
+            paper_summary.closing_coverage < CLOSING_ODDS_COVERAGE_GUARDRAIL
             or graded < 50
             or cumulative_roi <= 0.0
         ):

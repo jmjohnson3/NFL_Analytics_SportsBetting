@@ -94,7 +94,18 @@ backups cannot inherit starter-level stat lines. You can adjust the weights or
 window in
 `NFL_SPORTSBETTING.py` via `RECENT_FORM_LAST_GAME_WEIGHT`,
 `RECENT_FORM_WINDOW_WEIGHT`, and `RECENT_FORM_GAMES` if you want a different
-balance between short- and long-term form.
+balance between short- and long-term form. These values (and the historical cap
+quantile/headroom) can also be set without editing code by supplying a JSON
+config or environment variables:
+
+- `NFL_RECENT_FORM_GAMES`
+- `NFL_RECENT_FORM_LAST_WEIGHT`
+- `NFL_RECENT_FORM_WINDOW_WEIGHT`
+- `NFL_PLAYER_HISTORY_CAP_QUANTILE`
+- `NFL_PLAYER_HISTORY_CAP_HEADROOM`
+
+If the supplied weights exceed 100% of the blend, the driver now rescales them
+and logs the corrected values so the season-average anchor remains positive.
 
 Player prop outputs now mirror the game-level tables by carrying `confidence`
 labels, a `consensus_gap` (model minus market implied probability), and an
@@ -144,6 +155,16 @@ market data are trustworthy.
 The key principle is that you should never fabricate or forward-fill closing
 prices. Either find the real numbers or exclude the affected games from any
 evaluation you intend to trust for live betting decisions.
+
+### Choosing a closing-odds source
+
+- Set `NFL_CLOSING_ODDS_PROVIDER=oddsportal` to scrape verified closes directly
+  during ingestion.
+- Set `NFL_CLOSING_ODDS_PROVIDER=local` (or leave it unset) and populate
+  `data/closing_odds_history.csv` when you already have a vetted archive and do
+  not want the scraper to run.
+- If odds fetches return zero rows, the driver now emits a warning reminding
+  you to enable one of the options above.
 
 ## Play-by-play simulation vs. current scope
 
