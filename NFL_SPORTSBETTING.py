@@ -19670,6 +19670,33 @@ def main() -> None:
             )
             closing_gap_summary_logged = True
 
+    provider_flag = (config.closing_odds_provider or "").strip().lower()
+    closing_history_path = config.closing_odds_history_path or "data/closing_odds_history.csv"
+    provider_remedy_logged = False
+
+    def _log_closing_provider_remedy() -> None:
+        nonlocal provider_remedy_logged
+
+        if provider_remedy_logged or closing_coverage >= CLOSING_ODDS_COVERAGE_GUARDRAIL:
+            return
+
+        provider_remedy_logged = True
+
+        if provider_flag in {"none", "off", "disable", "disabled"}:
+            logging.warning(
+                "Closing odds provider is disabled (NFL_CLOSING_ODDS_PROVIDER=%s). Set it to 'oddsportal' to auto-download verified closing lines or populate %s manually.",
+                provider_flag or "off",
+                closing_history_path,
+            )
+        elif provider_flag in {"local", "csv", "file", "history", "offline"}:
+            path_obj = Path(closing_history_path)
+            if not path_obj.exists():
+                logging.warning(
+                    "Closing odds provider is '%s' but %s does not exist. Provide a CSV with verified closers or switch NFL_CLOSING_ODDS_PROVIDER to 'oddsportal'.",
+                    provider_flag or "local",
+                    closing_history_path,
+                )
+
     if not config.enable_paper_trading and closing_coverage < CLOSING_ODDS_COVERAGE_GUARDRAIL:
         logging.warning(
             "Closing odds coverage is %.1f%%. Falling back to paper trading until verified sportsbook closings are loaded.",
@@ -19678,6 +19705,7 @@ def main() -> None:
         config.enable_paper_trading = True
         _log_gap_location()
         _log_summary_location()
+        _log_closing_provider_remedy()
 
     if (
         closing_coverage < CLOSING_ODDS_COVERAGE_GUARDRAIL
@@ -19695,6 +19723,7 @@ def main() -> None:
             if closing_coverage < CLOSING_ODDS_COVERAGE_GUARDRAIL:
                 _log_gap_location()
                 _log_summary_location()
+                _log_closing_provider_remedy()
         else:
             logging.warning(
                 "Data coverage is incomplete (closing=%.1f%%, rest=%.1f%%, timezone=%.1f%%); remain in paper trading mode.",
@@ -19705,6 +19734,7 @@ def main() -> None:
             if closing_coverage < CLOSING_ODDS_COVERAGE_GUARDRAIL:
                 _log_gap_location()
                 _log_summary_location()
+                _log_closing_provider_remedy()
 
         if rest_coverage < SITUATIONAL_COVERAGE_GUARDRAIL:
             logging.warning(
