@@ -156,6 +156,16 @@ The key principle is that you should never fabricate or forward-fill closing
 prices. Either find the real numbers or exclude the affected games from any
 evaluation you intend to trust for live betting decisions.
 
+### Choosing a closing-odds source
+
+- Set `NFL_CLOSING_ODDS_PROVIDER=oddsportal` to scrape verified closes directly
+  during ingestion.
+- Set `NFL_CLOSING_ODDS_PROVIDER=local` (or leave it unset) and populate
+  `data/closing_odds_history.csv` when you already have a vetted archive and do
+  not want the scraper to run.
+- If odds fetches return zero rows, the driver now emits a warning reminding
+  you to enable one of the options above.
+
 ## Play-by-play simulation vs. current scope
 
 This repo does **not** attempt to forecast every snap in sequence. The models are

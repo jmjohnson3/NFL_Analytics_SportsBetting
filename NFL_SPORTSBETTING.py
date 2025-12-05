@@ -8644,6 +8644,13 @@ class NFLIngestor:
             include_player_props=True,
             include_historical=True,
         )
+        if not odds_data:
+            provider_hint = (self.config.closing_odds_provider or "").strip().lower()
+            if provider_hint in {"none", "off", "disable", "disabled", "local", "csv", "file", "history", "offline", ""}:
+                logging.warning(
+                    "No sportsbook odds were returned. Enable NFL_CLOSING_ODDS_PROVIDER=oddsportal or populate %s with verified closes.",
+                    self.config.closing_odds_history_path or "data/closing_odds_history.csv",
+                )
         logging.info("Fetched %d odds entries", len(odds_data))
 
         historical_rows = [
