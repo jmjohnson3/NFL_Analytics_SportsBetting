@@ -8212,11 +8212,13 @@ class NFLIngestor:
         msf_client: MySportsFeedsClient,
         odds_client: OddsApiClient,
         supplemental_loader: SupplementalDataLoader,
+        config: NFLConfig,
     ):
         self.db = db
         self.msf_client = msf_client
         self.odds_client = odds_client
         self.supplemental_loader = supplemental_loader
+        self.config = config
         user = getattr(msf_client, "user", None)
         password = getattr(msf_client, "password", None)
         auth_tuple = getattr(msf_client, "auth", None)
@@ -19399,7 +19401,7 @@ def main() -> None:
     # TODO: Backfill automated regression tests that exercise the Odds API ingestion
     # and ROI evaluation pipeline once live prop feeds are verified. The current
     # integration path is only covered by manual end-to-end runs.
-    ingestor = NFLIngestor(db, msf_client, odds_client, supplemental_loader)
+    ingestor = NFLIngestor(db, msf_client, odds_client, supplemental_loader, config)
     ingestor.ingest(config.seasons)
 
     trainer = ModelTrainer(engine, db, supplemental_loader)
