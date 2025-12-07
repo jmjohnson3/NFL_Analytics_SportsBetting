@@ -8542,6 +8542,19 @@ class NFLIngestor:
             logging.warning("No scheduled games available when attempting to ingest odds.")
             return
 
+        provider_hint = (self.config.closing_odds_provider or "").strip().lower()
+        closing_history_path = Path(
+            self.config.closing_odds_history_path
+            or Path.cwd() / "data" / "closing_odds_history.csv"
+        )
+        if provider_hint in {"none", "off", "disable", "disabled", "local", "csv", "file", "history", "offline", ""} and not closing_history_path.exists():
+            logging.warning(
+                "Closing odds provider is disabled and no local history file was found at %s. "
+                "Enable NFL_CLOSING_ODDS_PROVIDER=oddsportal or supply a CSV before rerunning odds ingestion.",
+                closing_history_path,
+            )
+            return
+
         def _ensure_datetime(value: Any) -> Optional[dt.datetime]:
             if value is None or value == "":
                 return None
@@ -8647,7 +8660,6 @@ class NFLIngestor:
             include_historical=True,
         )
         if not odds_data:
-            provider_hint = (self.config.closing_odds_provider or "").strip().lower()
             if provider_hint in {"none", "off", "disable", "disabled", "local", "csv", "file", "history", "offline", ""}:
                 logging.warning(
                     "No sportsbook odds were returned. Enable NFL_CLOSING_ODDS_PROVIDER=oddsportal or populate %s with verified closes.",
