@@ -1291,11 +1291,17 @@ class OddsPortalFetcher:
                     self._debug_dir,
                 )
 
-        auto_debug_env = os.environ.get("NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES", "0")
+        auto_debug_env = os.environ.get("NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES")
+        default_auto_samples = 2
         try:
-            self._auto_debug_remaining = max(0, int(str(auto_debug_env).strip() or 0))
+            parsed_auto = (
+                int(str(auto_debug_env).strip())
+                if auto_debug_env is not None and str(auto_debug_env).strip() != ""
+                else default_auto_samples
+            )
+            self._auto_debug_remaining = max(0, parsed_auto)
         except Exception:
-            self._auto_debug_remaining = 0
+            self._auto_debug_remaining = default_auto_samples
 
         if self._auto_debug_remaining > 0 and self._debug_dir is None:
             self._debug_dir = SCRIPT_ROOT / "reports" / "oddsportal_debug"
@@ -1890,7 +1896,7 @@ class OddsPortalFetcher:
 
         self._no_rows_warned.add(key)
         logging.warning(
-            "OddsPortal parser did not find closing odds for slug %s (season %s, url=%s). Set NFL_ODDSPORTAL_DEBUG_HTML=1 and rerun to capture the raw HTML for troubleshooting.",
+            "OddsPortal parser did not find closing odds for slug %s (season %s, url=%s). Set NFL_ODDSPORTAL_DEBUG_HTML=1 or NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES to a small number to capture HTML for troubleshooting.",
             slug,
             season_label,
             source_url,
