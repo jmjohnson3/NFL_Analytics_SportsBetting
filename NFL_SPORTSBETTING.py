@@ -133,6 +133,8 @@ def _default_data_file(name: str) -> Optional[str]:
 
 DEFAULT_CLOSING_ODDS_PATH = _default_data_file("closing_odds_history.csv")
 DEFAULT_TRAVEL_CONTEXT_PATH = _default_data_file("team_travel_context.csv")
+DEFAULT_COVERAGE_ADJUSTMENTS_PATH = _default_data_file("coverage_adjustments.csv")
+DEFAULT_TEAM_COVERAGE_PATH = _default_data_file("team_coverage_scheme.csv")
 
 # Guardrails used to decide when paper trading is mandatory due to incomplete
 # market/situational coverage.
@@ -187,6 +189,178 @@ def _is_effectively_empty_df(df: Optional[pd.DataFrame]) -> bool:
     """Compatibility wrapper used by legacy call sites to detect empty/NA frames."""
 
     return _sanitize_frame_for_concat(df) is None
+
+
+def _normalize_coverage_label(value: Any) -> str:
+    coverage = str(value or "").strip().lower()
+    if coverage in {"man", "man-coverage", "man to man", "man-to-man"}:
+        return "man"
+    if coverage in {"zone", "zone-coverage", "zone coverage"}:
+        return "zone"
+    return coverage
+
+
+def load_player_coverage_adjustments(path: Optional[str]) -> Dict[str, Dict[str, float]]:
+    """Load optional player-vs-coverage adjustment percentages.
+
+    Expected columns: player, coverage_type, adjustment_pct (decimal or percentage).
+    """
+
+    if not path:
+        return {}
+
+    adjustments: Dict[str, Dict[str, float]] = {}
+    candidate = Path(path)
+    if not candidate.exists():
+        logging.debug("Coverage adjustment file not found at %s", candidate)
+        return adjustments
+
+    try:
+        frame = pd.read_csv(candidate)
+    except Exception:
+        logging.exception("Failed to read coverage adjustments from %s", candidate)
+        return adjustments
+
+    required = {"player", "coverage_type", "adjustment_pct"}
+    if not required.issubset(frame.columns):
+        logging.warning(
+            "Coverage adjustment file %s missing required columns %s; skipping",
+            candidate,
+            required - set(frame.columns),
+        )
+        return adjustments
+
+    for _, row in frame.iterrows():
+        player_key = normalize_player_name(row.get("player"))
+        coverage_type = _normalize_coverage_label(row.get("coverage_type"))
+        if not player_key or not coverage_type:
+            continue
+
+        try:
+            adj = float(row.get("adjustment_pct"))
+        except Exception:
+            continue
+
+        if abs(adj) > 1.5:
+            adj = adj / 100.0
+
+        adjustments.setdefault(player_key, {})[coverage_type] = adj
+
+    if adjustments:
+        logging.info(
+            "Loaded %d player coverage adjustments from %s", len(adjustments), candidate
+        )
+
+    return adjustments
+
+
+def load_team_coverage_profiles(path: Optional[str]) -> Dict[str, str]:
+    """Load a map of team -> primary coverage (man/zone)."""
+
+    if not path:
+        return {}
+
+    candidate = Path(path)
+    if not candidate.exists():
+        logging.debug("Team coverage profile file not found at %s", candidate)
+        return {}
+
+    try:
+        frame = pd.read_csv(candidate)
+    except Exception:
+        logging.exception("Failed to read team coverage profiles from %s", candidate)
+        return {}
+
+    required = {"team", "coverage_type"}
+    if not required.issubset(frame.columns):
+        logging.warning(
+            "Team coverage profile file %s missing required columns %s; skipping",
+            candidate,
+            required - set(frame.columns),
+        )
+        return {}
+
+    profiles: Dict[str, str] = {}
+    for _, row in frame.iterrows():
+        team = normalize_team_abbr(row.get("team"))
+        coverage = _normalize_coverage_label(row.get("coverage_type"))
+        if not team or not coverage:
+            continue
+        profiles[team] = coverage
+
+    if profiles:
+        logging.info(
+            "Loaded coverage scheme for %d teams from %s", len(profiles), candidate
+        )
+
+    return profiles
+
+
+def apply_coverage_adjustments(
+    table: pd.DataFrame,
+    player_adjustments: Dict[str, Dict[str, float]],
+    team_coverage: Dict[str, str],
+) -> pd.DataFrame:
+    """Apply player vs coverage adjustments to prediction tables.
+
+    Multipliers are applied to median/quantile/stat probability columns when both a
+    player rule and opponent coverage are present.
+    """
+
+    if table is None or table.empty:
+        return table
+
+    if not player_adjustments or not team_coverage:
+        return table
+
+    if "opponent" not in table.columns or "player_name" not in table.columns:
+        return table
+
+    adjusted = table.copy()
+    opp_norm = adjusted["opponent"].apply(normalize_team_abbr)
+    adjusted["_opp_coverage"] = opp_norm.map(team_coverage)
+    adjusted["_player_key"] = adjusted["player_name"].apply(normalize_player_name)
+
+    def _apply_multiplier(value: Any, multiplier: float, is_probability: bool) -> Any:
+        try:
+            numeric = float(value)
+        except Exception:
+            return value
+        scaled = numeric * multiplier
+        if is_probability:
+            return float(np.clip(scaled, 0.0, 1.0))
+        return scaled
+
+    for idx, row in adjusted.iterrows():
+        coverage = row.get("_opp_coverage")
+        player_key = row.get("_player_key")
+        if not coverage or not player_key:
+            continue
+
+        adj_map = player_adjustments.get(player_key, {})
+        if coverage not in adj_map:
+            continue
+
+        adj_pct = adj_map[coverage]
+        multiplier = max(0.0, 1.0 + adj_pct)
+
+        for col in (
+            "q10",
+            "pred_median",
+            "q90",
+            "recommended_line",
+            "range_low",
+            "range_high",
+            "anytime_prob",
+            "model_probability",
+        ):
+            if col in adjusted.columns:
+                adjusted.at[idx, col] = _apply_multiplier(
+                    adjusted.at[idx, col], multiplier, col in {"anytime_prob", "model_probability"}
+                )
+
+    adjusted = adjusted.drop(columns=["_opp_coverage", "_player_key"], errors="ignore")
+    return adjusted
 
 def safe_concat(frames: List[pd.DataFrame], **kwargs) -> pd.DataFrame:
     """Concat that ignores None/empty/all-NA frames to avoid FutureWarnings and dtype drift."""
@@ -6829,6 +7003,8 @@ class NFLConfig:
     weather_forecast_path: Optional[str] = os.getenv("NFL_FORECAST_PATH")
     closing_odds_history_path: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PATH") or DEFAULT_CLOSING_ODDS_PATH
     rest_travel_context_path: Optional[str] = os.getenv("NFL_TRAVEL_CONTEXT_PATH") or DEFAULT_TRAVEL_CONTEXT_PATH
+    coverage_adjustments_path: Optional[str] = os.getenv("NFL_COVERAGE_ADJUSTMENTS_PATH") or DEFAULT_COVERAGE_ADJUSTMENTS_PATH
+    team_coverage_scheme_path: Optional[str] = os.getenv("NFL_TEAM_COVERAGE_PATH") or DEFAULT_TEAM_COVERAGE_PATH
     msf_user: str = os.getenv("NFL_API_USER", DEFAULT_NFL_API_USER)
     msf_password: str = os.getenv("NFL_API_PASS", DEFAULT_NFL_API_PASS)
     msf_timeout_seconds: int = int(os.getenv("NFL_API_TIMEOUT", str(DEFAULT_NFL_API_TIMEOUT)))
@@ -18567,6 +18743,17 @@ def predict_upcoming_games(
     if trainer is not None and player_features is not None:
         specials = getattr(trainer, "special_models", {}) or {}
         player_pred_tables: Dict[str, pd.DataFrame] = {}
+        coverage_adjustments = load_player_coverage_adjustments(
+            config.coverage_adjustments_path
+        )
+        team_coverage_profiles = load_team_coverage_profiles(
+            config.team_coverage_scheme_path
+        )
+
+        def _apply_coverage(table: pd.DataFrame) -> pd.DataFrame:
+            return apply_coverage_adjustments(
+                table, coverage_adjustments, team_coverage_profiles
+            )
 
         def _build_player_index(frame: pd.DataFrame) -> pd.DataFrame:
             cols = [
@@ -18613,6 +18800,7 @@ def predict_upcoming_games(
                 table = _apply_history_caps_to_quantiles(
                     table, target, player_features
                 )
+                table = _apply_coverage(table)
                 player_pred_tables[target] = table
 
         anytime_table = pd.DataFrame()
@@ -18642,6 +18830,7 @@ def predict_upcoming_games(
             )
             if table.empty:
                 continue
+            table = _apply_coverage(table)
             if anytime_table.empty:
                 anytime_table = table
             else:

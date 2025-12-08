@@ -251,3 +251,22 @@ already exist in the CSV. You can therefore seed the CSV manually, automate the
 pull via these providers, or combine both approaches. The coverage reports and
 paper-trade guardrails continue to operate exactly as before; the automated
 sync merely helps you reach the 90% threshold with less manual data entry.
+
+### Optional coverage-specific player tweaks
+
+If you track how players perform against different defensive coverages, you can
+layer those tendencies onto the model outputs without retraining:
+
+- Add `data/team_coverage_scheme.csv` with columns `team` (NFL abbreviation) and
+  `coverage_type` (`man` or `zone`).
+- Add `data/coverage_adjustments.csv` with columns `player`, `coverage_type`, and
+  `adjustment_pct`. Positive values boost the player’s projections vs. that
+  coverage; negative values dampen them. `adjustment_pct` can be provided as a
+  decimal (0.10 = +10%) or percentage (10 = +10%).
+- The loader is disabled by default; set custom paths via
+  `NFL_TEAM_COVERAGE_PATH` and `NFL_COVERAGE_ADJUSTMENTS_PATH` if you store the
+  files elsewhere.
+
+During prop generation, the script scales the per-player quantiles and median
+for passing/receiving markets (and anytime TD probabilities) when both a team
+coverage tag and a player rule are present.
