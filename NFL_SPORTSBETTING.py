@@ -133,8 +133,9 @@ def _default_data_file(name: str) -> Optional[str]:
 
 DEFAULT_CLOSING_ODDS_PATH = _default_data_file("closing_odds_history.csv")
 DEFAULT_TRAVEL_CONTEXT_PATH = _default_data_file("team_travel_context.csv")
-DEFAULT_COVERAGE_ADJUSTMENTS_PATH = _default_data_file("coverage_adjustments.csv")
-DEFAULT_TEAM_COVERAGE_PATH = _default_data_file("team_coverage_scheme.csv")
+# Coverage data can come from an API or scraped HTML; local CSVs are optional
+DEFAULT_COVERAGE_ADJUSTMENTS_PATH = None
+DEFAULT_TEAM_COVERAGE_PATH = None
 
 # Guardrails used to decide when paper trading is mandatory due to incomplete
 # market/situational coverage.
@@ -200,33 +201,12 @@ def _normalize_coverage_label(value: Any) -> str:
     return coverage
 
 
-def load_player_coverage_adjustments(path: Optional[str]) -> Dict[str, Dict[str, float]]:
-    """Load optional player-vs-coverage adjustment percentages.
-
-    Expected columns: player, coverage_type, adjustment_pct (decimal or percentage).
-    """
-
-    if not path:
-        return {}
-
+def _parse_coverage_adjustment_frame(frame: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     adjustments: Dict[str, Dict[str, float]] = {}
-    candidate = Path(path)
-    if not candidate.exists():
-        logging.debug("Coverage adjustment file not found at %s", candidate)
-        return adjustments
-
-    try:
-        frame = pd.read_csv(candidate)
-    except Exception:
-        logging.exception("Failed to read coverage adjustments from %s", candidate)
-        return adjustments
-
     required = {"player", "coverage_type", "adjustment_pct"}
     if not required.issubset(frame.columns):
-        logging.warning(
-            "Coverage adjustment file %s missing required columns %s; skipping",
-            candidate,
-            required - set(frame.columns),
+        logging.debug(
+            "Coverage adjustment source missing required columns %s; skipping", required
         )
         return adjustments
 
@@ -241,42 +221,19 @@ def load_player_coverage_adjustments(path: Optional[str]) -> Dict[str, Dict[str,
         except Exception:
             continue
 
-        if abs(adj) > 1.5:
+        if abs(adj) > 10:
             adj = adj / 100.0
 
         adjustments.setdefault(player_key, {})[coverage_type] = adj
 
-    if adjustments:
-        logging.info(
-            "Loaded %d player coverage adjustments from %s", len(adjustments), candidate
-        )
-
     return adjustments
 
 
-def load_team_coverage_profiles(path: Optional[str]) -> Dict[str, str]:
-    """Load a map of team -> primary coverage (man/zone)."""
-
-    if not path:
-        return {}
-
-    candidate = Path(path)
-    if not candidate.exists():
-        logging.debug("Team coverage profile file not found at %s", candidate)
-        return {}
-
-    try:
-        frame = pd.read_csv(candidate)
-    except Exception:
-        logging.exception("Failed to read team coverage profiles from %s", candidate)
-        return {}
-
+def _parse_team_coverage_frame(frame: pd.DataFrame) -> Dict[str, str]:
     required = {"team", "coverage_type"}
     if not required.issubset(frame.columns):
-        logging.warning(
-            "Team coverage profile file %s missing required columns %s; skipping",
-            candidate,
-            required - set(frame.columns),
+        logging.debug(
+            "Team coverage source missing required columns %s; skipping", required
         )
         return {}
 
@@ -287,13 +244,151 @@ def load_team_coverage_profiles(path: Optional[str]) -> Dict[str, str]:
         if not team or not coverage:
             continue
         profiles[team] = coverage
-
-    if profiles:
-        logging.info(
-            "Loaded coverage scheme for %d teams from %s", len(profiles), candidate
-        )
-
     return profiles
+
+
+def _fetch_coverage_json(url: str, api_key: Optional[str]) -> Optional[pd.DataFrame]:
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+    except Exception:
+        logging.exception("Coverage API request failed for %s", url)
+        return None
+
+    if resp.status_code != 200:
+        logging.warning("Coverage API %s returned %s", url, resp.status_code)
+        return None
+
+    try:
+        data = resp.json()
+        return pd.json_normalize(data)
+    except Exception:
+        logging.exception("Coverage API response from %s could not be parsed as JSON", url)
+        return None
+
+
+def _scrape_coverage_table(url: str) -> Optional[pd.DataFrame]:
+    try:
+        tables = pd.read_html(url)
+    except Exception:
+        logging.exception("Coverage scrape failed for %s", url)
+        return None
+
+    for table in tables:
+        if {"player", "coverage_type", "adjustment_pct"}.issubset(table.columns) or {
+            "team",
+            "coverage_type",
+        }.issubset(table.columns):
+            return table
+    logging.warning(
+        "Coverage scrape at %s did not include a usable table with expected columns", url
+    )
+    return None
+
+
+def load_player_coverage_adjustments(
+    path: Optional[str],
+    api_url: Optional[str],
+    api_key: Optional[str],
+    scrape_url: Optional[str],
+) -> Dict[str, Dict[str, float]]:
+    """Load optional player-vs-coverage adjustment percentages.
+
+    The priority is API -> scraped HTML -> optional CSV path.
+    """
+
+    if api_url:
+        frame = _fetch_coverage_json(api_url, api_key)
+        if frame is not None:
+            adjustments = _parse_coverage_adjustment_frame(frame)
+            if adjustments:
+                logging.info(
+                    "Loaded coverage adjustments for %d players from API %s",
+                    len(adjustments),
+                    api_url,
+                )
+                return adjustments
+
+    if scrape_url:
+        frame = _scrape_coverage_table(scrape_url)
+        if frame is not None:
+            adjustments = _parse_coverage_adjustment_frame(frame)
+            if adjustments:
+                logging.info(
+                    "Loaded coverage adjustments for %d players from scrape %s",
+                    len(adjustments),
+                    scrape_url,
+                )
+                return adjustments
+
+    if path:
+        candidate = Path(path)
+        if candidate.exists():
+            try:
+                frame = pd.read_csv(candidate)
+                adjustments = _parse_coverage_adjustment_frame(frame)
+                if adjustments:
+                    logging.info(
+                        "Loaded coverage adjustments for %d players from %s",
+                        len(adjustments),
+                        candidate,
+                    )
+                return adjustments
+            except Exception:
+                logging.exception("Failed to read coverage adjustments from %s", candidate)
+    return {}
+
+
+def load_team_coverage_profiles(
+    path: Optional[str],
+    api_url: Optional[str],
+    api_key: Optional[str],
+    scrape_url: Optional[str],
+) -> Dict[str, str]:
+    """Load a map of team -> primary coverage (man/zone)."""
+
+    if api_url:
+        frame = _fetch_coverage_json(api_url, api_key)
+        if frame is not None:
+            profiles = _parse_team_coverage_frame(frame)
+            if profiles:
+                logging.info(
+                    "Loaded coverage scheme for %d teams from API %s",
+                    len(profiles),
+                    api_url,
+                )
+                return profiles
+
+    if scrape_url:
+        frame = _scrape_coverage_table(scrape_url)
+        if frame is not None:
+            profiles = _parse_team_coverage_frame(frame)
+            if profiles:
+                logging.info(
+                    "Loaded coverage scheme for %d teams from scrape %s",
+                    len(profiles),
+                    scrape_url,
+                )
+                return profiles
+
+    if path:
+        candidate = Path(path)
+        if candidate.exists():
+            try:
+                frame = pd.read_csv(candidate)
+                profiles = _parse_team_coverage_frame(frame)
+                if profiles:
+                    logging.info(
+                        "Loaded coverage scheme for %d teams from %s",
+                        len(profiles),
+                        candidate,
+                    )
+                return profiles
+            except Exception:
+                logging.exception("Failed to read team coverage profiles from %s", candidate)
+    return {}
 
 
 def apply_coverage_adjustments(
@@ -7003,8 +7098,18 @@ class NFLConfig:
     weather_forecast_path: Optional[str] = os.getenv("NFL_FORECAST_PATH")
     closing_odds_history_path: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PATH") or DEFAULT_CLOSING_ODDS_PATH
     rest_travel_context_path: Optional[str] = os.getenv("NFL_TRAVEL_CONTEXT_PATH") or DEFAULT_TRAVEL_CONTEXT_PATH
-    coverage_adjustments_path: Optional[str] = os.getenv("NFL_COVERAGE_ADJUSTMENTS_PATH") or DEFAULT_COVERAGE_ADJUSTMENTS_PATH
-    team_coverage_scheme_path: Optional[str] = os.getenv("NFL_TEAM_COVERAGE_PATH") or DEFAULT_TEAM_COVERAGE_PATH
+    coverage_adjustments_path: Optional[str] = os.getenv("NFL_COVERAGE_ADJUSTMENTS_PATH")
+    team_coverage_scheme_path: Optional[str] = os.getenv("NFL_TEAM_COVERAGE_PATH")
+    coverage_api_base: Optional[str] = os.getenv("NFL_COVERAGE_API_BASE")
+    coverage_api_key: Optional[str] = os.getenv("NFL_COVERAGE_API_KEY")
+    coverage_api_player_endpoint: Optional[str] = os.getenv(
+        "NFL_COVERAGE_API_PLAYER_ENDPOINT", "player-adjustments"
+    )
+    coverage_api_team_endpoint: Optional[str] = os.getenv(
+        "NFL_COVERAGE_API_TEAM_ENDPOINT", "team-coverage"
+    )
+    coverage_scrape_player_url: Optional[str] = os.getenv("NFL_COVERAGE_SCRAPE_PLAYER_URL")
+    coverage_scrape_team_url: Optional[str] = os.getenv("NFL_COVERAGE_SCRAPE_TEAM_URL")
     msf_user: str = os.getenv("NFL_API_USER", DEFAULT_NFL_API_USER)
     msf_password: str = os.getenv("NFL_API_PASS", DEFAULT_NFL_API_PASS)
     msf_timeout_seconds: int = int(os.getenv("NFL_API_TIMEOUT", str(DEFAULT_NFL_API_TIMEOUT)))
@@ -18743,11 +18848,25 @@ def predict_upcoming_games(
     if trainer is not None and player_features is not None:
         specials = getattr(trainer, "special_models", {}) or {}
         player_pred_tables: Dict[str, pd.DataFrame] = {}
+        def _coverage_api_url(endpoint: Optional[str]) -> Optional[str]:
+            if not endpoint:
+                return None
+            base = (config.coverage_api_base or "").rstrip("/")
+            if not base:
+                return None
+            return urljoin(base + "/", endpoint.lstrip("/"))
+
         coverage_adjustments = load_player_coverage_adjustments(
-            config.coverage_adjustments_path
+            config.coverage_adjustments_path,
+            _coverage_api_url(config.coverage_api_player_endpoint),
+            config.coverage_api_key,
+            config.coverage_scrape_player_url,
         )
         team_coverage_profiles = load_team_coverage_profiles(
-            config.team_coverage_scheme_path
+            config.team_coverage_scheme_path,
+            _coverage_api_url(config.coverage_api_team_endpoint),
+            config.coverage_api_key,
+            config.coverage_scrape_team_url,
         )
 
         def _apply_coverage(table: pd.DataFrame) -> pd.DataFrame:

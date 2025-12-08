@@ -255,17 +255,22 @@ sync merely helps you reach the 90% threshold with less manual data entry.
 ### Optional coverage-specific player tweaks
 
 If you track how players perform against different defensive coverages, you can
-layer those tendencies onto the model outputs without retraining:
+layer those tendencies onto the model outputs without retraining. The loader now
+prefers an API or a scraped HTML table so you do not need to maintain CSVs:
 
-- Add `data/team_coverage_scheme.csv` with columns `team` (NFL abbreviation) and
-  `coverage_type` (`man` or `zone`).
-- Add `data/coverage_adjustments.csv` with columns `player`, `coverage_type`, and
-  `adjustment_pct`. Positive values boost the player’s projections vs. that
-  coverage; negative values dampen them. `adjustment_pct` can be provided as a
-  decimal (0.10 = +10%) or percentage (10 = +10%).
-- The loader is disabled by default; set custom paths via
-  `NFL_TEAM_COVERAGE_PATH` and `NFL_COVERAGE_ADJUSTMENTS_PATH` if you store the
-  files elsewhere.
+- Point `NFL_COVERAGE_API_BASE` to an API host and (optionally) set
+  `NFL_COVERAGE_API_KEY`. The driver will request
+  `<base>/<NFL_COVERAGE_API_PLAYER_ENDPOINT>` (defaults to
+  `player-adjustments`) for player rules and
+  `<base>/<NFL_COVERAGE_API_TEAM_ENDPOINT>` (defaults to `team-coverage`) for
+  team schemes. Responses should include columns/fields `player` or `team`,
+  `coverage_type` (`man`/`zone`), and `adjustment_pct`.
+- Alternatively, set `NFL_COVERAGE_SCRAPE_PLAYER_URL` and
+  `NFL_COVERAGE_SCRAPE_TEAM_URL` to pages containing HTML tables with those same
+  columns; the code will scrape and normalize them automatically.
+- CSVs remain optional fallbacks. If you still keep files around, you can point
+  `NFL_COVERAGE_ADJUSTMENTS_PATH` or `NFL_TEAM_COVERAGE_PATH` at them, but they
+  are no longer required.
 
 During prop generation, the script scales the per-player quantiles and median
 for passing/receiving markets (and anytime TD probabilities) when both a team
