@@ -94,7 +94,18 @@ backups cannot inherit starter-level stat lines. You can adjust the weights or
 window in
 `NFL_SPORTSBETTING.py` via `RECENT_FORM_LAST_GAME_WEIGHT`,
 `RECENT_FORM_WINDOW_WEIGHT`, and `RECENT_FORM_GAMES` if you want a different
-balance between short- and long-term form.
+balance between short- and long-term form. These values (and the historical cap
+quantile/headroom) can also be set without editing code by supplying a JSON
+config or environment variables:
+
+- `NFL_RECENT_FORM_GAMES`
+- `NFL_RECENT_FORM_LAST_WEIGHT`
+- `NFL_RECENT_FORM_WINDOW_WEIGHT`
+- `NFL_PLAYER_HISTORY_CAP_QUANTILE`
+- `NFL_PLAYER_HISTORY_CAP_HEADROOM`
+
+If the supplied weights exceed 100% of the blend, the driver now rescales them
+and logs the corrected values so the season-average anchor remains positive.
 
 Player prop outputs now mirror the game-level tables by carrying `confidence`
 labels, a `consensus_gap` (model minus market implied probability), and an
@@ -144,6 +155,16 @@ market data are trustworthy.
 The key principle is that you should never fabricate or forward-fill closing
 prices. Either find the real numbers or exclude the affected games from any
 evaluation you intend to trust for live betting decisions.
+
+### Choosing a closing-odds source
+
+- Set `NFL_CLOSING_ODDS_PROVIDER=oddsportal` to scrape verified closes directly
+  during ingestion.
+- Set `NFL_CLOSING_ODDS_PROVIDER=local` (or leave it unset) and populate
+  `data/closing_odds_history.csv` when you already have a vetted archive and do
+  not want the scraper to run.
+- If odds fetches return zero rows, the driver now emits a warning reminding
+  you to enable one of the options above.
 
 ## Play-by-play simulation vs. current scope
 
@@ -230,3 +251,27 @@ already exist in the CSV. You can therefore seed the CSV manually, automate the
 pull via these providers, or combine both approaches. The coverage reports and
 paper-trade guardrails continue to operate exactly as before; the automated
 sync merely helps you reach the 90% threshold with less manual data entry.
+
+### Optional coverage-specific player tweaks
+
+If you track how players perform against different defensive coverages, you can
+layer those tendencies onto the model outputs without retraining. The loader now
+prefers an API or a scraped HTML table so you do not need to maintain CSVs:
+
+- Point `NFL_COVERAGE_API_BASE` to an API host and (optionally) set
+  `NFL_COVERAGE_API_KEY`. The driver will request
+  `<base>/<NFL_COVERAGE_API_PLAYER_ENDPOINT>` (defaults to
+  `player-adjustments`) for player rules and
+  `<base>/<NFL_COVERAGE_API_TEAM_ENDPOINT>` (defaults to `team-coverage`) for
+  team schemes. Responses should include columns/fields `player` or `team`,
+  `coverage_type` (`man`/`zone`), and `adjustment_pct`.
+- Alternatively, set `NFL_COVERAGE_SCRAPE_PLAYER_URL` and
+  `NFL_COVERAGE_SCRAPE_TEAM_URL` to pages containing HTML tables with those same
+  columns; the code will scrape and normalize them automatically.
+- CSVs remain optional fallbacks. If you still keep files around, you can point
+  `NFL_COVERAGE_ADJUSTMENTS_PATH` or `NFL_TEAM_COVERAGE_PATH` at them, but they
+  are no longer required.
+
+During prop generation, the script scales the per-player quantiles and median
+for passing/receiving markets (and anytime TD probabilities) when both a team
+coverage tag and a player rule are present.
