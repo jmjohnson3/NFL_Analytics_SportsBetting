@@ -1267,6 +1267,7 @@ class OddsPortalFetcher:
         self._debug_dumped_sources: Set[str] = set()
         self._debug_capture_logged: Set[str] = set()
         self._no_rows_warned: Set[str] = set()
+        self._auto_debug_remaining = 0
 
         debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
         if str(debug_flag).strip().lower() in {"1", "true", "yes", "on", "debug"}:
@@ -1287,6 +1288,29 @@ class OddsPortalFetcher:
             else:
                 logging.warning(
                     "NFL_ODDSPORTAL_DEBUG_HTML enabled; raw OddsPortal pages will be written to %s",
+                    self._debug_dir,
+                )
+
+        auto_debug_env = os.environ.get("NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES", "0")
+        try:
+            self._auto_debug_remaining = max(0, int(str(auto_debug_env).strip() or 0))
+        except Exception:
+            self._auto_debug_remaining = 0
+
+        if self._auto_debug_remaining > 0 and self._debug_dir is None:
+            self._debug_dir = SCRIPT_ROOT / "reports" / "oddsportal_debug"
+            try:
+                self._debug_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                logging.exception(
+                    "Unable to create auto-debug directory for OddsPortal HTML at %s",
+                    self._debug_dir,
+                )
+                self._auto_debug_remaining = 0
+            else:
+                logging.warning(
+                    "NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES=%d; will save the first empty OddsPortal pages to %s for triage",
+                    self._auto_debug_remaining,
                     self._debug_dir,
                 )
 
@@ -1813,15 +1837,29 @@ class OddsPortalFetcher:
             json_like,
         )
 
-        self._debug_dump_html(slug, source_url, html)
+        saved_path = self._debug_dump_html(slug, source_url, html)
+        if saved_path is None and self._auto_debug_remaining > 0:
+            forced_path = self._debug_dump_html(slug, source_url, html, force=True)
+            if forced_path:
+                self._auto_debug_remaining -= 1
+                logging.warning(
+                    "Saved OddsPortal HTML snapshot to %s because parsing returned no rows (auto-debug samples remaining: %d)."
+                    " Enable NFL_ODDSPORTAL_DEBUG_HTML=1 to persist every failure until resolved.",
+                    forced_path,
+                    self._auto_debug_remaining,
+                )
 
-    def _debug_dump_html(self, slug: str, source_url: str, html: str) -> None:
-        if not self._debug_dump_enabled or not html or self._debug_dir is None:
-            return
+    def _debug_dump_html(
+        self, slug: str, source_url: str, html: str, *, force: bool = False
+    ) -> Optional[Path]:
+        if (not self._debug_dump_enabled and not force) or not html:
+            return None
+        if self._debug_dir is None:
+            return None
 
         key = f"{slug}|{source_url}"
         if key in self._debug_dumped_sources:
-            return
+            return None
         self._debug_dumped_sources.add(key)
 
         timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -1834,7 +1872,7 @@ class OddsPortalFetcher:
         except Exception:
             logging.exception("Failed to write OddsPortal debug HTML to %s", path)
             self._debug_dump_enabled = False
-            return
+            return None
 
         logging.warning(
             "Saved OddsPortal HTML snapshot to %s for slug %s (%s). Share this file if parsing remains empty.",
@@ -1842,6 +1880,8 @@ class OddsPortalFetcher:
             slug,
             source_url,
         )
+
+        return path
 
     def _debug_warn_no_rows(self, slug: str, season_label: str, source_url: str) -> None:
         key = f"{season_label}|{slug}"
