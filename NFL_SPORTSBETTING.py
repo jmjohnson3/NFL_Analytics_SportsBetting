@@ -1868,7 +1868,7 @@ class OddsPortalFetcher:
             return None
         self._debug_dumped_sources.add(key)
 
-        timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         safe_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/")) or "root"
         filename = f"{timestamp}_{safe_slug}.html"
         path = self._debug_dir / filename
@@ -19751,6 +19751,10 @@ def apply_runtime_config_overrides(config: NFLConfig) -> None:
 
 
 def main() -> None:
+    # Enable HTML capture by default so empty OddsPortal responses are saved automatically
+    # for troubleshooting unless the user explicitly opts out.
+    os.environ.setdefault("NFL_ODDSPORTAL_DEBUG_HTML", "1")
+
     args = parse_args()
     config = load_config(args.config)
     if getattr(args, "respect_lineups", None) is not None:
@@ -19758,6 +19762,12 @@ def main() -> None:
     if getattr(args, "paper_trade", False):
         config.enable_paper_trading = True
     setup_logging(config.log_level)
+
+    logging.debug(
+        "Runtime debug flags | NFL_ODDSPORTAL_DEBUG_HTML=%s | NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES=%s",
+        os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML"),
+        os.environ.get("NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES"),
+    )
 
     apply_runtime_config_overrides(config)
 
@@ -19773,6 +19783,26 @@ def main() -> None:
             sys.exit(1)
         raise
     db = NFLDatabase(engine)
+
+    # Snapshot existing coverage before ingest for lightweight observability.
+    def _closing_count(frame: pd.DataFrame) -> int:
+        if frame is None or frame.empty:
+            return 0
+        columns = [col for col in ("home_closing_moneyline", "away_closing_moneyline") if col in frame.columns]
+        if len(columns) < 2:
+            return 0
+        return int(frame[columns].dropna(how="any").shape[0])
+
+    pre_ingest_games = db.fetch_existing_game_ids()
+    pre_ingest_with_stats = db.fetch_games_with_player_stats()
+    pre_ingest_odds = db.fetch_games_with_odds_for_seasons(config.seasons)
+    logging.info(
+        "Pre-ingest coverage | total games=%d | with player stats=%d | with any odds=%d | with closing odds=%d",
+        len(pre_ingest_games),
+        len(pre_ingest_with_stats),
+        len(pre_ingest_odds),
+        _closing_count(pre_ingest_odds),
+    )
 
     try:
         syncer = ClosingOddsArchiveSyncer(config, db)
@@ -19799,6 +19829,18 @@ def main() -> None:
     # integration path is only covered by manual end-to-end runs.
     ingestor = NFLIngestor(db, msf_client, odds_client, supplemental_loader, config)
     ingestor.ingest(config.seasons)
+
+    # Lightweight post-ingest snapshot to confirm inputs landed as expected.
+    post_ingest_games = db.fetch_existing_game_ids()
+    post_ingest_with_stats = db.fetch_games_with_player_stats()
+    post_ingest_odds = db.fetch_games_with_odds_for_seasons(config.seasons)
+    logging.info(
+        "Post-ingest coverage | total games=%d | with player stats=%d | with any odds=%d | with closing odds=%d",
+        len(post_ingest_games),
+        len(post_ingest_with_stats),
+        len(post_ingest_odds),
+        _closing_count(post_ingest_odds),
+    )
 
     trainer = ModelTrainer(engine, db, supplemental_loader)
     try:
