@@ -1896,10 +1896,13 @@ class OddsPortalFetcher:
 
         self._no_rows_warned.add(key)
         logging.warning(
-            "OddsPortal parser did not find closing odds for slug %s (season %s, url=%s). Set NFL_ODDSPORTAL_DEBUG_HTML=1 or NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES to a small number to capture HTML for troubleshooting.",
+            "OddsPortal parser did not find closing odds for slug %s (season %s, url=%s). Debug flags -> HTML=%s auto_samples=%s debug_dir=%s",
             slug,
             season_label,
             source_url,
+            os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML"),
+            os.environ.get("NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES"),
+            self._debug_dir,
         )
 
     def _tag_testid_values(self, tag: "Tag") -> Sequence[str]:
@@ -19101,6 +19104,16 @@ def predict_upcoming_games(
                 odds_games=odds_games_df,
                 tpois=(poisson_info or {}).get("model") if poisson_info else None,
                 out_dir=out_dir,
+            )
+
+            logging.debug(
+                "Pricing summary | upcoming_games=%d | player_preds=%d | priced_props=%d | priced_totals=%d | model_props=%d | model_totals=%d",
+                len(upcoming),
+                sum(len(tbl) for tbl in player_pred_tables.values()),
+                len(priced_results.get("props", pd.DataFrame())),
+                len(priced_results.get("totals", pd.DataFrame())),
+                len(priced_results.get("model_props", pd.DataFrame())),
+                len(priced_results.get("model_totals", pd.DataFrame())),
             )
 
     # Reporting output
