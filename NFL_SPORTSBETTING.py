@@ -1267,6 +1267,7 @@ class OddsPortalFetcher:
         self._debug_dumped_sources: Set[str] = set()
         self._debug_capture_logged: Set[str] = set()
         self._no_rows_warned: Set[str] = set()
+        self._auto_debug_remaining = 0
 
         debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
         if str(debug_flag).strip().lower() in {"1", "true", "yes", "on", "debug"}:
@@ -1287,6 +1288,35 @@ class OddsPortalFetcher:
             else:
                 logging.warning(
                     "NFL_ODDSPORTAL_DEBUG_HTML enabled; raw OddsPortal pages will be written to %s",
+                    self._debug_dir,
+                )
+
+        auto_debug_env = os.environ.get("NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES")
+        default_auto_samples = 2
+        try:
+            parsed_auto = (
+                int(str(auto_debug_env).strip())
+                if auto_debug_env is not None and str(auto_debug_env).strip() != ""
+                else default_auto_samples
+            )
+            self._auto_debug_remaining = max(0, parsed_auto)
+        except Exception:
+            self._auto_debug_remaining = default_auto_samples
+
+        if self._auto_debug_remaining > 0 and self._debug_dir is None:
+            self._debug_dir = SCRIPT_ROOT / "reports" / "oddsportal_debug"
+            try:
+                self._debug_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                logging.exception(
+                    "Unable to create auto-debug directory for OddsPortal HTML at %s",
+                    self._debug_dir,
+                )
+                self._auto_debug_remaining = 0
+            else:
+                logging.warning(
+                    "NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES=%d; will save the first empty OddsPortal pages to %s for triage",
+                    self._auto_debug_remaining,
                     self._debug_dir,
                 )
 
@@ -1813,18 +1843,32 @@ class OddsPortalFetcher:
             json_like,
         )
 
-        self._debug_dump_html(slug, source_url, html)
+        saved_path = self._debug_dump_html(slug, source_url, html)
+        if saved_path is None and self._auto_debug_remaining > 0:
+            forced_path = self._debug_dump_html(slug, source_url, html, force=True)
+            if forced_path:
+                self._auto_debug_remaining -= 1
+                logging.warning(
+                    "Saved OddsPortal HTML snapshot to %s because parsing returned no rows (auto-debug samples remaining: %d)."
+                    " Enable NFL_ODDSPORTAL_DEBUG_HTML=1 to persist every failure until resolved.",
+                    forced_path,
+                    self._auto_debug_remaining,
+                )
 
-    def _debug_dump_html(self, slug: str, source_url: str, html: str) -> None:
-        if not self._debug_dump_enabled or not html or self._debug_dir is None:
-            return
+    def _debug_dump_html(
+        self, slug: str, source_url: str, html: str, *, force: bool = False
+    ) -> Optional[Path]:
+        if (not self._debug_dump_enabled and not force) or not html:
+            return None
+        if self._debug_dir is None:
+            return None
 
         key = f"{slug}|{source_url}"
         if key in self._debug_dumped_sources:
-            return
+            return None
         self._debug_dumped_sources.add(key)
 
-        timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         safe_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/")) or "root"
         filename = f"{timestamp}_{safe_slug}.html"
         path = self._debug_dir / filename
@@ -1834,7 +1878,7 @@ class OddsPortalFetcher:
         except Exception:
             logging.exception("Failed to write OddsPortal debug HTML to %s", path)
             self._debug_dump_enabled = False
-            return
+            return None
 
         logging.warning(
             "Saved OddsPortal HTML snapshot to %s for slug %s (%s). Share this file if parsing remains empty.",
@@ -1843,6 +1887,8 @@ class OddsPortalFetcher:
             source_url,
         )
 
+        return path
+
     def _debug_warn_no_rows(self, slug: str, season_label: str, source_url: str) -> None:
         key = f"{season_label}|{slug}"
         if key in self._no_rows_warned:
@@ -1850,10 +1896,13 @@ class OddsPortalFetcher:
 
         self._no_rows_warned.add(key)
         logging.warning(
-            "OddsPortal parser did not find closing odds for slug %s (season %s, url=%s). Set NFL_ODDSPORTAL_DEBUG_HTML=1 and rerun to capture the raw HTML for troubleshooting.",
+            "OddsPortal parser did not find closing odds for slug %s (season %s, url=%s). Debug flags -> HTML=%s auto_samples=%s debug_dir=%s",
             slug,
             season_label,
             source_url,
+            os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML"),
+            os.environ.get("NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES"),
+            self._debug_dir,
         )
 
     def _tag_testid_values(self, tag: "Tag") -> Sequence[str]:
@@ -19057,6 +19106,16 @@ def predict_upcoming_games(
                 out_dir=out_dir,
             )
 
+            logging.debug(
+                "Pricing summary | upcoming_games=%d | player_preds=%d | priced_props=%d | priced_totals=%d | model_props=%d | model_totals=%d",
+                len(upcoming),
+                sum(len(tbl) for tbl in player_pred_tables.values()),
+                len(priced_results.get("props", pd.DataFrame())),
+                len(priced_results.get("totals", pd.DataFrame())),
+                len(priced_results.get("model_props", pd.DataFrame())),
+                len(priced_results.get("model_totals", pd.DataFrame())),
+            )
+
     # Reporting output
     def _format_table(headers: Sequence[str], rows: Sequence[Sequence[str]], aligns=None) -> List[str]:
         if aligns is None:
@@ -19705,6 +19764,10 @@ def apply_runtime_config_overrides(config: NFLConfig) -> None:
 
 
 def main() -> None:
+    # Enable HTML capture by default so empty OddsPortal responses are saved automatically
+    # for troubleshooting unless the user explicitly opts out.
+    os.environ.setdefault("NFL_ODDSPORTAL_DEBUG_HTML", "1")
+
     args = parse_args()
     config = load_config(args.config)
     if getattr(args, "respect_lineups", None) is not None:
@@ -19712,6 +19775,12 @@ def main() -> None:
     if getattr(args, "paper_trade", False):
         config.enable_paper_trading = True
     setup_logging(config.log_level)
+
+    logging.debug(
+        "Runtime debug flags | NFL_ODDSPORTAL_DEBUG_HTML=%s | NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES=%s",
+        os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML"),
+        os.environ.get("NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES"),
+    )
 
     apply_runtime_config_overrides(config)
 
@@ -19727,6 +19796,26 @@ def main() -> None:
             sys.exit(1)
         raise
     db = NFLDatabase(engine)
+
+    # Snapshot existing coverage before ingest for lightweight observability.
+    def _closing_count(frame: pd.DataFrame) -> int:
+        if frame is None or frame.empty:
+            return 0
+        columns = [col for col in ("home_closing_moneyline", "away_closing_moneyline") if col in frame.columns]
+        if len(columns) < 2:
+            return 0
+        return int(frame[columns].dropna(how="any").shape[0])
+
+    pre_ingest_games = db.fetch_existing_game_ids()
+    pre_ingest_with_stats = db.fetch_games_with_player_stats()
+    pre_ingest_odds = db.fetch_games_with_odds_for_seasons(config.seasons)
+    logging.info(
+        "Pre-ingest coverage | total games=%d | with player stats=%d | with any odds=%d | with closing odds=%d",
+        len(pre_ingest_games),
+        len(pre_ingest_with_stats),
+        len(pre_ingest_odds),
+        _closing_count(pre_ingest_odds),
+    )
 
     try:
         syncer = ClosingOddsArchiveSyncer(config, db)
@@ -19753,6 +19842,18 @@ def main() -> None:
     # integration path is only covered by manual end-to-end runs.
     ingestor = NFLIngestor(db, msf_client, odds_client, supplemental_loader, config)
     ingestor.ingest(config.seasons)
+
+    # Lightweight post-ingest snapshot to confirm inputs landed as expected.
+    post_ingest_games = db.fetch_existing_game_ids()
+    post_ingest_with_stats = db.fetch_games_with_player_stats()
+    post_ingest_odds = db.fetch_games_with_odds_for_seasons(config.seasons)
+    logging.info(
+        "Post-ingest coverage | total games=%d | with player stats=%d | with any odds=%d | with closing odds=%d",
+        len(post_ingest_games),
+        len(post_ingest_with_stats),
+        len(post_ingest_odds),
+        _closing_count(post_ingest_odds),
+    )
 
     trainer = ModelTrainer(engine, db, supplemental_loader)
     try:
