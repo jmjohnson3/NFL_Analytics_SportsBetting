@@ -1101,6 +1101,36 @@ class OddsPortalFetcher:
             self._debug_warn_no_rows(slug, season_label, url)
         return result
 
+    def _discover_additional_pages(self, url: str, html: str) -> Iterable[str]:
+        """Find paginated OddsPortal result pages linked from the provided HTML."""
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            logging.exception("Failed to parse OddsPortal HTML when discovering pages for %s", url)
+            return []
+
+        anchors = soup.find_all("a")
+        if not anchors:
+            return []
+
+        candidates: List[str] = []
+        for anchor in anchors:
+            href = anchor.get("href")
+            if not href:
+                continue
+
+            href = href.strip()
+            # OddsPortal paginated links often contain "#/page/" fragments.
+            if "page" not in href:
+                continue
+
+            candidate = urljoin(url, href)
+            if candidate != url and candidate not in candidates:
+                candidates.append(candidate)
+
+        return candidates
+
     def _request(self, url: str) -> Optional[str]:
         attempt_insecure = False
 
