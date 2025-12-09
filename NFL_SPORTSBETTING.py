@@ -32,7 +32,7 @@ import sys
 import time
 import unicodedata
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from types import SimpleNamespace
 from dataclasses import dataclass
 from pathlib import Path
@@ -18944,6 +18944,16 @@ def predict_upcoming_games(
             len(coverage_adjustments),
             len(team_coverage_profiles),
         )
+        if team_coverage_profiles:
+            scheme_mix = Counter(team_coverage_profiles.values())
+            logging.info(
+                "Defensive coverage mix -> %s",
+                ", ".join(f"{scheme}={count}" for scheme, count in scheme_mix.most_common()),
+            )
+        else:
+            logging.info(
+                "Defensive coverage unavailable; configure NFL_TEAM_COVERAGE_API_URL or NFL_TEAM_COVERAGE_SCRAPE_URL to supply schemes."
+            )
         if coverage_adjustments:
             preview = list(coverage_adjustments.items())[:3]
             logging.info(
