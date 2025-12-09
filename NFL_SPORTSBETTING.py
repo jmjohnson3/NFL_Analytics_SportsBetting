@@ -3017,6 +3017,11 @@ class ClosingOddsArchiveSyncer:
                 logging.warning("Unknown closing odds provider '%s'", provider)
                 return
 
+            logging.info(
+                "Closing odds provider selected: %s (seasons=%s)",
+                provider_name,
+                ", ".join(seasons),
+            )
             archive = fetcher.fetch(seasons)
             if archive.empty:
                 logging.warning(
@@ -3026,6 +3031,12 @@ class ClosingOddsArchiveSyncer:
                 )
                 return
 
+            logging.info(
+                "Closing odds provider %s returned %d rows; normalizing and merging",
+                provider_name,
+                len(archive),
+            )
+            before_coverage = self._closing_coverage_snapshot()
             archive = self._attach_game_ids(archive)
             archive = self._finalize_probabilities(archive)
             updated_rows = self._apply_closing_odds_to_database(archive)
@@ -3035,9 +3046,40 @@ class ClosingOddsArchiveSyncer:
                     updated_rows,
                     provider_name,
                 )
+            after_coverage = self._closing_coverage_snapshot()
+            if before_coverage and after_coverage:
+                logging.info(
+                    "Closing odds coverage improved from %.1f%% (%d/%d) to %.1f%% (%d/%d)",
+                    before_coverage["percent"],
+                    before_coverage["covered"],
+                    before_coverage["total"],
+                    after_coverage["percent"],
+                    after_coverage["covered"],
+                    after_coverage["total"],
+                )
             self._write_history(provider_name, archive)
         finally:
             self.session.close()
+
+    def _closing_coverage_snapshot(self) -> Optional[Dict[str, int]]:
+        try:
+            games = pd.read_sql_table(
+                "nfl_games",
+                self.db.engine,
+                columns=["game_id", "home_closing_moneyline", "away_closing_moneyline"],
+            )
+        except Exception:
+            logging.debug("Unable to compute closing odds coverage snapshot")
+            return None
+
+        if games.empty:
+            return {"total": 0, "covered": 0, "percent": 0.0}
+
+        mask = games[["home_closing_moneyline", "away_closing_moneyline"]].notna().any(axis=1)
+        covered = int(mask.sum())
+        total = int(len(games))
+        percent = 100.0 * covered / total if total else 0.0
+        return {"total": total, "covered": covered, "percent": round(percent, 1)}
 
     def _attach_game_ids(self, archive: pd.DataFrame) -> pd.DataFrame:
         try:
