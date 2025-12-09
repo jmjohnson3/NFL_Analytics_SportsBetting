@@ -19051,19 +19051,24 @@ def predict_upcoming_games(
         )
         if coverage_adjustments:
             preview = list(coverage_adjustments.items())[:3]
-            logging.debug(
-                "Sample coverage adjustments: %s",
+            logging.info(
+                "Sample coverage adjustments (up to 3): %s",
                 "; ".join(
                     f"{player}: {', '.join(f'{k}={v:+.2f}' for k, v in sorted(adjs.items()))}"
                     for player, adjs in preview
                 ),
             )
+        else:
+            logging.info("No player coverage adjustments were loaded; predictions will be unadjusted.")
+
         if team_coverage_profiles:
             preview_profiles = list(team_coverage_profiles.items())[:5]
-            logging.debug(
-                "Sample team coverage schemes: %s",
+            logging.info(
+                "Sample team coverage schemes (up to 5): %s",
                 ", ".join(f"{team} -> {scheme}" for team, scheme in preview_profiles),
             )
+        else:
+            logging.info("No team coverage schemes were loaded; default coverage assumptions will be used.")
 
         def _apply_coverage(table: pd.DataFrame) -> pd.DataFrame:
             return apply_coverage_adjustments(
