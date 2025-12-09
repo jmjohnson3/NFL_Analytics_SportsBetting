@@ -7151,7 +7151,22 @@ class NFLConfig:
     player_history_cap_headroom: float = float(
         os.getenv("NFL_PLAYER_HISTORY_CAP_HEADROOM", str(PLAYER_HISTORY_CAP_HEADROOM))
     )
-    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER") or "oddsportal"
+    _ks_api_key_env: Optional[str] = os.getenv("KILLERSPORTS_API_KEY") or os.getenv(
+        "NFL_KILLERSPORTS_API_KEY"
+    )
+    _ks_username_env: Optional[str] = os.getenv("KILLERSPORTS_USERNAME") or os.getenv(
+        "NFL_KILLERSPORTS_USERNAME"
+    )
+    _ks_password_env: Optional[str] = os.getenv("KILLERSPORTS_PASSWORD") or os.getenv(
+        "NFL_KILLERSPORTS_PASSWORD"
+    )
+    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER")
+    if not closing_odds_provider:
+        closing_odds_provider = (
+            "oddsportal,killersports"
+            if _ks_api_key_env or (_ks_username_env and _ks_password_env)
+            else "oddsportal"
+        )
     closing_odds_timeout: int = int(os.getenv("NFL_CLOSING_ODDS_TIMEOUT", "45"))
     closing_odds_download_dir: Optional[str] = os.getenv("NFL_CLOSING_ODDS_DOWNLOAD_DIR")
     oddsportal_base_url: str = os.getenv(
@@ -7175,9 +7190,9 @@ class NFLConfig:
         if ua.strip()
     )
     killersports_base_url: Optional[str] = os.getenv("KILLERSPORTS_BASE_URL")
-    killersports_api_key: Optional[str] = os.getenv("KILLERSPORTS_API_KEY")
-    killersports_username: Optional[str] = os.getenv("KILLERSPORTS_USERNAME")
-    killersports_password: Optional[str] = os.getenv("KILLERSPORTS_PASSWORD")
+    killersports_api_key: Optional[str] = _ks_api_key_env
+    killersports_username: Optional[str] = _ks_username_env
+    killersports_password: Optional[str] = _ks_password_env
 
     @property
     def pg_url(self) -> str:
