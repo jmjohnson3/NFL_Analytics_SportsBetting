@@ -3230,15 +3230,6 @@ class ClosingOddsArchiveSyncer:
         )
 
 
-    def _history_path(self) -> Path:
-        if self.config.closing_odds_history_path:
-            return Path(self.config.closing_odds_history_path)
-        default_path = SCRIPT_ROOT / "data" / "closing_odds_history.csv"
-        default_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config.closing_odds_history_path = str(default_path)
-        return default_path
-
-
 def compute_rmse(y_true: Union[pd.Series, np.ndarray], y_pred: Union[pd.Series, np.ndarray]) -> float:
     """Backwards-compatible RMSE that tolerates older sklearn versions."""
 
@@ -6503,8 +6494,16 @@ class SupplementalDataLoader:
         self.depth_chart_records = self._load_records(config.depth_chart_path)
         self.advanced_records = self._load_records(config.advanced_metrics_path)
         self.weather_records = self._load_records(config.weather_forecast_path)
-        self.closing_odds_records = self._load_records(config.closing_odds_history_path)
         self.travel_context_records = self._load_records(config.rest_travel_context_path)
+
+        # Historical closing odds must come from a verified API/scrape or the database;
+        # ignore any legacy CSV paths to prevent stale data from being ingested.
+        if config.closing_odds_history_path:
+            logging.info(
+                "Ignoring local closing odds history file %s; use a live provider instead.",
+                config.closing_odds_history_path,
+            )
+        self.closing_odds_records: List[Dict[str, Any]] = []
 
         self.injuries_by_game = self._index_records(self.injury_records, "game_id")
         self.injuries_by_team = self._index_records(self.injury_records, "team")
