@@ -338,6 +338,13 @@ def load_player_coverage_adjustments(
                 return adjustments
             except Exception:
                 logging.exception("Failed to read coverage adjustments from %s", candidate)
+    logging.info(
+        "No player coverage adjustments loaded; sources api=%s scrape=%s csv=%s (exists=%s)",
+        api_url or "unset",
+        scrape_url or "unset",
+        path or "unset",
+        Path(path).exists() if path else False,
+    )
     return {}
 
 
@@ -388,6 +395,13 @@ def load_team_coverage_profiles(
                 return profiles
             except Exception:
                 logging.exception("Failed to read team coverage profiles from %s", candidate)
+    logging.info(
+        "No team coverage schemes loaded; sources api=%s scrape=%s csv=%s (exists=%s)",
+        api_url or "unset",
+        scrape_url or "unset",
+        path or "unset",
+        Path(path).exists() if path else False,
+    )
     return {}
 
 
