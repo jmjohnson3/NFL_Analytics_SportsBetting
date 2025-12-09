@@ -3079,17 +3079,6 @@ class ClosingOddsArchiveSyncer:
             providers_raw,
         )
 
-        fallback_rows = self._apply_fallback_from_game_odds()
-        if fallback_rows:
-            logging.info(
-                "Applied %d fallback closing odds rows from latest available game odds in the database",
-                fallback_rows,
-            )
-        else:
-            logging.info(
-                "No fallback closing odds were available from existing game odds; coverage remains unchanged",
-            )
-
     def _closing_coverage_snapshot(self) -> Optional[Dict[str, int]]:
         try:
             games = pd.read_sql_table(
@@ -3298,67 +3287,6 @@ class ClosingOddsArchiveSyncer:
         logging.info(
             "Skipping CSV history write for provider %s; closing odds are persisted directly to the database.",
             provider_name,
-        )
-
-    def _apply_fallback_from_game_odds(self) -> int:
-        """Derive pseudo-closing odds from the latest stored game odds when archives are empty."""
-
-        try:
-            odds = pd.read_sql_table("game_odds", self.db.engine)
-        except Exception:
-            logging.debug("Unable to load game_odds table for fallback closing odds")
-            return 0
-
-        if odds is None or odds.empty or "game_id" not in odds.columns:
-            return 0
-
-        working = odds.copy()
-        working["game_id"] = working["game_id"].astype(str).str.strip()
-        working = working[working["game_id"] != ""]
-        if working.empty:
-            return 0
-
-        if "updated_at" in working.columns:
-            working["updated_at"] = pd.to_datetime(
-                working["updated_at"], errors="coerce", utc=True
-            )
-        elif "created_at" in working.columns:
-            working["updated_at"] = pd.to_datetime(
-                working["created_at"], errors="coerce", utc=True
-            )
-        else:
-            working["updated_at"] = pd.NaT
-
-        for side in ("home", "away"):
-            src = f"{side}_moneyline"
-            dest = f"{side}_closing_moneyline"
-            if src in working.columns and dest not in working.columns:
-                working[dest] = working[src]
-
-        working["closing_bookmaker"] = "market_fallback"
-        for col in ("bookmaker", "source", "provider"):
-            if col in working.columns:
-                working["closing_bookmaker"] = working["closing_bookmaker"].where(
-                    working[col].isna() | (working[col].astype(str).str.strip() == ""),
-                    working[col].astype(str).str.strip(),
-                )
-                break
-
-        working["closing_line_time"] = working["updated_at"]
-        cols = [
-            "game_id",
-            "home_closing_moneyline",
-            "away_closing_moneyline",
-            "closing_bookmaker",
-            "closing_line_time",
-        ]
-        available_cols = [col for col in cols if col in working.columns]
-        working = working[available_cols]
-        if working.empty:
-            return 0
-
-        return self._apply_closing_odds_to_database(
-            self._finalize_probabilities(working)
         )
 
 
