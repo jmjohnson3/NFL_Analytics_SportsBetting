@@ -7699,6 +7699,133 @@ class NFLDatabase:
             rows = conn.execute(select(self.player_stats.c.game_id).distinct()).fetchall()
         return {row[0] for row in rows}
 
+    def sample_player_stats(self, limit: int = 5) -> pd.DataFrame:
+        """Return a small sample of recently ingested player stats for logging."""
+
+        columns = [
+            self.player_stats.c.game_id,
+            self.player_stats.c.player_name,
+            self.player_stats.c.team,
+            self.player_stats.c.position,
+            self.player_stats.c.passing_yards,
+            self.player_stats.c.rushing_yards,
+            self.player_stats.c.receiving_yards,
+            self.player_stats.c.receptions,
+        ]
+        with self.engine.begin() as conn:
+            rows = (
+                conn.execute(
+                    select(*columns)
+                    .order_by(self.player_stats.c.ingested_at.desc())
+                    .limit(limit)
+                )
+                .fetchall()
+            )
+
+        return pd.DataFrame(
+            rows,
+            columns=[
+                "game_id",
+                "player_name",
+                "team",
+                "position",
+                "passing_yards",
+                "rushing_yards",
+                "receiving_yards",
+                "receptions",
+            ],
+        )
+
+    def sample_game_odds(self, seasons: Iterable[str], limit: int = 5) -> pd.DataFrame:
+        """Return a handful of games with the latest odds/score context."""
+
+        season_list = [str(season) for season in seasons if season is not None]
+        if not season_list:
+            return pd.DataFrame()
+
+        columns = [
+            self.games.c.season,
+            self.games.c.week,
+            self.games.c.start_time,
+            self.games.c.away_team,
+            self.games.c.home_team,
+            self.games.c.away_score,
+            self.games.c.home_score,
+            self.games.c.away_moneyline,
+            self.games.c.home_moneyline,
+            self.games.c.away_closing_moneyline,
+            self.games.c.home_closing_moneyline,
+            self.games.c.closing_bookmaker,
+        ]
+
+        with self.engine.begin() as conn:
+            rows = (
+                conn.execute(
+                    select(*columns)
+                    .where(self.games.c.season.in_(season_list))
+                    .order_by(self.games.c.start_time.desc())
+                    .limit(limit)
+                )
+                .fetchall()
+            )
+
+        frame = pd.DataFrame(
+            rows,
+            columns=[
+                "season",
+                "week",
+                "start_time",
+                "away_team",
+                "home_team",
+                "away_score",
+                "home_score",
+                "away_moneyline",
+                "home_moneyline",
+                "away_closing_moneyline",
+                "home_closing_moneyline",
+                "closing_bookmaker",
+            ],
+        )
+        if not frame.empty:
+            frame["start_time"] = pd.to_datetime(frame["start_time"], errors="coerce")
+        return frame
+
+    def sample_team_advanced_metrics(self, limit: int = 5) -> pd.DataFrame:
+        """Return a few rows of team advanced metrics to validate defensive inputs."""
+
+        columns = [
+            self.team_advanced_metrics.c.season,
+            self.team_advanced_metrics.c.week,
+            self.team_advanced_metrics.c.team,
+            self.team_advanced_metrics.c.offense_yards_per_play,
+            self.team_advanced_metrics.c.defense_yards_per_play,
+            self.team_advanced_metrics.c.pass_rate,
+            self.team_advanced_metrics.c.rush_rate,
+        ]
+
+        with self.engine.begin() as conn:
+            rows = (
+                conn.execute(
+                    select(*columns)
+                    .order_by(self.team_advanced_metrics.c.season.desc(), self.team_advanced_metrics.c.week.desc())
+                    .limit(limit)
+                )
+                .fetchall()
+            )
+
+        return pd.DataFrame(
+            rows,
+            columns=[
+                "season",
+                "week",
+                "team",
+                "offense_yards_per_play",
+                "defense_yards_per_play",
+                "pass_rate",
+                "rush_rate",
+            ],
+        )
+
     def fetch_existing_advanced_metric_keys(self) -> Set[Tuple[str, int, str]]:
         with self.engine.begin() as conn:
             rows = conn.execute(
@@ -18917,6 +19044,26 @@ def predict_upcoming_games(
             config.coverage_api_key,
             config.coverage_scrape_team_url,
         )
+        logging.info(
+            "Coverage inputs loaded | player adjustments=%d | team schemes=%d",
+            len(coverage_adjustments),
+            len(team_coverage_profiles),
+        )
+        if coverage_adjustments:
+            preview = list(coverage_adjustments.items())[:3]
+            logging.debug(
+                "Sample coverage adjustments: %s",
+                "; ".join(
+                    f"{player}: {', '.join(f'{k}={v:+.2f}' for k, v in sorted(adjs.items()))}"
+                    for player, adjs in preview
+                ),
+            )
+        if team_coverage_profiles:
+            preview_profiles = list(team_coverage_profiles.items())[:5]
+            logging.debug(
+                "Sample team coverage schemes: %s",
+                ", ".join(f"{team} -> {scheme}" for team, scheme in preview_profiles),
+            )
 
         def _apply_coverage(table: pd.DataFrame) -> pd.DataFrame:
             return apply_coverage_adjustments(
@@ -19763,6 +19910,49 @@ def apply_runtime_config_overrides(config: NFLConfig) -> None:
     )
 
 
+def log_observability_samples(db: NFLDatabase, seasons: Sequence[str]) -> None:
+    """Print concise snapshots of ingested data to the console."""
+
+    try:
+        stats_sample = db.sample_player_stats(limit=5)
+        if stats_sample.empty:
+            logging.info("Player stats sample is empty; ingestion may not have loaded player box scores yet.")
+        else:
+            logging.info(
+                "Recent player stats (top %d rows):\n%s",
+                len(stats_sample),
+                stats_sample.to_string(index=False),
+            )
+    except Exception:
+        logging.exception("Unable to sample player stats for observability")
+
+    try:
+        odds_sample = db.sample_game_odds(seasons, limit=5)
+        if odds_sample.empty:
+            logging.info("No game odds rows available to sample for seasons %s", list(seasons))
+        else:
+            logging.info(
+                "Recent game odds and scores (top %d rows):\n%s",
+                len(odds_sample),
+                odds_sample.to_string(index=False),
+            )
+    except Exception:
+        logging.exception("Unable to sample odds for observability")
+
+    try:
+        defensive_sample = db.sample_team_advanced_metrics(limit=5)
+        if defensive_sample.empty:
+            logging.info("No team advanced metrics available; defensive coverage metrics may be missing.")
+        else:
+            logging.info(
+                "Recent team advanced metrics (top %d rows):\n%s",
+                len(defensive_sample),
+                defensive_sample.to_string(index=False),
+            )
+    except Exception:
+        logging.exception("Unable to sample team advanced metrics for observability")
+
+
 def main() -> None:
     # Enable HTML capture by default so empty OddsPortal responses are saved automatically
     # for troubleshooting unless the user explicitly opts out.
@@ -19854,6 +20044,9 @@ def main() -> None:
         len(post_ingest_odds),
         _closing_count(post_ingest_odds),
     )
+
+    # Emit compact, human-readable snapshots so operators can verify tables are populated.
+    log_observability_samples(db, config.seasons)
 
     trainer = ModelTrainer(engine, db, supplemental_loader)
     try:
