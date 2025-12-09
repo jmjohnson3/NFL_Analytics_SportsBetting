@@ -2975,24 +2975,29 @@ class ClosingOddsArchiveSyncer:
             self.session.verify = certifi.where()
 
     def sync(self) -> None:
-        provider = (self.config.closing_odds_provider or "").strip().lower() or "oddsportal"
-        if provider in {"none", "off", "disable", "disabled"}:
+        providers_raw = (self.config.closing_odds_provider or "").strip() or "oddsportal"
+        providers = [p.strip().lower() for p in providers_raw.split(",") if p.strip()]
+
+        if not providers:
+            providers = ["oddsportal"]
+
+        if providers[0] in {"none", "off", "disable", "disabled"}:
             logging.info(
                 "Closing odds archive sync disabled via NFL_CLOSING_ODDS_PROVIDER=%s",
-                provider,
+                providers_raw,
             )
             return
 
-        try:
-            seasons = [str(season) for season in self.config.seasons]
-
-            local_provider = False
+        seasons = [str(season) for season in self.config.seasons]
+        for provider in providers:
+            fetcher: Optional[OddsPortalFetcher | KillerSportsFetcher]
+            provider_name: str
 
             if provider in {"local", "csv", "file", "history", "offline"}:
                 logging.warning(
                     "Local CSV closing odds are no longer supported. Switch NFL_CLOSING_ODDS_PROVIDER to oddsportal or killersports."
                 )
-                return
+                continue
             elif provider in {"oddsportal", "odds-portal", "op"}:
                 fetcher = OddsPortalFetcher(
                     self.session,
@@ -3004,6 +3009,15 @@ class ClosingOddsArchiveSyncer:
                 )
                 provider_name = "OddsPortal"
             elif provider in {"killersports", "ks"}:
+                if not (
+                    self.config.killersports_api_key
+                    or self.config.killersports_username
+                    or self.config.killersports_password
+                ):
+                    logging.warning(
+                        "Skipping KillerSports fallback because credentials are not configured (set NFL_KILLERSPORTS_API_KEY or username/password)."
+                    )
+                    continue
                 fetcher = KillerSportsFetcher(
                     self.session,
                     base_url=self.config.killersports_base_url,
@@ -3015,7 +3029,7 @@ class ClosingOddsArchiveSyncer:
                 provider_name = "KillerSports"
             else:
                 logging.warning("Unknown closing odds provider '%s'", provider)
-                return
+                continue
 
             logging.info(
                 "Closing odds provider selected: %s (seasons=%s)",
@@ -3025,11 +3039,11 @@ class ClosingOddsArchiveSyncer:
             archive = fetcher.fetch(seasons)
             if archive.empty:
                 logging.warning(
-                    "%s did not return any closing odds for seasons %s",
+                    "%s did not return any closing odds for seasons %s; trying next provider if available",
                     provider_name,
                     ", ".join(seasons),
                 )
-                return
+                continue
 
             logging.info(
                 "Closing odds provider %s returned %d rows; normalizing and merging",
@@ -3058,8 +3072,12 @@ class ClosingOddsArchiveSyncer:
                     after_coverage["total"],
                 )
             self._write_history(provider_name, archive)
-        finally:
-            self.session.close()
+            return
+
+        logging.warning(
+            "Closing odds providers %s did not return any rows; no closing lines were applied.",
+            providers_raw,
+        )
 
     def _closing_coverage_snapshot(self) -> Optional[Dict[str, int]]:
         try:
