@@ -225,6 +225,33 @@ inspect the HTML that arrived without rerunning the pipeline. Set
 `NFL_ODDSPORTAL_DEBUG_HTML=1` when you want every failed slug captured instead of
 just the first handful.
 
+#### Troubleshooting OddsPortal scraping failures
+
+When the runtime prints diagnostics such as `html_bytes=100713 legacy_nodes=0
+modern_rows=0 participant_nodes=0 next_data_scripts=0 json_like=False`, the
+site responded but the parser could not locate any odds tables. Use the following
+checks before rerunning:
+
+1. **Inspect the saved snapshot.** Each failed slug is written to
+   `reports/oddsportal_debug/` (or the path you set via
+   `NFL_ODDSPORTAL_DEBUG_DIR`). Open the corresponding HTML file in a browser and
+   verify whether the odds table is present in the source. If the table is
+   missing, OddsPortal may have changed its markup or blocked the request.
+2. **Rotate User-Agents.** Add extra strings to `ODDSPORTAL_USER_AGENTS` so the
+   scraper cycles through more realistic headers. Some regions require a
+   desktop-like agent to receive the standard HTML.
+3. **Confirm the results path.** Ensure `ODDSPORTAL_RESULTS_PATH` and
+   `ODDSPORTAL_SEASON_TEMPLATE` match the slugs you expect (e.g.,
+   `nfl/results/`, `nfl-2024-2025/results/`). Mistyped values will return valid
+   pages with no odds rows.
+4. **Share the captured HTML.** If the snapshot clearly contains the odds table
+   but parsing still yields zero rows, send the saved file with your bug report
+   so the CSS selectors can be updated without re-scraping the season.
+
+These steps align with the guardrails already logged by the driver (e.g.,
+"Saved OddsPortal HTML snapshot to ... for slug nfl-2025/results/"), making it
+easier to triage scraping gaps without rerunning long ingestions.
+
 Example shell snippet for the default OddsPortal sync:
 
 ```bash
