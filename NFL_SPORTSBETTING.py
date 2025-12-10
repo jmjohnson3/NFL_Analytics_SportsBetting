@@ -3044,15 +3044,15 @@ class ClosingOddsArchiveSyncer:
                 self.config.closing_odds_history_path or "data/closing_odds_history.csv"
             )
 
-        if provider in {"killersports", "ks"} and not self.config.killersports_base_url:
-            local_path_exists = Path(closing_history_path).exists()
-            fallback_target = "local CSV" if local_path_exists else "OddsPortal"
-            logging.warning(
-                "KillerSports provider selected but KILLERSPORTS_BASE_URL is unset; "
-                "falling back to %s for closing odds.",
-                fallback_target,
-            )
-            provider = "local" if local_path_exists else "oddsportal"
+            if provider in {"killersports", "ks"} and not self.config.killersports_base_url:
+                local_path_exists = Path(closing_history_path).exists()
+                fallback_target = "local CSV" if local_path_exists else "OddsPortal"
+                logging.warning(
+                    "KillerSports provider selected but KILLERSPORTS_BASE_URL is unset; "
+                    "falling back to %s for closing odds.",
+                    fallback_target,
+                )
+                provider = "local" if local_path_exists else "oddsportal"
 
             if provider in {"local", "csv", "file", "history", "offline"}:
                 fetcher = LocalClosingOddsFetcher(closing_history_path)
