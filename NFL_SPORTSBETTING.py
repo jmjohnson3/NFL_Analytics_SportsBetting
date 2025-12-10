@@ -1237,9 +1237,13 @@ class OddsPortalFetcher:
         user_agents: Optional[Sequence[str]] = None,
     ) -> None:
         self.session = session
-        self.base_url = (base_url or "https://www.oddsportal.com/american-football/usa/").strip()
-        if not self.base_url.endswith("/"):
-            self.base_url += "/"
+        normalized_base = (base_url or "https://www.oddsportal.com/american-football/usa/").strip()
+        normalized_base = re.sub(
+            r"/nfl(?:-[^/]+)?/results/?$", "", normalized_base, flags=re.IGNORECASE
+        )
+        if not normalized_base.endswith("/"):
+            normalized_base += "/"
+        self.base_url = normalized_base
         self.results_path = results_path.strip("/") + "/" if results_path else "nfl/results/"
         self.season_path_template = season_path_template
         self.timeout = timeout

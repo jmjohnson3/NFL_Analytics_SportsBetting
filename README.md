@@ -205,7 +205,7 @@ pipeline:
 | `NFL_CLOSING_ODDS_PROVIDER` | Optional. Defaults to `oddsportal`; set to `killersports` to use that feed or `none`/empty to disable the automatic sync. |
 | `NFL_CLOSING_ODDS_TIMEOUT` | Optional HTTP timeout (seconds). Defaults to `45`. |
 | `NFL_CLOSING_ODDS_DOWNLOAD_DIR` | Optional folder where raw payloads are cached for auditing. |
-| `ODDSPORTAL_BASE_URL` | Override the base OddsPortal URL (defaults to `https://www.oddsportal.com/american-football/usa/`). |
+| `ODDSPORTAL_BASE_URL` | Override the base OddsPortal URL (defaults to `https://www.oddsportal.com/american-football/usa/`). Supplying the full results page (`https://www.oddsportal.com/american-football/usa/nfl/results/`) also works—the scraper trims the trailing results path automatically. |
 | `ODDSPORTAL_RESULTS_PATH` | Override the relative results path (defaults to `nfl/results/`). |
 | `ODDSPORTAL_SEASON_TEMPLATE` | Customize the fallback slug template (defaults to `nfl-{season}/results/`). |
 | `ODDSPORTAL_USER_AGENTS` | Comma- or semicolon-separated list of additional User-Agent strings to rotate when scraping OddsPortal. |
