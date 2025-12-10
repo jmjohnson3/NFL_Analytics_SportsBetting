@@ -1913,16 +1913,21 @@ class OddsPortalFetcher:
         if not state_rows.empty:
             return state_rows
 
+        # Some OddsPortal variants still wrap results in a table but rename row
+        # classes; if the legacy/modern selectors miss, fall back to read_html on
+        # the captured table (or full document) before giving up.
         try:
-            frames = pd.read_html(io.StringIO(html))
+            candidate_sources = [str(table), html]
+            for source in candidate_sources:
+                frames = pd.read_html(io.StringIO(source))
+                for frame in frames:
+                    if frame.empty:
+                        continue
+                    normalized = self._normalise_table(frame, season_label)
+                    if not normalized.empty:
+                        return normalized
         except Exception:
             return pd.DataFrame()
-        for frame in frames:
-            if frame.empty:
-                continue
-            normalized = self._normalise_table(frame, season_label)
-            if not normalized.empty:
-                return normalized
 
         return pd.DataFrame()
 
