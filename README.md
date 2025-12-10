@@ -210,6 +210,7 @@ pipeline:
 | `ODDSPORTAL_SEASON_TEMPLATE` | Customize the fallback slug template (defaults to `nfl-{season}/results/`). |
 | `ODDSPORTAL_USER_AGENTS` | Comma- or semicolon-separated list of additional User-Agent strings to rotate when scraping OddsPortal. |
 | `NFL_ODDSPORTAL_HTML_OVERRIDE` | Optional file or directory of saved OddsPortal HTML (e.g., downloaded in a browser). When set, those snapshots are parsed first before live requests. |
+| `NFL_ODDSPORTAL_HTML_OVERRIDE_DIR` | Optional directory to scan for slug-matching snapshots (e.g., the `reports/oddsportal_debug/` captures from a previous run). If unset, the scraper will still look in `reports/oddsportal_debug/` when it exists. |
 | `NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES` | Optional integer. Defaults to `2`. The scraper will save that many empty OddsPortal pages to `reports/oddsportal_debug/` even if `NFL_ODDSPORTAL_DEBUG_HTML` is off. Set to `0` to disable. |
 | `NFL_ODDS_SSL_CERT` | Optional path to a custom CA bundle used when verifying OddsPortal/KillerSports HTTPS connections. |
 | `ODDS_ALLOW_INSECURE_SSL` | Set to `true` to disable HTTPS verification (not recommended except for temporary corporate proxy issues). |
@@ -229,7 +230,10 @@ If the OddsPortal parser reports zero rows, the first `NFL_ODDSPORTAL_AUTO_DEBUG
 failures (default `2`) are captured automatically in `reports/oddsportal_debug/` so you can
 inspect the HTML that arrived without rerunning the pipeline. Set
 `NFL_ODDSPORTAL_DEBUG_HTML=1` when you want every failed slug captured instead of
-just the first handful.
+just the first handful. Saved snapshots in `reports/oddsportal_debug/` (or any
+folder provided via `NFL_ODDSPORTAL_HTML_OVERRIDE_DIR`) are automatically reused
+as offline overrides on the next run, so you can accept cookies once in a
+browser, drop the resulting HTML into that directory, and parse it locally.
 
 #### Troubleshooting OddsPortal scraping failures
 

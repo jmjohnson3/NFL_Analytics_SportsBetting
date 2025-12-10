@@ -1439,34 +1439,47 @@ class OddsPortalFetcher:
         return result
 
     def _load_override_html(self, slug: str) -> Iterable[str]:
-        if self._html_override_path is None:
-            return []
+        search_paths: List[Path] = []
 
-        path = self._html_override_path
-        if path.is_file():
-            try:
-                return [path.read_text(encoding="utf-8", errors="ignore")]
-            except Exception:
-                logging.exception("Failed to read NFL_ODDSPORTAL_HTML_OVERRIDE file %s", path)
-                return []
-
-        if not path.is_dir():
-            return []
+        if self._html_override_path is not None:
+            search_paths.append(self._html_override_path)
+        else:
+            if self._debug_dir is not None:
+                search_paths.append(self._debug_dir)
+            default_debug_dir = SCRIPT_ROOT / "reports" / "oddsportal_debug"
+            if default_debug_dir.exists():
+                search_paths.append(default_debug_dir)
 
         sanitized_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/"))
         html_list: List[str] = []
-        for candidate in sorted(path.glob("*.html")):
-            if sanitized_slug and sanitized_slug not in candidate.stem:
+
+        for path in search_paths:
+            if path.is_file():
+                try:
+                    html_list.append(path.read_text(encoding="utf-8", errors="ignore"))
+                except Exception:
+                    logging.exception("Failed to read NFL_ODDSPORTAL_HTML_OVERRIDE file %s", path)
                 continue
-            try:
-                html_list.append(candidate.read_text(encoding="utf-8", errors="ignore"))
-            except Exception:
-                logging.exception("Failed to read OddsPortal override HTML from %s", candidate)
-        if not html_list:
-            logging.warning(
-                "NFL_ODDSPORTAL_HTML_OVERRIDE pointed to %s but no matching *.html files were found for slug %s",
-                path,
+
+            if not path.is_dir():
+                continue
+
+            for candidate in sorted(path.glob("*.html")):
+                if sanitized_slug and sanitized_slug not in candidate.stem:
+                    continue
+                try:
+                    html_list.append(candidate.read_text(encoding="utf-8", errors="ignore"))
+                except Exception:
+                    logging.exception(
+                        "Failed to read OddsPortal override HTML from %s", candidate
+                    )
+
+        if html_list:
+            logging.info(
+                "Using %d OddsPortal HTML override frame(s) for slug %s from %s",
+                len(html_list),
                 slug,
+                ", ".join(str(p) for p in search_paths),
             )
         return html_list
 
