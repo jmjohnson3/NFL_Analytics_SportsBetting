@@ -1267,6 +1267,7 @@ class OddsPortalFetcher:
         self._insecure_success_logged = False
         self._ssl_failure_logged = False
         self._insecure_adapter_installed = False
+        self._bot_wall_notice_logged = False
 
         self._debug_dump_enabled = False
         self._debug_dir: Optional[Path] = None
@@ -1274,6 +1275,7 @@ class OddsPortalFetcher:
         self._debug_capture_logged: Set[str] = set()
         self._no_rows_warned: Set[str] = set()
         self._auto_debug_remaining = 0
+        self._html_override_path: Optional[Path] = None
 
         debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
         if str(debug_flag).strip().lower() in {"1", "true", "yes", "on", "debug"}:
@@ -1324,6 +1326,21 @@ class OddsPortalFetcher:
                     "NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES=%d; will save the first empty OddsPortal pages to %s for triage",
                     self._auto_debug_remaining,
                     self._debug_dir,
+                )
+
+        html_override = os.environ.get("NFL_ODDSPORTAL_HTML_OVERRIDE")
+        if html_override:
+            candidate = Path(html_override).expanduser()
+            if candidate.exists():
+                self._html_override_path = candidate
+                logging.warning(
+                    "NFL_ODDSPORTAL_HTML_OVERRIDE set; will parse local HTML from %s before requesting OddsPortal",
+                    candidate,
+                )
+            else:
+                logging.warning(
+                    "NFL_ODDSPORTAL_HTML_OVERRIDE=%s does not exist; ignoring the override",
+                    html_override,
                 )
 
         if BeautifulSoup is None:
@@ -1380,6 +1397,21 @@ class OddsPortalFetcher:
 
     def _scrape_slug(self, slug: str, season_label: str) -> pd.DataFrame:
         url = urljoin(self.base_url, slug)
+
+        override_frames: List[pd.DataFrame] = []
+        for html in self._load_override_html(slug):
+            parsed = self._parse_results_page(html, season_label)
+            if not _is_effectively_empty_df(parsed):
+                override_frames.append(parsed)
+        if override_frames:
+            logging.info(
+                "Loaded OddsPortal HTML override for %s (%s) with %d frame(s)",
+                season_label,
+                slug,
+                len(override_frames),
+            )
+            return safe_concat(override_frames, ignore_index=True)
+
         html = self._request(url)
         if not html:
             return pd.DataFrame()
@@ -1405,6 +1437,38 @@ class OddsPortalFetcher:
         if _is_effectively_empty_df(result):
             self._debug_warn_no_rows(slug, season_label, url)
         return result
+
+    def _load_override_html(self, slug: str) -> Iterable[str]:
+        if self._html_override_path is None:
+            return []
+
+        path = self._html_override_path
+        if path.is_file():
+            try:
+                return [path.read_text(encoding="utf-8", errors="ignore")]
+            except Exception:
+                logging.exception("Failed to read NFL_ODDSPORTAL_HTML_OVERRIDE file %s", path)
+                return []
+
+        if not path.is_dir():
+            return []
+
+        sanitized_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/"))
+        html_list: List[str] = []
+        for candidate in sorted(path.glob("*.html")):
+            if sanitized_slug and sanitized_slug not in candidate.stem:
+                continue
+            try:
+                html_list.append(candidate.read_text(encoding="utf-8", errors="ignore"))
+            except Exception:
+                logging.exception("Failed to read OddsPortal override HTML from %s", candidate)
+        if not html_list:
+            logging.warning(
+                "NFL_ODDSPORTAL_HTML_OVERRIDE pointed to %s but no matching *.html files were found for slug %s",
+                path,
+                slug,
+            )
+        return html_list
 
     def _discover_additional_pages(self, url: str, html: str) -> Iterable[str]:
         """Find paginated OddsPortal result pages linked from the provided HTML."""
@@ -1609,6 +1673,24 @@ class OddsPortalFetcher:
         if response.status_code == HTTPStatus.OK:
             text = response.text or ""
             if text.strip():
+                lower_text = text.lower()
+                if not self._bot_wall_notice_logged and any(
+                    token in lower_text
+                    for token in (
+                        "enable javascript",
+                        "browser is checking",
+                        "access denied",
+                        "captcha",
+                        "waiting room",
+                        "bot protection",
+                    )
+                ):
+                    logging.warning(
+                        "OddsPortal responded with a bot-protection page for %s. "
+                        "Supply a browser-saved HTML file via NFL_ODDSPORTAL_HTML_OVERRIDE or update your session headers.",
+                        url,
+                    )
+                    self._bot_wall_notice_logged = True
                 if insecure and not self._insecure_success_logged:
                     logging.warning(
                         "OddsPortal request for %s succeeded only after disabling certificate "
