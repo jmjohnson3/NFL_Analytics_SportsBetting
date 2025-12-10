@@ -284,9 +284,9 @@ python NFL_SPORTSBETTING.py
 
 If KillerSports is reachable but returns an HTML landing page or another non-CSV
 payload (which happens when pointing at the interactive query UI), the script
-logs the first part of the response and falls back automatically to the local
-`data/closing_odds_history.csv` (when present) or OddsPortal so that closing odds
-are still populated.
+logs the first part of the response and falls back automatically to OddsPortal
+first, then the local `data/closing_odds_history.csv` if present, so closing
+odds are still populated.
 
 During startup the script downloads the requested seasons, normalizes the
 payload into the schema used by `data/closing_odds_history.csv`, and merges the

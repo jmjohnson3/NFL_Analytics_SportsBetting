@@ -3115,14 +3115,11 @@ class ClosingOddsArchiveSyncer:
             killersports_base_url = (self.config.killersports_base_url or "").strip()
 
             if provider in {"killersports", "ks"} and not killersports_base_url:
-                local_path_exists = Path(closing_history_path).exists()
-                fallback_target = "local CSV" if local_path_exists else "OddsPortal"
                 logging.warning(
                     "KillerSports provider selected but KILLERSPORTS_BASE_URL is unset; "
-                    "falling back to %s for closing odds.",
-                    fallback_target,
+                    "falling back to OddsPortal for closing odds.",
                 )
-                provider = "local" if local_path_exists else "oddsportal"
+                provider = "oddsportal"
 
             if provider in {"local", "csv", "file", "history", "offline"}:
                 fetcher = LocalClosingOddsFetcher(closing_history_path)
@@ -3155,29 +3152,31 @@ class ClosingOddsArchiveSyncer:
             archive = fetcher.fetch(seasons)
 
             if archive.empty and provider_name == "KillerSports":
-                local_path_exists = Path(closing_history_path).exists()
-                fallback_provider = "local" if local_path_exists else "oddsportal"
-                fallback_label = "local CSV" if local_path_exists else "OddsPortal"
                 logging.warning(
-                    "KillerSports returned no closing odds; falling back to %s.",
-                    fallback_label,
+                    "KillerSports returned no closing odds; falling back to OddsPortal.",
                 )
-                if fallback_provider == "local":
+                fetcher = OddsPortalFetcher(
+                    self.session,
+                    base_url=self.config.oddsportal_base_url,
+                    results_path=self.config.oddsportal_results_path,
+                    season_path_template=self.config.oddsportal_season_template,
+                    timeout=self.config.closing_odds_timeout,
+                    user_agents=self.config.oddsportal_user_agents,
+                )
+                provider_name = "OddsPortal"
+                local_provider = False
+                archive = fetcher.fetch(seasons)
+
+            if archive.empty and provider_name == "OddsPortal":
+                local_path_exists = Path(closing_history_path).exists()
+                if local_path_exists:
+                    logging.warning(
+                        "OddsPortal returned no closing odds; falling back to local CSV.",
+                    )
                     fetcher = LocalClosingOddsFetcher(closing_history_path)
                     provider_name = "Local CSV"
                     local_provider = True
-                else:
-                    fetcher = OddsPortalFetcher(
-                        self.session,
-                        base_url=self.config.oddsportal_base_url,
-                        results_path=self.config.oddsportal_results_path,
-                        season_path_template=self.config.oddsportal_season_template,
-                        timeout=self.config.closing_odds_timeout,
-                        user_agents=self.config.oddsportal_user_agents,
-                    )
-                    provider_name = "OddsPortal"
-                    local_provider = False
-                archive = fetcher.fetch(seasons)
+                    archive = fetcher.fetch(seasons)
             if archive.empty:
                 logging.warning(
                     "%s did not return any closing odds for seasons %s",
