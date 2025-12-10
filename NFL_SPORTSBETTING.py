@@ -3080,6 +3080,44 @@ class OddsPortalFetcher:
                 home_col = home_col or text_cols[0]
                 away_col = away_col or text_cols[1]
 
+        # Final fallback: if no explicit home/away columns were found, try to
+        # extract them from the concatenated row text. This captures unlabeled
+        # OddsPortal tables that pandas flattens into positional columns.
+        if not home_col or not away_col:
+            row_text = frame.apply(lambda row: " ".join(str(v) for v in row if pd.notna(v)), axis=1)
+            teams = row_text.apply(_split_teams)
+            if teams.apply(lambda pair: any(pair)).any():
+                frame["__home"] = teams.apply(lambda pair: pair[0])
+                frame["__away"] = teams.apply(lambda pair: pair[1])
+                home_col = home_col or "__home"
+                away_col = away_col or "__away"
+                frame["__row_text"] = row_text
+                logging.info(
+                    "OddsPortal row-text fallback inferred home/away columns; columns=%s shape=%s",
+                    list(frame.columns),
+                    frame.shape,
+                )
+                # Extract the first two decimal-looking numbers per row as odds
+                decimals = row_text.apply(
+                    lambda text: [
+                        _parse_decimal_odds(match)
+                        for match in re.findall(r"\d+\.\d+", text)
+                    ]
+                )
+                if home_decimal is None:
+                    frame["__home_odds"] = decimals.apply(
+                        lambda vals: next((val for val in vals if val is not None), np.nan)
+                    )
+                    home_decimal = "__home_odds"
+                if away_decimal is None:
+                    frame["__away_odds"] = decimals.apply(
+                        lambda vals: next(
+                            (val for val in vals[1:] if val is not None),
+                            np.nan,
+                        )
+                    )
+                    away_decimal = "__away_odds"
+
         if not home_col or not away_col:
             return pd.DataFrame()
 
