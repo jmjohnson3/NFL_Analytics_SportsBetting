@@ -2895,7 +2895,7 @@ def _parse_killersports_html_table(html: str) -> pd.DataFrame:
 
     for table in best_first:
         headers = [th.get_text(strip=True) for th in table.find_all("th")]
-        rows: List[Dict[str, str]] = []
+        rows: List[List[str]] = []
 
         for tr in table.find_all("tr"):
             cells = [cell.get_text(strip=True) for cell in tr.find_all(["td", "th"])]
@@ -2903,20 +2903,32 @@ def _parse_killersports_html_table(html: str) -> pd.DataFrame:
             if not cells:
                 continue
 
-            if headers:
-                # Pad or trim so rows align with headers even when the table
-                # includes expandable/collapsed cells.
-                padded = cells + [""] * max(0, len(headers) - len(cells))
-                trimmed = padded[: len(headers)]
-                rows.append(dict(zip(headers, trimmed)))
-            else:
-                rows.append({str(idx): value for idx, value in enumerate(cells)})
+            rows.append(cells)
 
         if not rows:
             continue
 
+        if not headers:
+            # Treat the first non-empty row as headers when the table uses <td>
+            # instead of <th> for the header row (common on some KillerSports
+            # exports). This preserves the original column names rather than
+            # falling back to numeric keys that won't match moneyline columns.
+            headers = rows[0]
+            rows = rows[1:]
+
+        shaped_rows: List[Dict[str, str]] = []
+        for cells in rows:
+            # Pad or trim so rows align with headers even when the table includes
+            # expandable/collapsed cells.
+            padded = cells + [""] * max(0, len(headers) - len(cells))
+            trimmed = padded[: len(headers)]
+            shaped_rows.append(dict(zip(headers, trimmed)))
+
+        if not shaped_rows:
+            continue
+
         try:
-            frame = pd.DataFrame(rows)
+            frame = pd.DataFrame(shaped_rows)
         except Exception:
             continue
 
