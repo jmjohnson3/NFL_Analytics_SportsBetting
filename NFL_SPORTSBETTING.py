@@ -30,6 +30,7 @@ import re
 import ssl
 import sys
 import time
+import textwrap
 import unicodedata
 import uuid
 from collections import defaultdict
@@ -1276,6 +1277,10 @@ class OddsPortalFetcher:
         self._no_rows_warned: Set[str] = set()
         self._auto_debug_remaining = 0
         self._html_override_path: Optional[Path] = None
+        self._debug_png_enabled = str(
+            os.environ.get("NFL_ODDSPORTAL_DEBUG_PNG", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._debug_png_notice_logged = False
 
         debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
         if str(debug_flag).strip().lower() in {"1", "true", "yes", "on", "debug"}:
@@ -1988,7 +1993,91 @@ class OddsPortalFetcher:
             source_url,
         )
 
+        self._debug_dump_png(slug, path, html)
+
         return path
+
+    def _debug_dump_png(self, slug: str, html_path: Path, html: str) -> None:
+        if not self._debug_png_enabled:
+            return
+
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except Exception:
+            if not self._debug_png_notice_logged:
+                logging.warning(
+                    "NFL_ODDSPORTAL_DEBUG_PNG enabled but Pillow is not installed; cannot write OddsPortal PNG captures."
+                )
+                self._debug_png_notice_logged = True
+            return
+
+        text = html
+        if BeautifulSoup is not None:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                extracted = soup.get_text("\n")
+                if extracted:
+                    text = extracted
+            except Exception:
+                pass
+
+        header = [
+            "OddsPortal debug capture (HTML -> PNG)",
+            f"Slug: {slug}",
+            f"File: {html_path.name}",
+            "First 8000 characters rendered below:",
+            "",
+        ]
+
+        snippet = text[:8000]
+        wrapped_lines: List[str] = []
+        for raw_line in snippet.splitlines():
+            line = raw_line.rstrip()
+            if not line:
+                wrapped_lines.append("")
+                continue
+            wrapped_lines.extend(textwrap.wrap(line, width=180))
+
+        rendered_lines = header + wrapped_lines
+        if not rendered_lines:
+            rendered_lines = ["<empty HTML body>"]
+
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+
+        dummy = Image.new("RGB", (1, 1))
+        draw = ImageDraw.Draw(dummy)
+        line_height = max(draw.textbbox((0, 0), "Ag", font=font)[3], 12)
+        padding = 12
+        max_line_width = 0
+        for line in rendered_lines:
+            max_line_width = max(max_line_width, draw.textbbox((0, 0), line, font=font)[2])
+
+        width = min(max_line_width + padding * 2, 2400)
+        height = line_height * len(rendered_lines) + padding * 2
+
+        image = Image.new("RGB", (width, height), (250, 250, 250))
+        draw = ImageDraw.Draw(image)
+        y = padding
+        for line in rendered_lines:
+            draw.text((padding, y), line, fill=(0, 0, 0), font=font)
+            y += line_height
+
+        png_path = html_path.with_suffix(".png")
+        try:
+            image.save(png_path)
+        except Exception:
+            logging.exception("Failed to write OddsPortal debug PNG to %s", png_path)
+            return
+
+        logging.warning(
+            "Saved OddsPortal debug PNG snapshot to %s for slug %s (%s).",
+            png_path,
+            slug,
+            html_path,
+        )
 
     def _debug_warn_no_rows(self, slug: str, season_label: str, source_url: str) -> None:
         key = f"{season_label}|{slug}"
