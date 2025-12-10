@@ -2988,8 +2988,9 @@ class KillerSportsFetcher:
                 snippet = (response.text or "")[:320].replace("\n", " ")
                 logging.warning(
                     "KillerSports response for season %s was not a readable CSV/HTML table "
-                    "(content-type=%s, body starts with: %s). Ensure the base URL points to "
-                    "the CSV export endpoint, e.g., https://api.killersports.com/nfl/closing",
+                    "(content-type=%s, body starts with: %s). Provide a full CSV export link "
+                    "from the KillerSports query tool (include any querystring like export=csv), "
+                    "not the generic landing page.",
                     season,
                     response.headers.get("Content-Type"),
                     snippet,
@@ -3004,7 +3005,7 @@ class KillerSportsFetcher:
         return normalized
 
 
-DEFAULT_KILLERSPORTS_BASE_URL = "https://api.killersports.com/nfl/closing"
+DEFAULT_KILLERSPORTS_BASE_URL = None
 
 
 class ClosingOddsArchiveSyncer:
@@ -3047,11 +3048,9 @@ class ClosingOddsArchiveSyncer:
                 self.config.closing_odds_history_path or "data/closing_odds_history.csv"
             )
 
-            killersports_base_url = (
-                self.config.killersports_base_url or DEFAULT_KILLERSPORTS_BASE_URL
-            )
+            killersports_base_url = (self.config.killersports_base_url or "").strip()
 
-            if provider in {"killersports", "ks"} and not self.config.killersports_base_url:
+            if provider in {"killersports", "ks"} and not killersports_base_url:
                 local_path_exists = Path(closing_history_path).exists()
                 fallback_target = "local CSV" if local_path_exists else "OddsPortal"
                 logging.warning(
@@ -3090,27 +3089,6 @@ class ClosingOddsArchiveSyncer:
                 return
 
             archive = fetcher.fetch(seasons)
-
-            if (
-                archive.empty
-                and provider_name == "KillerSports"
-                and killersports_base_url != DEFAULT_KILLERSPORTS_BASE_URL
-            ):
-                logging.warning(
-                    "KillerSports returned no rows using custom base URL %s; retrying with default %s",
-                    killersports_base_url,
-                    DEFAULT_KILLERSPORTS_BASE_URL,
-                )
-                killersports_base_url = DEFAULT_KILLERSPORTS_BASE_URL
-                fetcher = KillerSportsFetcher(
-                    self.session,
-                    base_url=killersports_base_url,
-                    timeout=self.config.closing_odds_timeout,
-                    api_key=self.config.killersports_api_key,
-                    username=self.config.killersports_username,
-                    password=self.config.killersports_password,
-                )
-                archive = fetcher.fetch(seasons)
 
             if archive.empty and provider_name == "KillerSports":
                 local_path_exists = Path(closing_history_path).exists()
@@ -7282,9 +7260,7 @@ class NFLConfig:
         )
         if ua.strip()
     )
-    killersports_base_url: Optional[str] = os.getenv(
-        "KILLERSPORTS_BASE_URL", DEFAULT_KILLERSPORTS_BASE_URL
-    )
+    killersports_base_url: Optional[str] = os.getenv("KILLERSPORTS_BASE_URL")
     killersports_api_key: Optional[str] = os.getenv("KILLERSPORTS_API_KEY")
     killersports_username: Optional[str] = os.getenv("KILLERSPORTS_USERNAME")
     killersports_password: Optional[str] = os.getenv("KILLERSPORTS_PASSWORD")

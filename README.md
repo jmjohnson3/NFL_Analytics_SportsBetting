@@ -163,10 +163,11 @@ evaluation you intend to trust for live betting decisions.
 - Set `NFL_CLOSING_ODDS_PROVIDER=local` (or leave it unset) and populate
   `data/closing_odds_history.csv` when you already have a vetted archive and do
   not want the scraper to run.
-- If you select `killersports` but forget to set `KILLERSPORTS_BASE_URL`, the
-  driver now defaults to `https://api.killersports.com/nfl/closing` and, if that
-  still returns no rows, falls back to your local CSV (if present) or OddsPortal
-  so the run continues instead of halting with empty data.
+- If you select `killersports`, you must supply a CSV export URL from the
+  KillerSports query tool (include any `export=csv`/`format=csv` querystring).
+  If the URL is missing or returns only the landing page HTML, the driver falls
+  back to your local CSV (if present) or OddsPortal so the run continues instead
+  of halting with empty data.
 - If odds fetches return zero rows, the driver now emits a warning reminding
   you to enable one of the options above.
 
@@ -211,7 +212,7 @@ pipeline:
 | `NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES` | Optional integer. Defaults to `2`. The scraper will save that many empty OddsPortal pages to `reports/oddsportal_debug/` even if `NFL_ODDSPORTAL_DEBUG_HTML` is off. Set to `0` to disable. |
 | `NFL_ODDS_SSL_CERT` | Optional path to a custom CA bundle used when verifying OddsPortal/KillerSports HTTPS connections. |
 | `ODDS_ALLOW_INSECURE_SSL` | Set to `true` to disable HTTPS verification (not recommended except for temporary corporate proxy issues). |
-| `KILLERSPORTS_BASE_URL` | Base URL for KillerSports exports (required when that provider is selected). Defaults to `https://api.killersports.com/nfl/closing`; use the CSV export endpoint, not the interactive query UI. |
+| `KILLERSPORTS_BASE_URL` | Full CSV export URL for KillerSports (required when that provider is selected). Copy the direct CSV download link from the KillerSports query tool; the generic landing page will not work. |
 | `KILLERSPORTS_API_KEY` | Bearer token for KillerSports, when their API requires it. |
 | `KILLERSPORTS_USERNAME` / `KILLERSPORTS_PASSWORD` | HTTP basic credentials for KillerSports, if applicable. |
 
@@ -275,7 +276,7 @@ Example for KillerSports (when hosted behind basic auth):
 
 ```bash
 export NFL_CLOSING_ODDS_PROVIDER=killersports
-export KILLERSPORTS_BASE_URL="https://api.killersports.com/nfl/closing"
+export KILLERSPORTS_BASE_URL="https://killersports.com/query?export=csv&..."
 export KILLERSPORTS_USERNAME="my-user"
 export KILLERSPORTS_PASSWORD="my-secret"
 python NFL_SPORTSBETTING.py
