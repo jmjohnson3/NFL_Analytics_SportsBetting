@@ -38,6 +38,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
+
+from bs4 import BeautifulSoup
 from html import unescape
 
 import aiohttp
@@ -2877,6 +2879,53 @@ def _season_param_from_label(label: str) -> Optional[str]:
     return f"{year}-{next_year}"
 
 
+def _parse_killersports_html_table(html: str) -> pd.DataFrame:
+    if not html:
+        return pd.DataFrame()
+
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+    if not tables:
+        return pd.DataFrame()
+
+    def _table_score(table: Any) -> Tuple[int, int]:
+        return (len(table.find_all("tr")), len(table.find_all("th")))
+
+    best_first = sorted(tables, key=_table_score, reverse=True)
+
+    for table in best_first:
+        headers = [th.get_text(strip=True) for th in table.find_all("th")]
+        rows: List[Dict[str, str]] = []
+
+        for tr in table.find_all("tr"):
+            cells = [cell.get_text(strip=True) for cell in tr.find_all(["td", "th"])]
+            cells = [cell for cell in cells if cell]
+            if not cells:
+                continue
+
+            if headers:
+                # Pad or trim so rows align with headers even when the table
+                # includes expandable/collapsed cells.
+                padded = cells + [""] * max(0, len(headers) - len(cells))
+                trimmed = padded[: len(headers)]
+                rows.append(dict(zip(headers, trimmed)))
+            else:
+                rows.append({str(idx): value for idx, value in enumerate(cells)})
+
+        if not rows:
+            continue
+
+        try:
+            frame = pd.DataFrame(rows)
+        except Exception:
+            continue
+
+        if not frame.empty:
+            return frame
+
+    return pd.DataFrame()
+
+
 class KillerSportsFetcher:
     def __init__(
         self,
@@ -2985,17 +3034,20 @@ class KillerSportsFetcher:
             try:
                 payload = pd.read_html(io.BytesIO(response.content))[0]
             except Exception:
-                snippet = (response.text or "")[:320].replace("\n", " ")
-                logging.warning(
-                    "KillerSports response for season %s was not a readable CSV/HTML table "
-                    "(content-type=%s, body starts with: %s). Provide a full CSV export link "
-                    "from the KillerSports query tool (include any querystring like export=csv), "
-                    "not the generic landing page.",
-                    season,
-                    response.headers.get("Content-Type"),
-                    snippet,
-                )
-                return pd.DataFrame()
+                parsed = _parse_killersports_html_table(response.text)
+                if parsed.empty:
+                    snippet = (response.text or "")[:320].replace("\n", " ")
+                    logging.warning(
+                        "KillerSports response for season %s was not a readable CSV/HTML table "
+                        "(content-type=%s, body starts with: %s). Provide a full CSV export link "
+                        "from the KillerSports query tool (include any querystring like export=csv), "
+                        "not the generic landing page.",
+                        season,
+                        response.headers.get("Content-Type"),
+                        snippet,
+                    )
+                    return pd.DataFrame()
+                payload = parsed
 
         normalized = _normalize_historical_closing_frame(payload, "KillerSports", season)
         if normalized.empty:
