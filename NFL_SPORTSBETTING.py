@@ -1083,14 +1083,38 @@ def _parse_decimal_odds(value: Optional[str]) -> Optional[float]:
     text = str(value).strip().replace(",", ".")
     if not text:
         return None
-    match = re.search(r"\d+(?:\.\d+)?", text)
-    if not match:
-        return None
-    try:
-        decimal = float(match.group(0))
-    except ValueError:
-        return None
-    if not math.isfinite(decimal) or decimal <= 1.0:
+
+    direct_match = re.match(r"^[+-]?\d+(?:\.\d+)?$", text)
+    decimal: Optional[float] = None
+    if direct_match:
+        raw = direct_match.group(0)
+        try:
+            number = float(raw)
+        except ValueError:
+            number = math.nan
+
+        is_signed = raw.startswith(("+", "-"))
+        has_decimal = "." in raw
+        # Treat signed integers (or large unsigned ints) as American moneylines.
+        if not has_decimal and (is_signed or abs(number) >= 20):
+            if number == 0 or not math.isfinite(number):
+                decimal = None
+            elif number < 0:
+                decimal = 1.0 + 100.0 / abs(number)
+            else:
+                decimal = 1.0 + number / 100.0
+        else:
+            decimal = number
+    else:
+        match = re.search(r"\d+(?:\.\d+)?", text)
+        if not match:
+            return None
+        try:
+            decimal = float(match.group(0))
+        except ValueError:
+            decimal = None
+
+    if decimal is None or not math.isfinite(decimal) or decimal <= 1.0:
         return None
     return decimal
 
