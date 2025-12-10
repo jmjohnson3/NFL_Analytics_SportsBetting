@@ -3004,6 +3004,9 @@ class KillerSportsFetcher:
         return normalized
 
 
+DEFAULT_KILLERSPORTS_BASE_URL = "https://api.killersports.com/nfl/closing"
+
+
 class ClosingOddsArchiveSyncer:
     def __init__(self, config: "NFLConfig", db: "NFLDatabase") -> None:
         self.config = config
@@ -3044,6 +3047,10 @@ class ClosingOddsArchiveSyncer:
                 self.config.closing_odds_history_path or "data/closing_odds_history.csv"
             )
 
+            killersports_base_url = (
+                self.config.killersports_base_url or DEFAULT_KILLERSPORTS_BASE_URL
+            )
+
             if provider in {"killersports", "ks"} and not self.config.killersports_base_url:
                 local_path_exists = Path(closing_history_path).exists()
                 fallback_target = "local CSV" if local_path_exists else "OddsPortal"
@@ -3071,7 +3078,7 @@ class ClosingOddsArchiveSyncer:
             elif provider in {"killersports", "ks"}:
                 fetcher = KillerSportsFetcher(
                     self.session,
-                    base_url=self.config.killersports_base_url,
+                    base_url=killersports_base_url,
                     timeout=self.config.closing_odds_timeout,
                     api_key=self.config.killersports_api_key,
                     username=self.config.killersports_username,
@@ -3083,6 +3090,27 @@ class ClosingOddsArchiveSyncer:
                 return
 
             archive = fetcher.fetch(seasons)
+
+            if (
+                archive.empty
+                and provider_name == "KillerSports"
+                and killersports_base_url != DEFAULT_KILLERSPORTS_BASE_URL
+            ):
+                logging.warning(
+                    "KillerSports returned no rows using custom base URL %s; retrying with default %s",
+                    killersports_base_url,
+                    DEFAULT_KILLERSPORTS_BASE_URL,
+                )
+                killersports_base_url = DEFAULT_KILLERSPORTS_BASE_URL
+                fetcher = KillerSportsFetcher(
+                    self.session,
+                    base_url=killersports_base_url,
+                    timeout=self.config.closing_odds_timeout,
+                    api_key=self.config.killersports_api_key,
+                    username=self.config.killersports_username,
+                    password=self.config.killersports_password,
+                )
+                archive = fetcher.fetch(seasons)
 
             if archive.empty and provider_name == "KillerSports":
                 local_path_exists = Path(closing_history_path).exists()
@@ -7254,7 +7282,9 @@ class NFLConfig:
         )
         if ua.strip()
     )
-    killersports_base_url: Optional[str] = os.getenv("KILLERSPORTS_BASE_URL")
+    killersports_base_url: Optional[str] = os.getenv(
+        "KILLERSPORTS_BASE_URL", DEFAULT_KILLERSPORTS_BASE_URL
+    )
     killersports_api_key: Optional[str] = os.getenv("KILLERSPORTS_API_KEY")
     killersports_username: Optional[str] = os.getenv("KILLERSPORTS_USERNAME")
     killersports_password: Optional[str] = os.getenv("KILLERSPORTS_PASSWORD")
