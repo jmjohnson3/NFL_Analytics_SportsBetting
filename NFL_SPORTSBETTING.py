@@ -57,6 +57,7 @@ from requests.exceptions import (
     ConnectionError as RequestsConnectionError,
     JSONDecodeError as RequestsJSONDecodeError,
     ReadTimeout,
+    RequestException,
     SSLError,
 )
 from http import HTTPStatus
@@ -1556,8 +1557,11 @@ class OddsPortalFetcher:
                 logging.error("OddsPortal SSL error for %s: %s", url, exc)
                 attempt_insecure = True
                 break
+            except RequestException as exc:
+                logging.warning("OddsPortal request error for %s: %s", url, exc)
+                response = None
             except Exception:
-                logging.exception("OddsPortal request error for %s", url)
+                logging.exception("Unexpected OddsPortal request error for %s", url)
                 response = None
 
             if response is not None:
@@ -1575,8 +1579,11 @@ class OddsPortalFetcher:
                 logging.error("OddsPortal SSL error for %s (JSON variant): %s", url, exc)
                 attempt_insecure = True
                 break
+            except RequestException as exc:
+                logging.warning("OddsPortal JSON request error for %s: %s", url, exc)
+                continue
             except Exception:
-                logging.exception("OddsPortal JSON request error for %s", url)
+                logging.exception("Unexpected OddsPortal JSON request error for %s", url)
                 continue
 
             result = self._process_oddsportal_response(response, url, insecure=False)
