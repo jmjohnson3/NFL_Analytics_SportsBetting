@@ -163,6 +163,9 @@ evaluation you intend to trust for live betting decisions.
 - Set `NFL_CLOSING_ODDS_PROVIDER=local` (or leave it unset) and populate
   `data/closing_odds_history.csv` when you already have a vetted archive and do
   not want the scraper to run.
+- If you select `killersports` but forget to set `KILLERSPORTS_BASE_URL`, the
+  driver now falls back to your local CSV (if present) or OddsPortal so the run
+  continues instead of halting with empty data.
 - If odds fetches return zero rows, the driver now emits a warning reminding
   you to enable one of the options above.
 
@@ -207,7 +210,7 @@ pipeline:
 | `NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES` | Optional integer. Defaults to `2`. The scraper will save that many empty OddsPortal pages to `reports/oddsportal_debug/` even if `NFL_ODDSPORTAL_DEBUG_HTML` is off. Set to `0` to disable. |
 | `NFL_ODDS_SSL_CERT` | Optional path to a custom CA bundle used when verifying OddsPortal/KillerSports HTTPS connections. |
 | `ODDS_ALLOW_INSECURE_SSL` | Set to `true` to disable HTTPS verification (not recommended except for temporary corporate proxy issues). |
-| `KILLERSPORTS_BASE_URL` | Base URL for KillerSports exports (required when that provider is selected). |
+| `KILLERSPORTS_BASE_URL` | Base URL for KillerSports exports (required when that provider is selected). Use the CSV export endpoint (e.g., `https://api.killersports.com/nfl/closing`), not the interactive query UI. |
 | `KILLERSPORTS_API_KEY` | Bearer token for KillerSports, when their API requires it. |
 | `KILLERSPORTS_USERNAME` / `KILLERSPORTS_PASSWORD` | HTTP basic credentials for KillerSports, if applicable. |
 
@@ -224,6 +227,33 @@ failures (default `2`) are captured automatically in `reports/oddsportal_debug/`
 inspect the HTML that arrived without rerunning the pipeline. Set
 `NFL_ODDSPORTAL_DEBUG_HTML=1` when you want every failed slug captured instead of
 just the first handful.
+
+#### Troubleshooting OddsPortal scraping failures
+
+When the runtime prints diagnostics such as `html_bytes=100713 legacy_nodes=0
+modern_rows=0 participant_nodes=0 next_data_scripts=0 json_like=False`, the
+site responded but the parser could not locate any odds tables. Use the following
+checks before rerunning:
+
+1. **Inspect the saved snapshot.** Each failed slug is written to
+   `reports/oddsportal_debug/` (or the path you set via
+   `NFL_ODDSPORTAL_DEBUG_DIR`). Open the corresponding HTML file in a browser and
+   verify whether the odds table is present in the source. If the table is
+   missing, OddsPortal may have changed its markup or blocked the request.
+2. **Rotate User-Agents.** Add extra strings to `ODDSPORTAL_USER_AGENTS` so the
+   scraper cycles through more realistic headers. Some regions require a
+   desktop-like agent to receive the standard HTML.
+3. **Confirm the results path.** Ensure `ODDSPORTAL_RESULTS_PATH` and
+   `ODDSPORTAL_SEASON_TEMPLATE` match the slugs you expect (e.g.,
+   `nfl/results/`, `nfl-2024-2025/results/`). Mistyped values will return valid
+   pages with no odds rows.
+4. **Share the captured HTML.** If the snapshot clearly contains the odds table
+   but parsing still yields zero rows, send the saved file with your bug report
+   so the CSS selectors can be updated without re-scraping the season.
+
+These steps align with the guardrails already logged by the driver (e.g.,
+"Saved OddsPortal HTML snapshot to ... for slug nfl-2025/results/"), making it
+easier to triage scraping gaps without rerunning long ingestions.
 
 Example shell snippet for the default OddsPortal sync:
 
@@ -249,6 +279,12 @@ export KILLERSPORTS_USERNAME="my-user"
 export KILLERSPORTS_PASSWORD="my-secret"
 python NFL_SPORTSBETTING.py
 ```
+
+If KillerSports is reachable but returns an HTML landing page or another non-CSV
+payload (which happens when pointing at the interactive query UI), the script
+logs the first part of the response and falls back automatically to the local
+`data/closing_odds_history.csv` (when present) or OddsPortal so that closing odds
+are still populated.
 
 During startup the script downloads the requested seasons, normalizes the
 payload into the schema used by `data/closing_odds_history.csv`, and merges the

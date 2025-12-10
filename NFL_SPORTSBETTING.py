@@ -2985,9 +2985,14 @@ class KillerSportsFetcher:
             try:
                 payload = pd.read_html(io.BytesIO(response.content))[0]
             except Exception:
+                snippet = (response.text or "")[:320].replace("\n", " ")
                 logging.warning(
-                    "KillerSports response for season %s was not a readable CSV/HTML table",
+                    "KillerSports response for season %s was not a readable CSV/HTML table "
+                    "(content-type=%s, body starts with: %s). Ensure the base URL points to "
+                    "the CSV export endpoint, e.g., https://api.killersports.com/nfl/closing",
                     season,
+                    response.headers.get("Content-Type"),
+                    snippet,
                 )
                 return pd.DataFrame()
 
@@ -3035,9 +3040,22 @@ class ClosingOddsArchiveSyncer:
             seasons = [str(season) for season in self.config.seasons]
 
             local_provider = False
+            closing_history_path = (
+                self.config.closing_odds_history_path or "data/closing_odds_history.csv"
+            )
+
+        if provider in {"killersports", "ks"} and not self.config.killersports_base_url:
+            local_path_exists = Path(closing_history_path).exists()
+            fallback_target = "local CSV" if local_path_exists else "OddsPortal"
+            logging.warning(
+                "KillerSports provider selected but KILLERSPORTS_BASE_URL is unset; "
+                "falling back to %s for closing odds.",
+                fallback_target,
+            )
+            provider = "local" if local_path_exists else "oddsportal"
 
             if provider in {"local", "csv", "file", "history", "offline"}:
-                fetcher = LocalClosingOddsFetcher(self.config.closing_odds_history_path)
+                fetcher = LocalClosingOddsFetcher(closing_history_path)
                 provider_name = "Local CSV"
                 local_provider = True
             elif provider in {"oddsportal", "odds-portal", "op"}:
@@ -3065,6 +3083,31 @@ class ClosingOddsArchiveSyncer:
                 return
 
             archive = fetcher.fetch(seasons)
+
+            if archive.empty and provider_name == "KillerSports":
+                local_path_exists = Path(closing_history_path).exists()
+                fallback_provider = "local" if local_path_exists else "oddsportal"
+                fallback_label = "local CSV" if local_path_exists else "OddsPortal"
+                logging.warning(
+                    "KillerSports returned no closing odds; falling back to %s.",
+                    fallback_label,
+                )
+                if fallback_provider == "local":
+                    fetcher = LocalClosingOddsFetcher(closing_history_path)
+                    provider_name = "Local CSV"
+                    local_provider = True
+                else:
+                    fetcher = OddsPortalFetcher(
+                        self.session,
+                        base_url=self.config.oddsportal_base_url,
+                        results_path=self.config.oddsportal_results_path,
+                        season_path_template=self.config.oddsportal_season_template,
+                        timeout=self.config.closing_odds_timeout,
+                        user_agents=self.config.oddsportal_user_agents,
+                    )
+                    provider_name = "OddsPortal"
+                    local_provider = False
+                archive = fetcher.fetch(seasons)
             if archive.empty:
                 logging.warning(
                     "%s did not return any closing odds for seasons %s",
@@ -19875,6 +19918,46 @@ def main() -> None:
         if args.predict:
             logging.error("Prediction generation skipped because no models were available.")
         return
+
+    def _log_training_inputs(builder: FeatureBuilder) -> None:
+        games = builder.games_frame if builder else None
+        players = builder.player_feature_frame if builder else None
+        odds_lookup = builder.latest_odds_lookup if builder else None
+        prop_lines = builder.player_prop_lines_frame if builder else None
+        totals = builder.game_totals_frame if builder else None
+
+        def _count_rows(frame: Optional[pd.DataFrame]) -> int:
+            return int(len(frame)) if frame is not None else 0
+
+        def _count_complete(frame: Optional[pd.DataFrame], columns: Sequence[str]) -> int:
+            if frame is None or frame.empty:
+                return 0
+            available = [col for col in columns if col in frame.columns]
+            if len(available) < len(columns):
+                return 0
+            return int(frame[available].dropna(how="any").shape[0])
+
+        def _count_unique(frame: Optional[pd.DataFrame], columns: Sequence[str]) -> int:
+            if frame is None or frame.empty:
+                return 0
+            for col in columns:
+                if col in frame.columns:
+                    return int(frame[col].nunique())
+            return 0
+
+        logging.info(
+            "Training input snapshot | games=%d (with scores=%d, with closing odds=%d) | player rows=%d (unique players=%d) | prop lines=%d | totals lines=%d | odds rows=%d",
+            _count_rows(games),
+            _count_complete(games, ["home_score", "away_score"]),
+            _count_complete(games, ["home_closing_moneyline", "away_closing_moneyline"]),
+            _count_rows(players),
+            _count_unique(players, ["player_id", "player"]),
+            _count_rows(prop_lines),
+            _count_rows(totals),
+            _count_rows(odds_lookup),
+        )
+
+    _log_training_inputs(trainer.feature_builder)
 
     games_frame = getattr(trainer.feature_builder, "games_frame", None)
     if games_frame is None:
