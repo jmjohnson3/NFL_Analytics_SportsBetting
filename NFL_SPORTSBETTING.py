@@ -3035,6 +3035,18 @@ class OddsPortalFetcher:
         if away_decimal is None and len(odds_columns) >= 2:
             away_decimal = odds_columns[1]
 
+        if (home_decimal is None or away_decimal is None) and not odds_columns:
+            numeric_density = {
+                col: pd.to_numeric(frame[col], errors="coerce").notna().mean()
+                for col in frame.columns
+                if col not in {home_col, away_col}
+            }
+            numeric_cols = [col for col, ratio in numeric_density.items() if ratio >= 0.5]
+            if home_decimal is None and numeric_cols:
+                home_decimal = numeric_cols[0]
+            if away_decimal is None and len(numeric_cols) >= 2:
+                away_decimal = numeric_cols[1]
+
         def _split_teams(value: Any) -> Tuple[str, str]:
             text = str(value or "").strip()
             separators = [" - ", " – ", " vs ", " vs. ", " v ", " @ "]
@@ -3054,6 +3066,19 @@ class OddsPortalFetcher:
             frame["__away"] = extracted.apply(lambda pair: pair[1])
             home_col = home_col or "__home"
             away_col = away_col or "__away"
+
+        if not home_col or not away_col:
+            text_density = {
+                col: frame[col]
+                .astype(str)
+                .str.contains(r"[A-Za-z]", regex=True)
+                .mean()
+                for col in frame.columns
+            }
+            text_cols = [col for col, ratio in text_density.items() if ratio >= 0.5]
+            if len(text_cols) >= 2:
+                home_col = home_col or text_cols[0]
+                away_col = away_col or text_cols[1]
 
         if not home_col or not away_col:
             return pd.DataFrame()
