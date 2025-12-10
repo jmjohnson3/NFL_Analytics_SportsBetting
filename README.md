@@ -211,6 +211,7 @@ pipeline:
 | `ODDSPORTAL_USER_AGENTS` | Comma- or semicolon-separated list of additional User-Agent strings to rotate when scraping OddsPortal. |
 | `NFL_ODDSPORTAL_HTML_OVERRIDE` | Optional file or directory of saved OddsPortal HTML (e.g., downloaded in a browser). When set, those snapshots are parsed first before live requests. |
 | `NFL_ODDSPORTAL_HTML_OVERRIDE_DIR` | Optional directory to scan for slug-matching snapshots (e.g., the `reports/oddsportal_debug/` captures from a previous run). If unset, the scraper will still look in `reports/oddsportal_debug/` when it exists. |
+| `NFL_ODDSPORTAL_OVERRIDE_ONLY` | Optional flag (`1/true/on`). When set, the scraper will **not** make live OddsPortal HTTP requests and will rely solely on the provided override/debug HTML. |
 | `NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES` | Optional integer. Defaults to `2`. The scraper will save that many empty OddsPortal pages to `reports/oddsportal_debug/` even if `NFL_ODDSPORTAL_DEBUG_HTML` is off. Set to `0` to disable. |
 | `NFL_ODDSPORTAL_DEBUG_PNG` | Optional flag (`1/true/on`). When enabled and Pillow is installed, every saved OddsPortal debug HTML snapshot is also rendered to a PNG text capture alongside the `.html` file for easier sharing. |
 | `NFL_ODDS_SSL_CERT` | Optional path to a custom CA bundle used when verifying OddsPortal/KillerSports HTTPS connections. |

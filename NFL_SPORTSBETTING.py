@@ -1278,6 +1278,7 @@ class OddsPortalFetcher:
         self._no_rows_warned: Set[str] = set()
         self._auto_debug_remaining = 0
         self._html_override_path: Optional[Path] = None
+        self._override_only = env_flag("NFL_ODDSPORTAL_OVERRIDE_ONLY", False)
         self._debug_png_enabled = str(
             os.environ.get("NFL_ODDSPORTAL_DEBUG_PNG", "")
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -1405,7 +1406,8 @@ class OddsPortalFetcher:
         url = urljoin(self.base_url, slug)
 
         override_frames: List[pd.DataFrame] = []
-        for html in self._load_override_html(slug):
+        override_html_list = list(self._load_override_html(slug))
+        for html in override_html_list:
             parsed = self._parse_results_page(html, season_label)
             if not _is_effectively_empty_df(parsed):
                 override_frames.append(parsed)
@@ -1417,6 +1419,14 @@ class OddsPortalFetcher:
                 len(override_frames),
             )
             return safe_concat(override_frames, ignore_index=True)
+
+        if override_html_list and self._override_only:
+            logging.warning(
+                "NFL_ODDSPORTAL_OVERRIDE_ONLY enabled; skipping live OddsPortal request for %s. "
+                "Provide complete override HTML or disable the flag to resume scraping.",
+                slug,
+            )
+            return pd.DataFrame()
 
         html = self._request(url)
         if not html:
