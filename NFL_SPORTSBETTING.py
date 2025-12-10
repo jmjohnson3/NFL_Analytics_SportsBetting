@@ -1279,9 +1279,13 @@ class OddsPortalFetcher:
         self._auto_debug_remaining = 0
         self._html_override_path: Optional[Path] = None
         self._override_only = env_flag("NFL_ODDSPORTAL_OVERRIDE_ONLY", False)
-        self._debug_png_enabled = str(
-            os.environ.get("NFL_ODDSPORTAL_DEBUG_PNG", "")
-        ).strip().lower() in {"1", "true", "yes", "on"}
+        debug_png_env = os.environ.get("NFL_ODDSPORTAL_DEBUG_PNG")
+        self._debug_png_enabled = str(debug_png_env or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self._debug_png_notice_logged = False
 
         debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
@@ -1305,6 +1309,11 @@ class OddsPortalFetcher:
                     "NFL_ODDSPORTAL_DEBUG_HTML enabled; raw OddsPortal pages will be written to %s",
                     self._debug_dir,
                 )
+
+                if debug_png_env is None:
+                    # Automatically emit PNG text captures alongside HTML when debug HTML is on,
+                    # unless the user explicitly disables it via NFL_ODDSPORTAL_DEBUG_PNG.
+                    self._debug_png_enabled = True
 
         auto_debug_env = os.environ.get("NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES")
         default_auto_samples = 2
