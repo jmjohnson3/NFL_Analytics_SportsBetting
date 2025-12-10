@@ -1836,12 +1836,9 @@ class OddsPortalFetcher:
             if not frames:
                 return pd.DataFrame()
             # Fallback: attempt to normalise first readable table
-            for frame in frames:
-                if frame.empty:
-                    continue
-                normalized = self._normalise_table(frame, season_label)
-                if not normalized.empty:
-                    return normalized
+            normalized = self._normalise_frames(frames, season_label)
+            if not normalized.empty:
+                return normalized
             return pd.DataFrame()
 
         rows: List[Dict[str, Any]] = []
@@ -1920,15 +1917,36 @@ class OddsPortalFetcher:
             candidate_sources = [str(table), html]
             for source in candidate_sources:
                 frames = pd.read_html(io.StringIO(source))
-                for frame in frames:
-                    if frame.empty:
-                        continue
-                    normalized = self._normalise_table(frame, season_label)
-                    if not normalized.empty:
-                        return normalized
+                normalized = self._normalise_frames(frames, season_label)
+                if not normalized.empty:
+                    return normalized
         except Exception:
             return pd.DataFrame()
 
+        return pd.DataFrame()
+
+    def _normalise_frames(
+        self, frames: Sequence[pd.DataFrame], season_label: str
+    ) -> pd.DataFrame:
+        """Attempt to normalise a collection of read_html frames with diagnostics."""
+
+        logged = False
+        for idx, frame in enumerate(frames):
+            if frame is None or frame.empty:
+                continue
+            normalized = self._normalise_table(frame, season_label)
+            if not normalized.empty:
+                return normalized
+            if not logged:
+                sample = frame.head(3).to_dict(orient="records")
+                logging.info(
+                    "OddsPortal read_html frame %s could not be normalised; columns=%s shape=%s sample_rows=%s",
+                    idx,
+                    list(frame.columns),
+                    frame.shape,
+                    sample,
+                )
+                logged = True
         return pd.DataFrame()
 
     def _debug_capture_failure(self, slug: str, html: str, *, source_url: str) -> None:
