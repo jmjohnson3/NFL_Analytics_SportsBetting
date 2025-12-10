@@ -3125,7 +3125,7 @@ class OddsPortalFetcher:
                 decimals = row_text.apply(
                     lambda text: [
                         _parse_decimal_odds(match)
-                        for match in re.findall(r"\d+\.\d+", text)
+                        for match in re.findall(r"[+-]?\d+(?:\.\d+)?", text)
                     ]
                 )
                 if home_decimal is None:
