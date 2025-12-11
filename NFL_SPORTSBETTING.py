@@ -3103,6 +3103,12 @@ class OddsPortalFetcher:
             if len(text_cols) >= 2:
                 home_col = home_col or text_cols[0]
                 away_col = away_col or text_cols[1]
+            elif not text_cols:
+                ranked = sorted(text_density.items(), key=lambda item: item[1], reverse=True)
+                ranked = [col for col, ratio in ranked if ratio >= 0.2]
+                if len(ranked) >= 2:
+                    home_col = home_col or ranked[0]
+                    away_col = away_col or ranked[1]
 
         # Final fallback: if no explicit home/away columns were found, try to
         # extract them from the concatenated row text. This captures unlabeled
@@ -3121,26 +3127,26 @@ class OddsPortalFetcher:
                     list(frame.columns),
                     frame.shape,
                 )
-                # Extract the first two decimal-looking numbers per row as odds
+                # Extract the last two decimal-looking numbers per row as odds
                 decimals = row_text.apply(
                     lambda text: [
                         _parse_decimal_odds(match)
                         for match in re.findall(r"[+-]?\d+(?:\.\d+)?", text)
                     ]
                 )
-                if home_decimal is None:
-                    frame["__home_odds"] = decimals.apply(
-                        lambda vals: next((val for val in vals if val is not None), np.nan)
-                    )
-                    home_decimal = "__home_odds"
-                if away_decimal is None:
-                    frame["__away_odds"] = decimals.apply(
-                        lambda vals: next(
-                            (val for val in vals[1:] if val is not None),
-                            np.nan,
-                        )
-                    )
-                    away_decimal = "__away_odds"
+                if home_decimal is None or away_decimal is None:
+                    def _pick_tail(vals: List[Optional[float]], offset: int) -> float:
+                        parsed = [val for val in vals if val is not None]
+                        if len(parsed) > offset:
+                            return parsed[-(offset + 1)]
+                        return math.nan
+
+                    if home_decimal is None:
+                        frame["__home_odds"] = decimals.apply(lambda vals: _pick_tail(vals, 1))
+                        home_decimal = "__home_odds"
+                    if away_decimal is None:
+                        frame["__away_odds"] = decimals.apply(lambda vals: _pick_tail(vals, 0))
+                        away_decimal = "__away_odds"
 
         if not home_col or not away_col:
             return pd.DataFrame()
