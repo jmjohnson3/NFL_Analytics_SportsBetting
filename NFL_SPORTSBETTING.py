@@ -2521,6 +2521,21 @@ class OddsPortalFetcher:
                 )
 
         if not rows:
+            loose_rows = self._extract_loose_json_matchups(data, season_label)
+            for entry in loose_rows:
+                key = (
+                    entry.get("home_team"),
+                    entry.get("away_team"),
+                    entry.get("kickoff_utc"),
+                    entry.get("home_closing_moneyline"),
+                    entry.get("away_closing_moneyline"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(entry)
+
+        if not rows:
             return pd.DataFrame()
 
         frame = pd.DataFrame(rows)
@@ -2534,6 +2549,136 @@ class OddsPortalFetcher:
         frame["away_score"] = frame["away_score"].where(frame["away_score"].notna(), np.nan)
 
         return frame.reset_index(drop=True)
+
+    def _extract_loose_json_matchups(
+        self, data: Any, season_label: str
+    ) -> List[Dict[str, Any]]:
+        """Fallback JSON scraper for OddsPortal when no participant lists are found.
+
+        Some OddsPortal variants embed game data as loosely structured home/away
+        objects (or flat dictionaries) without participant arrays. This helper
+        scans dicts for home/away team names and any numeric odds fields and
+        emits rows when a plausible pair is detected.
+        """
+
+        if not isinstance(data, (dict, list)):
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, Optional[float], Optional[float]]] = set()
+
+        def _parse_team(value: Any) -> Optional[str]:
+            if isinstance(value, str):
+                cleaned = value.strip()
+                if cleaned:
+                    return cleaned
+            if isinstance(value, dict):
+                return self._extract_json_team_name(value, {})
+            return None
+
+        def _parse_odds_field(value: Any) -> Optional[float]:
+            if isinstance(value, (int, float)):
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    return None
+                return _parse_decimal_odds(str(numeric))
+            if isinstance(value, str):
+                return _parse_decimal_odds(value)
+            return None
+
+        def _scan_odds(node: Any) -> List[float]:
+            if isinstance(node, dict):
+                found: List[float] = []
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    if any(
+                        token in lower
+                        for token in (
+                            "odd",
+                            "price",
+                            "line",
+                            "moneyline",
+                            "money",
+                            "ml",
+                            "american",
+                            "decimal",
+                        )
+                    ):
+                        parsed = _parse_odds_field(value)
+                        if parsed is not None:
+                            found.append(parsed)
+                    if isinstance(value, (dict, list)):
+                        found.extend(_scan_odds(value))
+                return found
+            if isinstance(node, list):
+                aggregated: List[float] = []
+                for item in node:
+                    aggregated.extend(_scan_odds(item))
+                return aggregated
+            parsed = _parse_odds_field(node)
+            return [parsed] if parsed is not None else []
+
+        stack: List[Any] = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                home_name = None
+                away_name = None
+
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    if "home" in lower and home_name is None:
+                        home_name = _parse_team(value)
+                    if "away" in lower and away_name is None:
+                        away_name = _parse_team(value)
+
+                if home_name and away_name:
+                    odds_list = _scan_odds(node)
+                    home_decimal = odds_list[0] if odds_list else None
+                    away_decimal = odds_list[1] if len(odds_list) > 1 else None
+
+                    key = (
+                        home_name,
+                        away_name,
+                        home_decimal,
+                        away_decimal,
+                    )
+                    if key not in seen and (home_decimal or away_decimal):
+                        seen.add(key)
+                        rows.append(
+                            {
+                                "season": season_label,
+                                "week": np.nan,
+                                "home_team": normalize_team_abbr(home_name),
+                                "away_team": normalize_team_abbr(away_name),
+                                "home_closing_moneyline": _decimal_to_american(
+                                    home_decimal
+                                ),
+                                "away_closing_moneyline": _decimal_to_american(
+                                    away_decimal
+                                ),
+                                "closing_bookmaker": "OddsPortal",
+                                "closing_line_time": pd.NaT,
+                                "kickoff_utc": pd.NaT,
+                                "kickoff_date": "",
+                                "kickoff_weekday": "",
+                                "home_score": np.nan,
+                                "away_score": np.nan,
+                            }
+                        )
+
+                for value in node.values():
+                    if isinstance(value, (dict, list)):
+                        stack.append(value)
+            elif isinstance(node, list):
+                stack.extend(node)
+
+        if rows:
+            logging.info(
+                "OddsPortal loose JSON fallback recovered %d rows", len(rows)
+            )
+        return rows
 
     def _extract_json_payloads(
         self, html: str, soup: Optional["BeautifulSoup"]
