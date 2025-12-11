@@ -1084,6 +1084,20 @@ def _parse_decimal_odds(value: Optional[str]) -> Optional[float]:
     if not text:
         return None
 
+    fraction_match = re.match(r"^([+-]?\d+)\s*/\s*(\d+)$", text)
+    if fraction_match:
+        try:
+            num = float(fraction_match.group(1))
+            den = float(fraction_match.group(2))
+            if den != 0:
+                decimal_fraction = num / den + 1.0
+            else:
+                decimal_fraction = math.nan
+        except ValueError:
+            decimal_fraction = math.nan
+        if math.isfinite(decimal_fraction) and decimal_fraction > 1.0:
+            return decimal_fraction
+
     direct_match = re.match(r"^[+-]?\d+(?:\.\d+)?$", text)
     decimal: Optional[float] = None
     if direct_match:
@@ -3082,6 +3096,30 @@ class OddsPortalFetcher:
             tokens = re.split(r"\s+vs\.?\s+|\s+@\s+", text, maxsplit=1, flags=re.IGNORECASE)
             if len(tokens) == 2:
                 return tokens[0].strip(), tokens[1].strip()
+
+            # Heuristic: scan token windows to find the first two recognizable
+            # team names/abbreviations when no explicit separator exists.
+            words = re.findall(r"[A-Za-z]+", text)
+            hits: List[Tuple[int, int, str]] = []
+            for start in range(len(words)):
+                for end in range(start, min(len(words), start + 3)):
+                    phrase = " ".join(words[start : end + 1])
+                    abbr = normalize_team_abbr(phrase)
+                    if abbr:
+                        hits.append((start, end, abbr))
+            if hits:
+                hits.sort(key=lambda item: (item[0], item[1] - item[0]))
+                selected: List[Tuple[int, int, str]] = []
+                for start, end, abbr in hits:
+                    if any(s <= start <= e or s <= end <= e for s, e, _ in selected):
+                        continue
+                    selected.append((start, end, abbr))
+                    if len(selected) == 2:
+                        break
+                if len(selected) == 2:
+                    selected.sort(key=lambda item: item[0])
+                    return selected[0][2], selected[1][2]
+
             return "", ""
 
         if match_col and (not home_col or not away_col):
@@ -3183,6 +3221,15 @@ class OddsPortalFetcher:
             scores = frame[score_col].astype(str).apply(lambda text: re.findall(r"\d+", text))
             result["home_score"] = scores.apply(lambda vals: float(vals[0]) if len(vals) >= 1 else np.nan)
             result["away_score"] = scores.apply(lambda vals: float(vals[1]) if len(vals) >= 2 else np.nan)
+
+        if result["home_closing_moneyline"].notna().sum() == 0 and result[
+            "away_closing_moneyline"
+        ].notna().sum() == 0:
+            logging.info(
+                "OddsPortal normalized frame but moneyline columns were empty; columns=%s sample_rows=%s",
+                list(frame.columns),
+                result.head(5).to_dict(orient="records"),
+            )
 
         return result.reset_index(drop=True)
 
