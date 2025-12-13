@@ -1914,7 +1914,7 @@ class OddsPortalFetcher:
 
             decimals: List[float] = []
             for odds in odds_nodes:
-                value = _parse_decimal_odds(odds.get_text(" ", strip=True))
+                value = self._extract_decimal_from_node(odds)
                 if value is not None:
                     decimals.append(value)
             home_decimal = decimals[0] if decimals else None
@@ -2399,7 +2399,8 @@ class OddsPortalFetcher:
                     )
                 ):
                     continue
-                price = _parse_moneyline_text(odd_container.get_text(" ", strip=True))
+
+                price = self._extract_moneyline_from_node(odd_container)
                 if price is None:
                     continue
                 odds_values.append(price)
@@ -2549,6 +2550,86 @@ class OddsPortalFetcher:
         frame["away_score"] = frame["away_score"].where(frame["away_score"].notna(), np.nan)
 
         return frame.reset_index(drop=True)
+
+    def _extract_decimal_from_node(self, node: Any) -> Optional[float]:
+        """Parse decimal odds from a BeautifulSoup node or return None.
+
+        Some OddsPortal variants hide prices in data attributes while leaving the
+        text content empty; this helper checks both the rendered text and common
+        attribute names before giving up.
+        """
+
+        if node is None:
+            return None
+
+        candidates: List[str] = []
+        try:
+            text = node.get_text(" ", strip=True)
+        except Exception:
+            text = ""
+        if text:
+            candidates.append(text)
+
+        for attr in (
+            "data-odds",
+            "data-odd",
+            "data-odd-value",
+            "data-odds-value",
+            "data-selection-price",
+            "data-selection-odds",
+        ):
+            try:
+                value = node.get(attr)
+            except Exception:
+                value = None
+            if value:
+                candidates.append(str(value))
+
+        for candidate in candidates:
+            parsed = _parse_decimal_odds(candidate)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _extract_moneyline_from_node(self, node: Any) -> Optional[int]:
+        """Parse a moneyline price from text or data attributes on a node."""
+
+        if node is None:
+            return None
+
+        candidates: List[str] = []
+        try:
+            text = node.get_text(" ", strip=True)
+        except Exception:
+            text = ""
+        if text:
+            candidates.append(text)
+
+        for attr in (
+            "data-odds",
+            "data-odd",
+            "data-odd-value",
+            "data-odds-value",
+            "data-selection-price",
+            "data-selection-odds",
+        ):
+            try:
+                value = node.get(attr)
+            except Exception:
+                value = None
+            if value:
+                candidates.append(str(value))
+
+        for candidate in candidates:
+            moneyline = _parse_moneyline_text(candidate)
+            if moneyline is not None:
+                return moneyline
+            decimal = _parse_decimal_odds(candidate)
+            if decimal is not None:
+                converted = _decimal_to_american(decimal)
+                if converted is not None:
+                    return converted
+        return None
 
     def _extract_loose_json_matchups(
         self, data: Any, season_label: str
