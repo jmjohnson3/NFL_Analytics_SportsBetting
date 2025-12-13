@@ -1266,6 +1266,9 @@ class LocalClosingOddsFetcher:
 class OddsPortalFetcher:
     """Scrape historical closing odds from OddsPortal results pages."""
 
+    _ocr_dependencies_missing: bool = False
+    _ocr_dependencies_notice_logged: bool = False
+
     def __init__(
         self,
         session: requests.Session,
@@ -1325,7 +1328,9 @@ class OddsPortalFetcher:
             "on",
         }
         self._debug_png_notice_logged = False
-        self._ocr_unavailable_logged: Set[str] = set()
+        self._ocr_enabled = env_flag("NFL_ODDSPORTAL_OCR_ENABLED", True)
+        self._ocr_disabled_notice_logged = False
+        self._ocr_dependencies_notice_logged = False
 
         debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
         if str(debug_flag).strip().lower() in {"1", "true", "yes", "on", "debug"}:
@@ -2102,16 +2107,32 @@ class OddsPortalFetcher:
         return combined
 
     def _load_override_png_text(self, slug: str) -> List[str]:
+        if not self._ocr_enabled:
+            if not self._ocr_disabled_notice_logged:
+                logging.info(
+                    "OCR fallback disabled via NFL_ODDSPORTAL_OCR_ENABLED; skipping PNGs for all slugs"
+                )
+                self._ocr_disabled_notice_logged = True
+            return []
+
+        if OddsPortalFetcher._ocr_dependencies_missing:
+            if not OddsPortalFetcher._ocr_dependencies_notice_logged:
+                logging.info(
+                    "OCR fallback skipped for all slugs because Pillow+pytesseract are unavailable"
+                )
+                OddsPortalFetcher._ocr_dependencies_notice_logged = True
+            return []
+
         try:
             from PIL import Image
             import pytesseract
         except Exception:
-            if slug not in self._ocr_unavailable_logged:
+            OddsPortalFetcher._ocr_dependencies_missing = True
+            if not OddsPortalFetcher._ocr_dependencies_notice_logged:
                 logging.info(
-                    "OCR fallback skipped for slug %s because Pillow+pytesseract are unavailable",
-                    slug,
+                    "OCR fallback skipped for all slugs because Pillow+pytesseract are unavailable"
                 )
-                self._ocr_unavailable_logged.add(slug)
+                OddsPortalFetcher._ocr_dependencies_notice_logged = True
             return []
 
         search_paths: List[Path] = []
