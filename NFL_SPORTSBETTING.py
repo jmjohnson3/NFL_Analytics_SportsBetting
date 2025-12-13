@@ -1455,7 +1455,7 @@ class OddsPortalFetcher:
         override_frames: List[pd.DataFrame] = []
         override_html_list = list(self._load_override_html(slug))
         for html in override_html_list:
-            parsed = self._parse_results_page(html, season_label)
+            parsed = self._parse_results_page(html, season_label, slug)
             if not _is_effectively_empty_df(parsed):
                 override_frames.append(parsed)
         if override_frames:
@@ -1480,7 +1480,7 @@ class OddsPortalFetcher:
             return pd.DataFrame()
 
         frames: List[pd.DataFrame] = []
-        parsed = self._parse_results_page(html, season_label)
+        parsed = self._parse_results_page(html, season_label, slug)
         if not _is_effectively_empty_df(parsed):
             frames.append(parsed)
         else:
@@ -1490,7 +1490,7 @@ class OddsPortalFetcher:
             page_html = self._request(page_url)
             if not page_html:
                 continue
-            chunk = self._parse_results_page(page_html, season_label)
+            chunk = self._parse_results_page(page_html, season_label, slug)
             if not _is_effectively_empty_df(chunk):
                 frames.append(chunk)
             else:
@@ -1846,7 +1846,9 @@ class OddsPortalFetcher:
                     if timestamp is not None:
                         return timestamp
 
-    def _parse_results_page(self, html: str, season_label: str) -> pd.DataFrame:
+    def _parse_results_page(
+        self, html: str, season_label: str, slug: str = ""
+    ) -> pd.DataFrame:
         global _BEAUTIFULSOUP_WARNING_EMITTED
         if BeautifulSoup is None:
             if not _BEAUTIFULSOUP_WARNING_EMITTED:
@@ -1870,6 +1872,9 @@ class OddsPortalFetcher:
             state_rows = self._parse_embedded_state(html, season_label, soup=soup)
             if not state_rows.empty:
                 return state_rows
+            png_rows = self._parse_override_pngs(slug, season_label)
+            if not png_rows.empty:
+                return png_rows
             try:
                 frames = pd.read_html(io.StringIO(html))
             except Exception:
@@ -1950,6 +1955,9 @@ class OddsPortalFetcher:
         state_rows = self._parse_embedded_state(html, season_label, soup=soup)
         if not state_rows.empty:
             return state_rows
+        png_rows = self._parse_override_pngs(slug, season_label)
+        if not png_rows.empty:
+            return png_rows
 
         attribute_rows = self._parse_attribute_tables(soup, season_label)
         if not attribute_rows.empty:
@@ -2058,6 +2066,81 @@ class OddsPortalFetcher:
                 "OddsPortal attribute-table fallback extracted %d rows for %s", len(normalized), season_label
             )
         return normalized
+
+    def _parse_override_pngs(self, slug: str, season_label: str) -> pd.DataFrame:
+        """OCR fallback that extracts odds from debug PNG snapshots when provided."""
+
+        texts = self._load_override_png_text(slug)
+        if not texts:
+            return pd.DataFrame()
+
+        frames: List[pd.DataFrame] = []
+        for text in texts:
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if not lines:
+                continue
+            frame = pd.DataFrame({"row": lines})
+            normalized = self._normalise_table(frame, season_label)
+            if not normalized.empty:
+                frames.append(normalized)
+
+        if not frames:
+            logging.info(
+                "OCR fallback read %d OddsPortal PNG snapshot(s) for %s but found no odds",
+                len(texts),
+                slug or season_label,
+            )
+            return pd.DataFrame()
+
+        combined = safe_concat(frames, ignore_index=True)
+        logging.info(
+            "OCR fallback parsed %d closing-odds rows from PNG snapshot(s) for %s",
+            len(combined),
+            slug or season_label,
+        )
+        return combined
+
+    def _load_override_png_text(self, slug: str) -> List[str]:
+        try:
+            from PIL import Image
+            import pytesseract
+        except Exception:
+            logging.info(
+                "OCR fallback skipped for slug %s because Pillow+pytesseract are unavailable",
+                slug,
+            )
+            return []
+
+        search_paths: List[Path] = []
+        if self._html_override_path is not None:
+            search_paths.append(self._html_override_path)
+        else:
+            if self._debug_dir is not None:
+                search_paths.append(self._debug_dir)
+            default_debug_dir = SCRIPT_ROOT / "reports" / "oddsportal_debug"
+            if default_debug_dir.exists():
+                search_paths.append(default_debug_dir)
+
+        sanitized_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/"))
+        texts: List[str] = []
+
+        for path in search_paths:
+            candidates: List[Path] = []
+            if path.is_file() and path.suffix.lower() == ".png":
+                candidates.append(path)
+            elif path.is_dir():
+                candidates.extend(sorted(path.glob("*.png")))
+            for candidate in candidates:
+                if sanitized_slug and sanitized_slug not in candidate.stem:
+                    continue
+                try:
+                    text = pytesseract.image_to_string(Image.open(candidate))
+                    if text.strip():
+                        texts.append(text)
+                except Exception:
+                    logging.exception("Failed OCR on OddsPortal PNG snapshot %s", candidate)
+
+        return texts
 
     def _debug_capture_failure(self, slug: str, html: str, *, source_url: str) -> None:
         if not html:
