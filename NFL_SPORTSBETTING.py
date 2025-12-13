@@ -1861,6 +1861,9 @@ class OddsPortalFetcher:
         if table is None:
             table = soup.find(id=re.compile("tournamentTable", re.IGNORECASE))
         if table is None:
+            attribute_rows = self._parse_attribute_tables(soup, season_label)
+            if not attribute_rows.empty:
+                return attribute_rows
             modern_rows = self._parse_modern_results(soup, season_label)
             if not modern_rows.empty:
                 return modern_rows
@@ -1948,6 +1951,10 @@ class OddsPortalFetcher:
         if not state_rows.empty:
             return state_rows
 
+        attribute_rows = self._parse_attribute_tables(soup, season_label)
+        if not attribute_rows.empty:
+            return attribute_rows
+
         # Some OddsPortal variants still wrap results in a table but rename row
         # classes; if the legacy/modern selectors miss, fall back to read_html on
         # the captured table (or full document) before giving up.
@@ -1986,6 +1993,71 @@ class OddsPortalFetcher:
                 )
                 logged = True
         return pd.DataFrame()
+
+    def _parse_attribute_tables(self, soup: BeautifulSoup, season_label: str) -> pd.DataFrame:
+        """Normalise tables whose odds live in data-* attributes instead of text.
+
+        When OddsPortal renders prices purely via attributes (e.g., data-odds,
+        data-odd, data-us, data-decimal), pandas.read_html returns empty strings.
+        This helper walks every <table> row, extracts both text and attribute
+        values, and feeds the synthetic frame back through the normaliser so team
+        and odds inference heuristics can still run.
+        """
+
+        tables = soup.find_all("table")
+        if not tables:
+            return pd.DataFrame()
+
+        frames: List[pd.DataFrame] = []
+
+        def _extract_attr_odds(cell: Any) -> Optional[float]:
+            for key, value in cell.attrs.items():
+                if value is None:
+                    continue
+                text_value = " ".join(value) if isinstance(value, list) else str(value)
+                parsed = _parse_decimal_odds(text_value)
+                if parsed is not None:
+                    return parsed
+                tokens = re.findall(r"[+-]?\d+(?:\.\d+)?", text_value)
+                for token in tokens[::-1]:
+                    parsed = _parse_decimal_odds(token)
+                    if parsed is not None:
+                        return parsed
+            return None
+
+        for table in tables:
+            rows: List[Dict[str, Any]] = []
+            for tr in table.find_all("tr"):
+                cells = tr.find_all(["td", "th"])
+                if not cells:
+                    continue
+                row: Dict[str, Any] = {}
+                for idx, cell in enumerate(cells):
+                    text = cell.get_text(" ", strip=True)
+                    row[f"col_{idx}"] = text
+                    attr_odds = _extract_attr_odds(cell)
+                    if attr_odds is not None:
+                        row[f"col_{idx}_attr_odds"] = attr_odds
+                rows.append(row)
+
+            if rows:
+                frames.append(pd.DataFrame(rows))
+
+        if not frames:
+            return pd.DataFrame()
+
+        normalized = self._normalise_frames(frames, season_label)
+        if normalized.empty:
+            sample = frames[0].head(3).to_dict(orient="records")
+            logging.info(
+                "OddsPortal attribute-table fallback produced frames but no odds; sample=%s",
+                sample,
+            )
+        else:
+            logging.info(
+                "OddsPortal attribute-table fallback extracted %d rows for %s", len(normalized), season_label
+            )
+        return normalized
 
     def _debug_capture_failure(self, slug: str, html: str, *, source_url: str) -> None:
         if not html:
