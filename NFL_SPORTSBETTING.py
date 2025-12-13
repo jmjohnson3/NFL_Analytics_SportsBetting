@@ -1325,6 +1325,7 @@ class OddsPortalFetcher:
             "on",
         }
         self._debug_png_notice_logged = False
+        self._ocr_unavailable_logged: Set[str] = set()
 
         debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
         if str(debug_flag).strip().lower() in {"1", "true", "yes", "on", "debug"}:
@@ -2105,10 +2106,12 @@ class OddsPortalFetcher:
             from PIL import Image
             import pytesseract
         except Exception:
-            logging.info(
-                "OCR fallback skipped for slug %s because Pillow+pytesseract are unavailable",
-                slug,
-            )
+            if slug not in self._ocr_unavailable_logged:
+                logging.info(
+                    "OCR fallback skipped for slug %s because Pillow+pytesseract are unavailable",
+                    slug,
+                )
+                self._ocr_unavailable_logged.add(slug)
             return []
 
         search_paths: List[Path] = []
