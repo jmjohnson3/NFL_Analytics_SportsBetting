@@ -1335,6 +1335,12 @@ class OddsPortalFetcher:
             os.environ.get("NFL_ODDSPORTAL_TESSERACT_CMD")
             or os.environ.get("TESSERACT_CMD")
         )
+        manual_csv_env = os.environ.get("NFL_ODDSPORTAL_MANUAL_CSV")
+        self._manual_csv_path: Optional[Path] = (
+            Path(manual_csv_env).expanduser()
+            if manual_csv_env
+            else (SCRIPT_ROOT / "reports" / "oddsportal_manual_closing_odds.csv")
+        )
 
         debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
         if str(debug_flag).strip().lower() in {"1", "true", "yes", "on", "debug"}:
@@ -1882,6 +1888,9 @@ class OddsPortalFetcher:
             state_rows = self._parse_embedded_state(html, season_label, soup=soup)
             if not state_rows.empty:
                 return state_rows
+            json_rows = self._parse_json_scripts(soup, html, season_label, slug)
+            if not json_rows.empty:
+                return json_rows
             png_rows = self._parse_override_pngs(slug, season_label)
             if not png_rows.empty:
                 return png_rows
@@ -1980,6 +1989,14 @@ class OddsPortalFetcher:
         )
         if not text_rows.empty:
             return text_rows
+
+        json_rows = self._parse_json_scripts(soup, html, season_label, slug)
+        if not json_rows.empty:
+            return json_rows
+
+        manual_rows = self._parse_manual_csv_override(season_label)
+        if not manual_rows.empty:
+            return manual_rows
 
         # Some OddsPortal variants still wrap results in a table but rename row
         # classes; if the legacy/modern selectors miss, fall back to read_html on
@@ -2296,6 +2313,91 @@ class OddsPortalFetcher:
             return pd.DataFrame(rows)
 
         return pd.DataFrame()
+
+    def _parse_manual_csv_override(self, season_label: str) -> pd.DataFrame:
+        """Allow users to supply a manual OddsPortal closing-odds CSV.
+
+        Expected columns: season, home_team, away_team, home_closing_moneyline,
+        away_closing_moneyline, and optional kickoff_date (YYYY-MM-DD).
+        """
+
+        if self._manual_csv_path is None:
+            return pd.DataFrame()
+
+        path = self._manual_csv_path
+        try:
+            if not path.exists():
+                return pd.DataFrame()
+            frame = pd.read_csv(path)
+        except Exception:
+            logging.exception("Failed to read manual OddsPortal CSV override at %s", path)
+            return pd.DataFrame()
+
+        required = {
+            "season",
+            "home_team",
+            "away_team",
+            "home_closing_moneyline",
+            "away_closing_moneyline",
+        }
+        missing = required - set(frame.columns)
+        if missing:
+            logging.warning(
+                "Manual OddsPortal CSV %s is missing required columns: %s",
+                path,
+                ", ".join(sorted(missing)),
+            )
+            return pd.DataFrame()
+
+        filtered = frame.loc[frame["season"].astype(str) == str(season_label)].copy()
+        if filtered.empty:
+            return pd.DataFrame()
+
+        for col in ("home_team", "away_team"):
+            filtered[col] = filtered[col].astype(str).map(normalize_team_abbr)
+
+        for odds_col in ("home_closing_moneyline", "away_closing_moneyline"):
+            filtered[odds_col] = filtered[odds_col].apply(
+                lambda value: _parse_moneyline_text(str(value))
+                if not pd.isna(value)
+                else np.nan
+            )
+
+        filtered["closing_bookmaker"] = "OddsPortal"
+        filtered["kickoff_date"] = filtered.get("kickoff_date", "").fillna("")
+        filtered["kickoff_weekday"] = ""
+        filtered["kickoff_utc"] = pd.NaT
+        filtered["closing_line_time"] = pd.NaT
+        filtered["week"] = np.nan
+        filtered["home_score"] = np.nan
+        filtered["away_score"] = np.nan
+
+        filtered = filtered[
+            [
+                "season",
+                "week",
+                "home_team",
+                "away_team",
+                "home_closing_moneyline",
+                "away_closing_moneyline",
+                "closing_bookmaker",
+                "closing_line_time",
+                "kickoff_utc",
+                "kickoff_date",
+                "kickoff_weekday",
+                "home_score",
+                "away_score",
+            ]
+        ]
+
+        logging.info(
+            "Loaded %d manual closing odds rows from %s for season %s",
+            len(filtered),
+            path,
+            season_label,
+        )
+
+        return filtered
 
     def _debug_capture_failure(self, slug: str, html: str, *, source_url: str) -> None:
         if not html:
@@ -2742,6 +2844,47 @@ class OddsPortalFetcher:
             return pd.DataFrame()
 
         return pd.DataFrame(rows)
+
+    def _parse_json_scripts(
+        self, soup: "BeautifulSoup", html: str, season_label: str, slug: str
+    ) -> pd.DataFrame:
+        """Parse any JSON-looking script payloads for closing odds."""
+
+        payloads = self._extract_json_payloads(html, soup)
+        if not payloads:
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, Optional[float], Optional[float]]] = set()
+
+        for payload in payloads:
+            data = self._safe_json_loads(payload)
+            if data is None:
+                continue
+
+            extracted = self._extract_loose_json_matchups(data, season_label)
+            for row in extracted:
+                key = (
+                    row.get("home_team"),
+                    row.get("away_team"),
+                    row.get("home_closing_moneyline"),
+                    row.get("away_closing_moneyline"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(row)
+
+        if rows:
+            frame = pd.DataFrame(rows)
+            logging.info(
+                "Parsed %d closing-odds rows from JSON scripts for slug %s",
+                len(frame),
+                slug or season_label,
+            )
+            return frame
+
+        return pd.DataFrame()
 
     def _parse_embedded_state(
         self,
