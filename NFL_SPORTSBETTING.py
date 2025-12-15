@@ -2162,7 +2162,7 @@ class OddsPortalFetcher:
                     text = pytesseract.image_to_string(Image.open(candidate))
                     if text.strip():
                         texts.append(text)
-                except TesseractNotFoundError:
+                except (TesseractNotFoundError, FileNotFoundError, OSError):
                     OddsPortalFetcher._ocr_dependencies_missing = True
                     if not OddsPortalFetcher._ocr_dependencies_notice_logged:
                         logging.info(
