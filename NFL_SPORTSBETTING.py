@@ -2126,6 +2126,7 @@ class OddsPortalFetcher:
         try:
             from PIL import Image
             import pytesseract
+            TesseractNotFoundError = pytesseract.TesseractNotFoundError
         except Exception:
             OddsPortalFetcher._ocr_dependencies_missing = True
             if not OddsPortalFetcher._ocr_dependencies_notice_logged:
@@ -2161,6 +2162,14 @@ class OddsPortalFetcher:
                     text = pytesseract.image_to_string(Image.open(candidate))
                     if text.strip():
                         texts.append(text)
+                except TesseractNotFoundError:
+                    OddsPortalFetcher._ocr_dependencies_missing = True
+                    if not OddsPortalFetcher._ocr_dependencies_notice_logged:
+                        logging.info(
+                            "OCR fallback skipped for all slugs because tesseract is not installed or not on PATH"
+                        )
+                        OddsPortalFetcher._ocr_dependencies_notice_logged = True
+                    return texts
                 except Exception:
                     logging.exception("Failed OCR on OddsPortal PNG snapshot %s", candidate)
 
