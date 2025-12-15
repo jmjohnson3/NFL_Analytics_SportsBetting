@@ -215,6 +215,7 @@ pipeline:
 | `NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES` | Optional integer. Defaults to `2`. The scraper will save that many empty OddsPortal pages to `reports/oddsportal_debug/` even if `NFL_ODDSPORTAL_DEBUG_HTML` is off. Set to `0` to disable. |
 | `NFL_ODDSPORTAL_DEBUG_PNG` | Optional flag (`1/true/on`). When set, or when `NFL_ODDSPORTAL_DEBUG_HTML` is enabled without overriding this flag, every saved OddsPortal debug HTML snapshot is also rendered to a PNG text capture (requires Pillow) alongside the `.html` file for easier sharing. |
 | `NFL_ODDSPORTAL_OCR_ENABLED` | Optional flag (`1/true/on`). Defaults to on when Pillow+pytesseract are installed. Set to `0`/`false`/`off` to suppress OCR attempts (and the related missing-dependency notices) if you only want HTML/CSV-based odds extraction. |
+| `NFL_ODDSPORTAL_TESSERACT_CMD` | Optional path to the `tesseract` executable (Windows users can point this to `C:\Program Files\Tesseract-OCR\tesseract.exe`). If unset, the scraper also honours `TESSERACT_CMD` and will try common Windows defaults before giving up. |
 | `NFL_ODDS_SSL_CERT` | Optional path to a custom CA bundle used when verifying OddsPortal/KillerSports HTTPS connections. |
 | `ODDS_ALLOW_INSECURE_SSL` | Set to `true` to disable HTTPS verification (not recommended except for temporary corporate proxy issues). |
 | `KILLERSPORTS_BASE_URL` | Full CSV export URL for KillerSports (required when that provider is selected). Copy the direct CSV download link from the KillerSports query tool; the generic landing page will not work. |

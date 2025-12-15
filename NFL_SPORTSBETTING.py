@@ -1331,6 +1331,10 @@ class OddsPortalFetcher:
         self._ocr_enabled = env_flag("NFL_ODDSPORTAL_OCR_ENABLED", True)
         self._ocr_disabled_notice_logged = False
         self._ocr_dependencies_notice_logged = False
+        self._tesseract_cmd: Optional[str] = (
+            os.environ.get("NFL_ODDSPORTAL_TESSERACT_CMD")
+            or os.environ.get("TESSERACT_CMD")
+        )
 
         debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
         if str(debug_flag).strip().lower() in {"1", "true", "yes", "on", "debug"}:
@@ -2127,6 +2131,17 @@ class OddsPortalFetcher:
             from PIL import Image
             import pytesseract
             TesseractNotFoundError = pytesseract.TesseractNotFoundError
+
+            if self._tesseract_cmd:
+                pytesseract.pytesseract.tesseract_cmd = self._tesseract_cmd
+            elif platform.system().lower().startswith("win"):
+                for candidate in (
+                    r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+                    r"C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe",
+                ):
+                    if Path(candidate).exists():
+                        pytesseract.pytesseract.tesseract_cmd = candidate
+                        break
         except Exception:
             OddsPortalFetcher._ocr_dependencies_missing = True
             if not OddsPortalFetcher._ocr_dependencies_notice_logged:
@@ -2165,8 +2180,13 @@ class OddsPortalFetcher:
                 except (TesseractNotFoundError, FileNotFoundError, OSError):
                     OddsPortalFetcher._ocr_dependencies_missing = True
                     if not OddsPortalFetcher._ocr_dependencies_notice_logged:
+                        hint = (
+                            "Set NFL_ODDSPORTAL_TESSERACT_CMD (or TESSERACT_CMD) to the tesseract.exe path, "
+                            "or install Tesseract and ensure it is on PATH."
+                        )
                         logging.info(
-                            "OCR fallback skipped for all slugs because tesseract is not installed or not on PATH"
+                            "OCR fallback skipped for all slugs because tesseract is not installed or not on PATH. %s",
+                            hint,
                         )
                         OddsPortalFetcher._ocr_dependencies_notice_logged = True
                     return texts
