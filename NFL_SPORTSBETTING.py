@@ -1973,6 +1973,14 @@ class OddsPortalFetcher:
         if not attribute_rows.empty:
             return attribute_rows
 
+        text_rows = self._parse_text_lines(
+            [line.strip() for line in soup.get_text("\n").splitlines() if line.strip()],
+            season_label,
+            source=f"text:{slug or season_label}",
+        )
+        if not text_rows.empty:
+            return text_rows
+
         # Some OddsPortal variants still wrap results in a table but rename row
         # classes; if the legacy/modern selectors miss, fall back to read_html on
         # the captured table (or full document) before giving up.
@@ -2093,6 +2101,13 @@ class OddsPortalFetcher:
             normalized = self._normalise_table(frame, season_label)
             if not normalized.empty:
                 frames.append(normalized)
+                continue
+
+            text_rows = self._parse_text_lines(
+                lines, season_label, source=f"png:{slug or season_label}"
+            )
+            if not text_rows.empty:
+                frames.append(text_rows)
 
         if not frames:
             logging.info(
@@ -2194,6 +2209,93 @@ class OddsPortalFetcher:
                     logging.exception("Failed OCR on OddsPortal PNG snapshot %s", candidate)
 
         return texts
+
+    def _parse_text_lines(
+        self, lines: Sequence[str], season_label: str, *, source: str
+    ) -> pd.DataFrame:
+        """Heuristic parser for odds embedded in plain-text or OCR output."""
+
+        rows: List[Dict[str, Any]] = []
+
+        for line in lines:
+            cleaned = " ".join(line.split())
+            if not cleaned:
+                continue
+
+            odds_tokens = re.findall(r"[+-]?\d+(?:\.\d+)?", cleaned)
+            decimals = [
+                _parse_decimal_odds(token)
+                for token in odds_tokens
+                if _parse_decimal_odds(token) is not None
+            ]
+            if len(decimals) < 2:
+                continue
+
+            text_no_odds = re.sub(r"[+-]?\d+(?:\.\d+)?", " ", cleaned)
+            text_no_odds = re.sub(r"\s+", " ", text_no_odds).strip(" -–@")
+
+            splitters = [
+                r"\s+-\s+",
+                r"\s+–\s+",
+                r"\s+@\s+",
+                r"\s+vs\.?\s+",
+                r"\s+v\.?\s+",
+                r"\s+at\s+",
+            ]
+            parts: Optional[Sequence[str]] = None
+            for splitter in splitters:
+                candidate_parts = re.split(splitter, text_no_odds, maxsplit=1, flags=re.IGNORECASE)
+                if len(candidate_parts) == 2:
+                    parts = candidate_parts
+                    break
+
+            if parts is None:
+                spaced = re.split(r"\s{2,}", text_no_odds)
+                if len(spaced) == 2:
+                    parts = spaced
+
+            if parts is None:
+                tokens = text_no_odds.split(" ")
+                if len(tokens) >= 4:
+                    mid = len(tokens) // 2
+                    parts = [" ".join(tokens[:mid]), " ".join(tokens[mid:])]
+
+            if parts is None:
+                continue
+
+            home_team = normalize_team_abbr(parts[0].strip(" -–@"))
+            away_team = normalize_team_abbr(parts[1].strip(" -–@"))
+            if not home_team or not away_team:
+                continue
+
+            home_decimal = decimals[0]
+            away_decimal = decimals[1] if len(decimals) > 1 else None
+
+            rows.append(
+                {
+                    "season": season_label,
+                    "week": np.nan,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_closing_moneyline": _decimal_to_american(home_decimal),
+                    "away_closing_moneyline": _decimal_to_american(away_decimal),
+                    "closing_bookmaker": "OddsPortal",
+                    "closing_line_time": None,
+                    "kickoff_utc": None,
+                    "kickoff_date": "",
+                    "kickoff_weekday": "",
+                    "home_score": np.nan,
+                    "away_score": np.nan,
+                }
+            )
+
+        if rows:
+            logging.info(
+                "Text-line fallback extracted %d closing-odds rows from %s", len(rows), source
+            )
+            return pd.DataFrame(rows)
+
+        return pd.DataFrame()
 
     def _debug_capture_failure(self, slug: str, html: str, *, source_url: str) -> None:
         if not html:
