@@ -2327,6 +2327,22 @@ class OddsPortalFetcher:
         path = self._manual_csv_path
         try:
             if not path.exists():
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(
+                        "# Fill in closing odds when OddsPortal pages are empty\n"
+                        "# season,home_team,away_team,home_closing_moneyline,away_closing_moneyline,kickoff_date\n",
+                        encoding="utf-8",
+                    )
+                    logging.warning(
+                        "Created manual OddsPortal CSV template at %s; populate it with closing odds or "
+                        "set NFL_ODDSPORTAL_MANUAL_CSV to your file",
+                        path,
+                    )
+                except Exception:
+                    logging.exception(
+                        "Failed to create manual OddsPortal CSV template at %s", path
+                    )
                 return pd.DataFrame()
             frame = pd.read_csv(path)
         except Exception:
@@ -2346,6 +2362,14 @@ class OddsPortalFetcher:
                 "Manual OddsPortal CSV %s is missing required columns: %s",
                 path,
                 ", ".join(sorted(missing)),
+            )
+            return pd.DataFrame()
+
+        if frame.empty:
+            logging.warning(
+                "Manual OddsPortal CSV %s is empty; add rows for season=%s to load closing odds",
+                path,
+                season_label,
             )
             return pd.DataFrame()
 
