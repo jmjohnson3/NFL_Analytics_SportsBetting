@@ -4142,6 +4142,7 @@ class ClosingOddsArchiveSyncer:
             return
 
         seasons = [str(season) for season in self.config.seasons]
+        closing_history_path = self.config.closing_odds_history_path
         for provider in providers:
             fetcher: Optional[OddsPortalFetcher | KillerSportsFetcher]
             provider_name: str
@@ -4207,7 +4208,7 @@ class ClosingOddsArchiveSyncer:
                 local_provider = False
                 archive = fetcher.fetch(seasons)
 
-            if archive.empty and provider_name == "OddsPortal":
+            if archive.empty and provider_name == "OddsPortal" and closing_history_path:
                 local_path_exists = Path(closing_history_path).exists()
                 if local_path_exists:
                     logging.warning(
