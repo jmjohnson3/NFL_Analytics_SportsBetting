@@ -171,6 +171,17 @@ evaluation you intend to trust for live betting decisions.
 - If odds fetches return zero rows, the driver now emits a warning reminding
   you to enable one of the options above.
 
+### Troubleshooting OddsPortal scraping
+
+- OddsPortal often serves bot-protection or cookie walls that strip results from
+  the HTML. When the logs show `bot-protection` or "no rows" warnings, open the
+  page in a real browser, save the HTML, and point `NFL_ODDSPORTAL_HTML_OVERRIDE`
+  (or `_DIR`) at the file so parsing can proceed.
+- To avoid the block in the first place, reuse a browser-like `User-Agent`,
+  `Accept-Language`, and any session cookies that appear in your working
+  browser session; pass them via environment variables or the existing
+  configuration hooks in `NFL_SPORTSBETTING.py`.
+
 ## Play-by-play simulation vs. current scope
 
 This repo does **not** attempt to forecast every snap in sequence. The models are

@@ -1721,24 +1721,7 @@ class OddsPortalFetcher:
         if response.status_code == HTTPStatus.OK:
             text = response.text or ""
             if text.strip():
-                lower_text = text.lower()
-                if not self._bot_wall_notice_logged and any(
-                    token in lower_text
-                    for token in (
-                        "enable javascript",
-                        "browser is checking",
-                        "access denied",
-                        "captcha",
-                        "waiting room",
-                        "bot protection",
-                    )
-                ):
-                    logging.warning(
-                        "OddsPortal responded with a bot-protection page for %s. "
-                        "Supply a browser-saved HTML file via NFL_ODDSPORTAL_HTML_OVERRIDE or update your session headers.",
-                        url,
-                    )
-                    self._bot_wall_notice_logged = True
+                self._detect_bot_wall(text, url=url)
                 if insecure and not self._insecure_success_logged:
                     logging.warning(
                         "OddsPortal request for %s succeeded only after disabling certificate "
@@ -1759,6 +1742,39 @@ class OddsPortalFetcher:
             "OddsPortal request for %s returned status %s", url, response.status_code
         )
         return None
+
+    def _detect_bot_wall(self, html: str, *, url: str) -> None:
+        """Detect and log common bot-protection responses returned by OddsPortal."""
+
+        if self._bot_wall_notice_logged:
+            return
+
+        lower_text = html.lower()
+        bot_tokens = (
+            "enable javascript",
+            "browser is checking",
+            "access denied",
+            "captcha",
+            "waiting room",
+            "bot protection",
+            "pardon the interruption",
+            "unusual traffic",
+            "verify you are human",
+            "please enable cookies",
+            "datadome",
+            "cloudflare",
+            "ddos-guard",
+        )
+
+        if any(token in lower_text for token in bot_tokens):
+            logging.warning(
+                "OddsPortal responded with content that looks like bot-protection for %s. "
+                "Fetch the page in a browser and set NFL_ODDSPORTAL_HTML_OVERRIDE to the saved HTML, "
+                "or adjust your headers/cookies (User-Agent, Accept-Language, session cookies) to mimic a browser.",
+                url,
+            )
+            self._bot_wall_notice_logged = True
+            return
 
     def _extract_json_score(self, entry: Dict[str, Any]) -> Optional[float]:
         values: List[float] = []
@@ -1825,6 +1841,7 @@ class OddsPortalFetcher:
             return pd.DataFrame()
 
         soup = BeautifulSoup(html, "html.parser")
+        self._detect_bot_wall(html, url=urljoin(self.base_url, slug))
         table = soup.find(class_=re.compile(r"\btable-main\b"))
         if table is None:
             table = soup.find(id=re.compile("tournamentTable", re.IGNORECASE))
