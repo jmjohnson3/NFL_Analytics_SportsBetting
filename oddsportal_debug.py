@@ -65,6 +65,26 @@ def _analyze_html(html: str) -> dict:
     }
 
 
+def _looks_like_oddsportal(html: str) -> tuple[bool, str]:
+    """Heuristically determine whether the HTML came from OddsPortal."""
+
+    if "oddsportal" not in html.lower():
+        return False, "HTML does not mention 'oddsportal'; did you save the page source?"
+
+    if BeautifulSoup is None:
+        return True, "Skipped deep detection because BeautifulSoup is unavailable"
+
+    soup = BeautifulSoup(html, "html.parser")
+    canonical = soup.find("link", rel="canonical")
+    og_site_name = soup.find("meta", property="og:site_name")
+    if canonical and "oddsportal.com" in (canonical.get("href") or ""):
+        return True, "Canonical link is OddsPortal"
+    if og_site_name and "oddsportal" in (og_site_name.get("content") or "").lower():
+        return True, "OpenGraph site name is OddsPortal"
+
+    return False, "Could not find canonical/OG markers for OddsPortal"
+
+
 def _load_html(fetcher: Any, slug: str, html_file: Optional[Path]) -> tuple[str | None, str]:
     """Return HTML for a slug, preferring a local file when provided."""
 
@@ -85,6 +105,13 @@ def inspect_slug(fetcher: Any, slug: str, season: str, html_file: Optional[Path]
 
     logging.info("Loaded %d bytes from %s", len(html.encode("utf-8")), source)
 
+    looks_like_ops, ops_reason = _looks_like_oddsportal(html)
+    if not looks_like_ops:
+        logging.warning(
+            "Input HTML does not look like an OddsPortal results page (%s). If you passed --html-file, make sure it is a saved OddsPortal page source.",
+            ops_reason,
+        )
+
     # Surface bot-wall signals immediately.
     fetcher._detect_bot_wall(html, url=source)
 
@@ -97,6 +124,11 @@ def inspect_slug(fetcher: Any, slug: str, season: str, html_file: Optional[Path]
         signals["participant_nodes"],
         signals["next_data_scripts"],
     )
+
+    if not any(signals.values()):
+        logging.warning(
+            "No OddsPortal markers were detected in the HTML. This usually means the page is a bot wall, an unrelated HTML file, or that OddsPortal changed markup.",
+        )
 
     try:
         frame = fetcher._parse_results_page(html, season, slug)

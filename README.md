@@ -300,6 +300,10 @@ python oddsportal_debug.py --season 2024-regular --log-level DEBUG
 
 The script disables HTML overrides by default so you can confirm whether live
 requests are being blocked or whether the parser is failing on returned HTML.
+If you pass `--html-file`, make sure the file is a saved OddsPortal **page
+source** (e.g., right-click → View Page Source → Save) rather than a rendered
+screenshot or unrelated text file; the helper now logs a warning when the HTML
+does not look like an OddsPortal page.
 
 Example shell snippet for the default OddsPortal sync:
 
