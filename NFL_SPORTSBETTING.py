@@ -33,7 +33,7 @@ import time
 import textwrap
 import unicodedata
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from types import SimpleNamespace
 from dataclasses import dataclass
 from pathlib import Path
@@ -135,8 +135,8 @@ def _default_data_file(name: str) -> Optional[str]:
     return None
 
 
-DEFAULT_CLOSING_ODDS_PATH = _default_data_file("closing_odds_history.csv")
-DEFAULT_TRAVEL_CONTEXT_PATH = _default_data_file("team_travel_context.csv")
+DEFAULT_CLOSING_ODDS_PATH: Optional[str] = None
+DEFAULT_TRAVEL_CONTEXT_PATH: Optional[str] = None
 # Coverage data can come from an API or scraped HTML; local CSVs are optional
 DEFAULT_COVERAGE_ADJUSTMENTS_PATH = None
 DEFAULT_TEAM_COVERAGE_PATH = None
@@ -328,20 +328,15 @@ def load_player_coverage_adjustments(
                 return adjustments
 
     if path:
-        candidate = Path(path)
-        if candidate.exists():
-            try:
-                frame = pd.read_csv(candidate)
-                adjustments = _parse_coverage_adjustment_frame(frame)
-                if adjustments:
-                    logging.info(
-                        "Loaded coverage adjustments for %d players from %s",
-                        len(adjustments),
-                        candidate,
-                    )
-                return adjustments
-            except Exception:
-                logging.exception("Failed to read coverage adjustments from %s", candidate)
+        logging.info(
+            "Ignoring local coverage adjustment file %s; configure an API or scrape source instead.",
+            path,
+        )
+    logging.info(
+        "No player coverage adjustments loaded; sources api=%s scrape=%s csv=disabled",
+        api_url or "unset",
+        scrape_url or "unset",
+    )
     return {}
 
 
@@ -378,20 +373,15 @@ def load_team_coverage_profiles(
                 return profiles
 
     if path:
-        candidate = Path(path)
-        if candidate.exists():
-            try:
-                frame = pd.read_csv(candidate)
-                profiles = _parse_team_coverage_frame(frame)
-                if profiles:
-                    logging.info(
-                        "Loaded coverage scheme for %d teams from %s",
-                        len(profiles),
-                        candidate,
-                    )
-                return profiles
-            except Exception:
-                logging.exception("Failed to read team coverage profiles from %s", candidate)
+        logging.info(
+            "Ignoring local team coverage file %s; configure an API or scrape source instead.",
+            path,
+        )
+    logging.info(
+        "No team coverage schemes loaded; sources api=%s scrape=%s csv=disabled",
+        api_url or "unset",
+        scrape_url or "unset",
+    )
     return {}
 
 
@@ -1221,46 +1211,10 @@ class LocalClosingOddsFetcher:
         self.csv_path = Path(csv_path).expanduser() if csv_path else None
 
     def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
-        if not self.csv_path:
-            logging.warning(
-                "Local closing odds path not configured; set NFL_CLOSING_ODDS_PATH to a CSV file"
-            )
-            return pd.DataFrame()
-
-        try:
-            if not self.csv_path.exists():
-                logging.warning("Local closing odds file %s not found", self.csv_path)
-                return pd.DataFrame()
-        except OSError:
-            logging.exception(
-                "Unable to access local closing odds file at %s", self.csv_path
-            )
-            return pd.DataFrame()
-
-        try:
-            raw = pd.read_csv(self.csv_path)
-        except Exception:
-            logging.exception(
-                "Failed to read closing odds CSV from %s", self.csv_path
-            )
-            return pd.DataFrame()
-
-        normalized = _standardize_closing_odds_frame(raw, "Local CSV")
-        if normalized.empty:
-            logging.warning(
-                "Local closing odds file %s did not produce any usable rows", self.csv_path
-            )
-            return normalized
-
-        normalized = normalized.copy()
-        normalized["season"] = normalized["season"].astype(str)
-        if seasons:
-            wanted = {str(season) for season in seasons}
-            normalized = normalized[normalized["season"].isin(wanted)]
-        if "week" in normalized.columns:
-            normalized["week"] = pd.to_numeric(normalized["week"], errors="coerce")
-
-        return normalized.reset_index(drop=True)
+        logging.info(
+            "Local closing odds CSVs are no longer supported. Configure NFL_CLOSING_ODDS_PROVIDER to an API or scrape source."
+        )
+        return pd.DataFrame()
 
 
 class OddsPortalFetcher:
@@ -4174,37 +4128,29 @@ class ClosingOddsArchiveSyncer:
             self.session.verify = certifi.where()
 
     def sync(self) -> None:
-        provider = (self.config.closing_odds_provider or "").strip().lower()
-        if not provider:
-            provider = "oddsportal"
-        if provider in {"none", "off", "disable", "disabled"}:
+        providers_raw = (self.config.closing_odds_provider or "").strip() or "oddsportal"
+        providers = [p.strip().lower() for p in providers_raw.split(",") if p.strip()]
+
+        if not providers:
+            providers = ["oddsportal"]
+
+        if providers[0] in {"none", "off", "disable", "disabled"}:
             logging.info(
                 "Closing odds archive sync disabled via NFL_CLOSING_ODDS_PROVIDER=%s",
-                provider,
+                providers_raw,
             )
             return
 
-        try:
-            seasons = [str(season) for season in self.config.seasons]
-
-            local_provider = False
-            closing_history_path = (
-                self.config.closing_odds_history_path or "data/closing_odds_history.csv"
-            )
-
-            killersports_base_url = (self.config.killersports_base_url or "").strip()
-
-            if provider in {"killersports", "ks"} and not killersports_base_url:
-                logging.warning(
-                    "KillerSports provider selected but KILLERSPORTS_BASE_URL is unset; "
-                    "falling back to OddsPortal for closing odds.",
-                )
-                provider = "oddsportal"
+        seasons = [str(season) for season in self.config.seasons]
+        for provider in providers:
+            fetcher: Optional[OddsPortalFetcher | KillerSportsFetcher]
+            provider_name: str
 
             if provider in {"local", "csv", "file", "history", "offline"}:
-                fetcher = LocalClosingOddsFetcher(closing_history_path)
-                provider_name = "Local CSV"
-                local_provider = True
+                logging.warning(
+                    "Local CSV closing odds are no longer supported. Switch NFL_CLOSING_ODDS_PROVIDER to oddsportal or killersports."
+                )
+                continue
             elif provider in {"oddsportal", "odds-portal", "op"}:
                 fetcher = OddsPortalFetcher(
                     self.session,
@@ -4216,6 +4162,15 @@ class ClosingOddsArchiveSyncer:
                 )
                 provider_name = "OddsPortal"
             elif provider in {"killersports", "ks"}:
+                if not (
+                    self.config.killersports_api_key
+                    or self.config.killersports_username
+                    or self.config.killersports_password
+                ):
+                    logging.warning(
+                        "Skipping KillerSports fallback because credentials are not configured (set NFL_KILLERSPORTS_API_KEY or username/password)."
+                    )
+                    continue
                 fetcher = KillerSportsFetcher(
                     self.session,
                     base_url=killersports_base_url,
@@ -4227,8 +4182,13 @@ class ClosingOddsArchiveSyncer:
                 provider_name = "KillerSports"
             else:
                 logging.warning("Unknown closing odds provider '%s'", provider)
-                return
+                continue
 
+            logging.info(
+                "Closing odds provider selected: %s (seasons=%s)",
+                provider_name,
+                ", ".join(seasons),
+            )
             archive = fetcher.fetch(seasons)
 
             if archive.empty and provider_name == "KillerSports":
@@ -4259,12 +4219,18 @@ class ClosingOddsArchiveSyncer:
                     archive = fetcher.fetch(seasons)
             if archive.empty:
                 logging.warning(
-                    "%s did not return any closing odds for seasons %s",
+                    "%s did not return any closing odds for seasons %s; trying next provider if available",
                     provider_name,
                     ", ".join(seasons),
                 )
-                return
+                continue
 
+            logging.info(
+                "Closing odds provider %s returned %d rows; normalizing and merging",
+                provider_name,
+                len(archive),
+            )
+            before_coverage = self._closing_coverage_snapshot()
             archive = self._attach_game_ids(archive)
             archive = self._finalize_probabilities(archive)
             updated_rows = self._apply_closing_odds_to_database(archive)
@@ -4274,19 +4240,44 @@ class ClosingOddsArchiveSyncer:
                     updated_rows,
                     provider_name,
                 )
-            elif local_provider:
-                logging.warning(
-                    "Local closing odds data did not match any scheduled games. Verify season/week alignment in %s.",
-                    self.config.closing_odds_history_path,
-                )
-            if local_provider:
+            after_coverage = self._closing_coverage_snapshot()
+            if before_coverage and after_coverage:
                 logging.info(
-                    "Loaded %d closing odds rows from %s", len(archive), self.config.closing_odds_history_path
+                    "Closing odds coverage improved from %.1f%% (%d/%d) to %.1f%% (%d/%d)",
+                    before_coverage["percent"],
+                    before_coverage["covered"],
+                    before_coverage["total"],
+                    after_coverage["percent"],
+                    after_coverage["covered"],
+                    after_coverage["total"],
                 )
-            else:
-                self._write_history(provider_name, archive)
-        finally:
-            self.session.close()
+            self._write_history(provider_name, archive)
+            return
+
+        logging.warning(
+            "Closing odds providers %s did not return any rows; no closing lines were applied.",
+            providers_raw,
+        )
+
+    def _closing_coverage_snapshot(self) -> Optional[Dict[str, int]]:
+        try:
+            games = pd.read_sql_table(
+                "nfl_games",
+                self.db.engine,
+                columns=["game_id", "home_closing_moneyline", "away_closing_moneyline"],
+            )
+        except Exception:
+            logging.debug("Unable to compute closing odds coverage snapshot")
+            return None
+
+        if games.empty:
+            return {"total": 0, "covered": 0, "percent": 0.0}
+
+        mask = games[["home_closing_moneyline", "away_closing_moneyline"]].notna().any(axis=1)
+        covered = int(mask.sum())
+        total = int(len(games))
+        percent = 100.0 * covered / total if total else 0.0
+        return {"total": total, "covered": covered, "percent": round(percent, 1)}
 
     def _attach_game_ids(self, archive: pd.DataFrame) -> pd.DataFrame:
         try:
@@ -4473,62 +4464,10 @@ class ClosingOddsArchiveSyncer:
         return updated_count
 
     def _write_history(self, provider_name: str, archive: pd.DataFrame) -> None:
-        dest_path = self._history_path()
-        try:
-            existing = pd.read_csv(dest_path)
-        except FileNotFoundError:
-            existing = pd.DataFrame()
-        except Exception:
-            logging.warning("Unable to read existing closing odds history at %s", dest_path)
-            existing = pd.DataFrame()
-
-        combined = safe_concat([existing, archive], ignore_index=True)
-        if combined.empty:
-            logging.warning("No closing odds data available to write after combining frames")
-            return
-
-        for team_col in ("home_team", "away_team"):
-            if team_col in combined.columns:
-                combined[team_col] = combined[team_col].apply(normalize_team_abbr)
-        if "closing_line_time" in combined.columns:
-            combined["closing_line_time"] = pd.to_datetime(
-                combined["closing_line_time"], errors="coerce", utc=True
-            )
-            combined["closing_line_time"] = combined["closing_line_time"].dt.strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            )
-            combined["closing_line_time"] = combined["closing_line_time"].replace(
-                "NaT", ""
-            )
-
-        key_columns = [
-            col
-            for col in ["game_id", "season", "week", "home_team", "away_team"]
-            if col in combined.columns
-        ]
-        if key_columns:
-            combined = combined.drop_duplicates(subset=key_columns, keep="last")
-
-        combined = combined.sort_values(
-            [col for col in ("season", "week", "home_team", "away_team") if col in combined.columns]
-        )
-
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        combined.to_csv(dest_path, index=False)
         logging.info(
-            "Wrote %d rows of closing odds to %s using provider %s",
-            len(combined),
-            dest_path,
+            "Skipping CSV history write for provider %s; closing odds are persisted directly to the database.",
             provider_name,
         )
-
-    def _history_path(self) -> Path:
-        if self.config.closing_odds_history_path:
-            return Path(self.config.closing_odds_history_path)
-        default_path = SCRIPT_ROOT / "data" / "closing_odds_history.csv"
-        default_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config.closing_odds_history_path = str(default_path)
-        return default_path
 
 
 def compute_rmse(y_true: Union[pd.Series, np.ndarray], y_pred: Union[pd.Series, np.ndarray]) -> float:
@@ -7795,8 +7734,16 @@ class SupplementalDataLoader:
         self.depth_chart_records = self._load_records(config.depth_chart_path)
         self.advanced_records = self._load_records(config.advanced_metrics_path)
         self.weather_records = self._load_records(config.weather_forecast_path)
-        self.closing_odds_records = self._load_records(config.closing_odds_history_path)
         self.travel_context_records = self._load_records(config.rest_travel_context_path)
+
+        # Historical closing odds must come from a verified API/scrape or the database;
+        # ignore any legacy CSV paths to prevent stale data from being ingested.
+        if config.closing_odds_history_path:
+            logging.info(
+                "Ignoring local closing odds history file %s; use a live provider instead.",
+                config.closing_odds_history_path,
+            )
+        self.closing_odds_records: List[Dict[str, Any]] = []
 
         self.injuries_by_game = self._index_records(self.injury_records, "game_id")
         self.injuries_by_team = self._index_records(self.injury_records, "team")
@@ -7835,8 +7782,12 @@ class SupplementalDataLoader:
                     return [dict(item) for item in payload]
                 logging.warning("Unsupported JSON format in %s", file_path)
                 return []
-            frame = pd.read_csv(file_path)
-            return frame.to_dict("records")
+
+            logging.info(
+                "Ignoring supplemental file %s (unsupported extension); rely on database/API sources instead.",
+                file_path,
+            )
+            return []
         except Exception:  # pragma: no cover - defensive logging
             logging.exception("Unable to load supplemental data from %s", file_path)
             return []
@@ -8380,7 +8331,22 @@ class NFLConfig:
     player_history_cap_headroom: float = float(
         os.getenv("NFL_PLAYER_HISTORY_CAP_HEADROOM", str(PLAYER_HISTORY_CAP_HEADROOM))
     )
-    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER") or "local"
+    _ks_api_key_env: Optional[str] = os.getenv("KILLERSPORTS_API_KEY") or os.getenv(
+        "NFL_KILLERSPORTS_API_KEY"
+    )
+    _ks_username_env: Optional[str] = os.getenv("KILLERSPORTS_USERNAME") or os.getenv(
+        "NFL_KILLERSPORTS_USERNAME"
+    )
+    _ks_password_env: Optional[str] = os.getenv("KILLERSPORTS_PASSWORD") or os.getenv(
+        "NFL_KILLERSPORTS_PASSWORD"
+    )
+    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER")
+    if not closing_odds_provider:
+        closing_odds_provider = (
+            "oddsportal,killersports"
+            if _ks_api_key_env or (_ks_username_env and _ks_password_env)
+            else "oddsportal"
+        )
     closing_odds_timeout: int = int(os.getenv("NFL_CLOSING_ODDS_TIMEOUT", "45"))
     closing_odds_download_dir: Optional[str] = os.getenv("NFL_CLOSING_ODDS_DOWNLOAD_DIR")
     oddsportal_base_url: str = os.getenv(
@@ -8404,9 +8370,9 @@ class NFLConfig:
         if ua.strip()
     )
     killersports_base_url: Optional[str] = os.getenv("KILLERSPORTS_BASE_URL")
-    killersports_api_key: Optional[str] = os.getenv("KILLERSPORTS_API_KEY")
-    killersports_username: Optional[str] = os.getenv("KILLERSPORTS_USERNAME")
-    killersports_password: Optional[str] = os.getenv("KILLERSPORTS_PASSWORD")
+    killersports_api_key: Optional[str] = _ks_api_key_env
+    killersports_username: Optional[str] = _ks_username_env
+    killersports_password: Optional[str] = _ks_password_env
 
     @property
     def pg_url(self) -> str:
@@ -8890,6 +8856,133 @@ class NFLDatabase:
         with self.engine.begin() as conn:
             rows = conn.execute(select(self.player_stats.c.game_id).distinct()).fetchall()
         return {row[0] for row in rows}
+
+    def sample_player_stats(self, limit: int = 5) -> pd.DataFrame:
+        """Return a small sample of recently ingested player stats for logging."""
+
+        columns = [
+            self.player_stats.c.game_id,
+            self.player_stats.c.player_name,
+            self.player_stats.c.team,
+            self.player_stats.c.position,
+            self.player_stats.c.passing_yards,
+            self.player_stats.c.rushing_yards,
+            self.player_stats.c.receiving_yards,
+            self.player_stats.c.receptions,
+        ]
+        with self.engine.begin() as conn:
+            rows = (
+                conn.execute(
+                    select(*columns)
+                    .order_by(self.player_stats.c.ingested_at.desc())
+                    .limit(limit)
+                )
+                .fetchall()
+            )
+
+        return pd.DataFrame(
+            rows,
+            columns=[
+                "game_id",
+                "player_name",
+                "team",
+                "position",
+                "passing_yards",
+                "rushing_yards",
+                "receiving_yards",
+                "receptions",
+            ],
+        )
+
+    def sample_game_odds(self, seasons: Iterable[str], limit: int = 5) -> pd.DataFrame:
+        """Return a handful of games with the latest odds/score context."""
+
+        season_list = [str(season) for season in seasons if season is not None]
+        if not season_list:
+            return pd.DataFrame()
+
+        columns = [
+            self.games.c.season,
+            self.games.c.week,
+            self.games.c.start_time,
+            self.games.c.away_team,
+            self.games.c.home_team,
+            self.games.c.away_score,
+            self.games.c.home_score,
+            self.games.c.away_moneyline,
+            self.games.c.home_moneyline,
+            self.games.c.away_closing_moneyline,
+            self.games.c.home_closing_moneyline,
+            self.games.c.closing_bookmaker,
+        ]
+
+        with self.engine.begin() as conn:
+            rows = (
+                conn.execute(
+                    select(*columns)
+                    .where(self.games.c.season.in_(season_list))
+                    .order_by(self.games.c.start_time.desc())
+                    .limit(limit)
+                )
+                .fetchall()
+            )
+
+        frame = pd.DataFrame(
+            rows,
+            columns=[
+                "season",
+                "week",
+                "start_time",
+                "away_team",
+                "home_team",
+                "away_score",
+                "home_score",
+                "away_moneyline",
+                "home_moneyline",
+                "away_closing_moneyline",
+                "home_closing_moneyline",
+                "closing_bookmaker",
+            ],
+        )
+        if not frame.empty:
+            frame["start_time"] = pd.to_datetime(frame["start_time"], errors="coerce")
+        return frame
+
+    def sample_team_advanced_metrics(self, limit: int = 5) -> pd.DataFrame:
+        """Return a few rows of team advanced metrics to validate defensive inputs."""
+
+        columns = [
+            self.team_advanced_metrics.c.season,
+            self.team_advanced_metrics.c.week,
+            self.team_advanced_metrics.c.team,
+            self.team_advanced_metrics.c.offense_yards_per_play,
+            self.team_advanced_metrics.c.defense_yards_per_play,
+            self.team_advanced_metrics.c.pass_rate,
+            self.team_advanced_metrics.c.rush_rate,
+        ]
+
+        with self.engine.begin() as conn:
+            rows = (
+                conn.execute(
+                    select(*columns)
+                    .order_by(self.team_advanced_metrics.c.season.desc(), self.team_advanced_metrics.c.week.desc())
+                    .limit(limit)
+                )
+                .fetchall()
+            )
+
+        return pd.DataFrame(
+            rows,
+            columns=[
+                "season",
+                "week",
+                "team",
+                "offense_yards_per_play",
+                "defense_yards_per_play",
+                "pass_rate",
+                "rush_rate",
+            ],
+        )
 
     def fetch_existing_advanced_metric_keys(self) -> Set[Tuple[str, int, str]]:
         with self.engine.begin() as conn:
@@ -10095,15 +10188,9 @@ class NFLIngestor:
             return
 
         provider_hint = (self.config.closing_odds_provider or "").strip().lower()
-        closing_history_path = Path(
-            self.config.closing_odds_history_path
-            or Path.cwd() / "data" / "closing_odds_history.csv"
-        )
-        if provider_hint in {"none", "off", "disable", "disabled", "local", "csv", "file", "history", "offline", ""} and not closing_history_path.exists():
+        if provider_hint in {"none", "off", "disable", "disabled", "local", "csv", "file", "history", "offline", ""}:
             logging.warning(
-                "Closing odds provider is disabled and no local history file was found at %s. "
-                "Enable NFL_CLOSING_ODDS_PROVIDER=oddsportal or supply a CSV before rerunning odds ingestion.",
-                closing_history_path,
+                "Closing odds provider is disabled. Set NFL_CLOSING_ODDS_PROVIDER to oddsportal or killersports to download verified lines."
             )
             return
 
@@ -10212,11 +10299,9 @@ class NFLIngestor:
             include_historical=True,
         )
         if not odds_data:
-            if provider_hint in {"none", "off", "disable", "disabled", "local", "csv", "file", "history", "offline", ""}:
-                logging.warning(
-                    "No sportsbook odds were returned. Enable NFL_CLOSING_ODDS_PROVIDER=oddsportal or populate %s with verified closes.",
-                    self.config.closing_odds_history_path or "data/closing_odds_history.csv",
-                )
+            logging.warning(
+                "No sportsbook odds were returned. Enable NFL_CLOSING_ODDS_PROVIDER=oddsportal or killersports to keep odds current."
+            )
         logging.info("Fetched %d odds entries", len(odds_data))
 
         historical_rows = [
@@ -20109,6 +20194,41 @@ def predict_upcoming_games(
             config.coverage_api_key,
             config.coverage_scrape_team_url,
         )
+        logging.info(
+            "Coverage inputs loaded | player adjustments=%d | team schemes=%d",
+            len(coverage_adjustments),
+            len(team_coverage_profiles),
+        )
+        if team_coverage_profiles:
+            scheme_mix = Counter(team_coverage_profiles.values())
+            logging.info(
+                "Defensive coverage mix -> %s",
+                ", ".join(f"{scheme}={count}" for scheme, count in scheme_mix.most_common()),
+            )
+        else:
+            logging.info(
+                "Defensive coverage unavailable; configure NFL_TEAM_COVERAGE_API_URL or NFL_TEAM_COVERAGE_SCRAPE_URL to supply schemes."
+            )
+        if coverage_adjustments:
+            preview = list(coverage_adjustments.items())[:3]
+            logging.info(
+                "Sample coverage adjustments (up to 3): %s",
+                "; ".join(
+                    f"{player}: {', '.join(f'{k}={v:+.2f}' for k, v in sorted(adjs.items()))}"
+                    for player, adjs in preview
+                ),
+            )
+        else:
+            logging.info("No player coverage adjustments were loaded; predictions will be unadjusted.")
+
+        if team_coverage_profiles:
+            preview_profiles = list(team_coverage_profiles.items())[:5]
+            logging.info(
+                "Sample team coverage schemes (up to 5): %s",
+                ", ".join(f"{team} -> {scheme}" for team, scheme in preview_profiles),
+            )
+        else:
+            logging.info("No team coverage schemes were loaded; default coverage assumptions will be used.")
 
         def _apply_coverage(table: pd.DataFrame) -> pd.DataFrame:
             return apply_coverage_adjustments(
@@ -20802,25 +20922,6 @@ def paper_trade_recent_slates(
 
     ledger_path = Path("paper_trades.csv")
     combined_df = trades_df.copy()
-    if ledger_path.exists():
-        try:
-            existing = pd.read_csv(ledger_path)
-        except Exception:
-            logging.warning("Paper trading: unable to read existing ledger at %s; recreating it.", ledger_path)
-        else:
-            if not existing.empty:
-                if "start_time" in existing.columns:
-                    existing["start_time"] = pd.to_datetime(existing["start_time"], errors="coerce")
-                combined_df = safe_concat([existing, trades_df], ignore_index=True, sort=False)
-                dedupe_keys = ["game_id", "team_side"]
-                if "start_time" in combined_df.columns:
-                    dedupe_keys.append("start_time")
-                dedupe_keys = [col for col in dedupe_keys if col in combined_df.columns]
-                if dedupe_keys:
-                    combined_df = (
-                        combined_df.sort_values("start_time")
-                        .drop_duplicates(subset=dedupe_keys, keep="last")
-                    )
 
     combined_df.to_csv(ledger_path, index=False)
     logging.info(
@@ -20955,6 +21056,49 @@ def apply_runtime_config_overrides(config: NFLConfig) -> None:
     )
 
 
+def log_observability_samples(db: NFLDatabase, seasons: Sequence[str]) -> None:
+    """Print concise snapshots of ingested data to the console."""
+
+    try:
+        stats_sample = db.sample_player_stats(limit=5)
+        if stats_sample.empty:
+            logging.info("Player stats sample is empty; ingestion may not have loaded player box scores yet.")
+        else:
+            logging.info(
+                "Recent player stats (top %d rows):\n%s",
+                len(stats_sample),
+                stats_sample.to_string(index=False),
+            )
+    except Exception:
+        logging.exception("Unable to sample player stats for observability")
+
+    try:
+        odds_sample = db.sample_game_odds(seasons, limit=5)
+        if odds_sample.empty:
+            logging.info("No game odds rows available to sample for seasons %s", list(seasons))
+        else:
+            logging.info(
+                "Recent game odds and scores (top %d rows):\n%s",
+                len(odds_sample),
+                odds_sample.to_string(index=False),
+            )
+    except Exception:
+        logging.exception("Unable to sample odds for observability")
+
+    try:
+        defensive_sample = db.sample_team_advanced_metrics(limit=5)
+        if defensive_sample.empty:
+            logging.info("No team advanced metrics available; defensive coverage metrics may be missing.")
+        else:
+            logging.info(
+                "Recent team advanced metrics (top %d rows):\n%s",
+                len(defensive_sample),
+                defensive_sample.to_string(index=False),
+            )
+    except Exception:
+        logging.exception("Unable to sample team advanced metrics for observability")
+
+
 def main() -> None:
     # Enable HTML capture by default so empty OddsPortal responses are saved automatically
     # for troubleshooting unless the user explicitly opts out.
@@ -21046,6 +21190,9 @@ def main() -> None:
         len(post_ingest_odds),
         _closing_count(post_ingest_odds),
     )
+
+    # Emit compact, human-readable snapshots so operators can verify tables are populated.
+    log_observability_samples(db, config.seasons)
 
     trainer = ModelTrainer(engine, db, supplemental_loader)
     try:
@@ -21363,7 +21510,6 @@ def main() -> None:
             closing_gap_summary_logged = True
 
     provider_flag = (config.closing_odds_provider or "").strip().lower()
-    closing_history_path = config.closing_odds_history_path or "data/closing_odds_history.csv"
     provider_remedy_logged = False
 
     def _log_closing_provider_remedy() -> None:
@@ -21374,20 +21520,11 @@ def main() -> None:
 
         provider_remedy_logged = True
 
-        if provider_flag in {"none", "off", "disable", "disabled"}:
+        if provider_flag in {"none", "off", "disable", "disabled", "local", "csv", "file", "history", "offline", ""}:
             logging.warning(
-                "Closing odds provider is disabled (NFL_CLOSING_ODDS_PROVIDER=%s). Set it to 'oddsportal' to auto-download verified closing lines or populate %s manually.",
+                "Closing odds provider is disabled (NFL_CLOSING_ODDS_PROVIDER=%s). Set it to 'oddsportal' or 'killersports' to auto-download verified closing lines.",
                 provider_flag or "off",
-                closing_history_path,
             )
-        elif provider_flag in {"local", "csv", "file", "history", "offline"}:
-            path_obj = Path(closing_history_path)
-            if not path_obj.exists():
-                logging.warning(
-                    "Closing odds provider is '%s' but %s does not exist. Provide a CSV with verified closers or switch NFL_CLOSING_ODDS_PROVIDER to 'oddsportal'.",
-                    provider_flag or "local",
-                    closing_history_path,
-                )
 
     if not config.enable_paper_trading and closing_coverage < CLOSING_ODDS_COVERAGE_GUARDRAIL:
         logging.warning(
