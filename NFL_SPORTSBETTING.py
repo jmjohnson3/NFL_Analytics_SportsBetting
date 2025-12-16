@@ -1274,7 +1274,6 @@ class OddsPortalFetcher:
         self._auto_debug_remaining = 0
         self._html_override_path: Optional[Path] = None
         self._override_only = env_flag("NFL_ODDSPORTAL_OVERRIDE_ONLY", False)
-        self._use_debug_overrides = env_flag("NFL_ODDSPORTAL_USE_DEBUG_OVERRIDE", False)
         debug_png_env = os.environ.get("NFL_ODDSPORTAL_DEBUG_PNG")
         self._debug_png_enabled = str(debug_png_env or "").strip().lower() in {
             "1",
@@ -1477,12 +1476,8 @@ class OddsPortalFetcher:
 
         if self._html_override_path is not None:
             search_paths.append(self._html_override_path)
-        elif self._use_debug_overrides:
-            if self._debug_dir is not None:
-                search_paths.append(self._debug_dir)
-            default_debug_dir = SCRIPT_ROOT / "reports" / "oddsportal_debug"
-            if default_debug_dir.exists():
-                search_paths.append(default_debug_dir)
+        else:
+            return []
 
         sanitized_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/"))
         html_list: List[str] = []
