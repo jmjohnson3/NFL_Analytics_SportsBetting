@@ -298,6 +298,10 @@ python oddsportal_debug.py --season 2024-regular \
 python oddsportal_debug.py --season 2024-regular --log-level DEBUG
 ```
 
+> Tip: run the helper directly as shown above. Passing `oddsportal_debug.py` as
+> an extra argument to `NFL_SPORTSBETTING.py` will be rejected because the main
+> CLI only accepts the documented pipeline flags.
+
 The script disables HTML overrides by default so you can confirm whether live
 requests are being blocked or whether the parser is failing on returned HTML.
 If you pass `--html-file`, make sure the file is a saved OddsPortal **page

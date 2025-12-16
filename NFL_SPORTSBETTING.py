@@ -21012,6 +21012,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Simulate recent slates with recorded sportsbook odds to validate ROI",
     )
+    parser.add_argument(
+        "extras",
+        nargs="*",
+        help=(
+            "Unsupported positional arguments. Run `python oddsportal_debug.py ...` directly "
+            "for OddsPortal troubleshooting instead of passing it here."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -21112,6 +21120,12 @@ def main() -> None:
     os.environ.setdefault("NFL_ODDSPORTAL_DEBUG_HTML", "1")
 
     args = parse_args()
+    if getattr(args, "extras", None):
+        logging.error(
+            "Unrecognized arguments: %s. To inspect OddsPortal slugs use `python oddsportal_debug.py --season ... --slug ...`.",
+            " ".join(args.extras),
+        )
+        sys.exit(2)
     config = load_config(args.config)
     if getattr(args, "respect_lineups", None) is not None:
         config.respect_lineups = bool(args.respect_lineups)
