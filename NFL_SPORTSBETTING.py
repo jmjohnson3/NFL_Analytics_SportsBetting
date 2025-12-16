@@ -40,7 +40,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
 
-from bs4 import BeautifulSoup
 from html import unescape
 
 import aiohttp

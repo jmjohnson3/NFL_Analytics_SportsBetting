@@ -281,6 +281,26 @@ These steps align with the guardrails already logged by the driver (e.g.,
 "Saved OddsPortal HTML snapshot to ... for slug nfl-2025/results/"), making it
 easier to triage scraping gaps without rerunning long ingestions.
 
+##### Standalone OddsPortal diagnostics script
+
+Run `python oddsportal_debug.py` to inspect a single slug without touching the
+main ingestion pipeline. The helper fetches the page (or a saved HTML file via
+`--html-file`), logs bot-wall signals, counts of odds rows/participants, and
+prints the parsed frame shape. Example invocations:
+
+```bash
+# Analyze a saved snapshot
+python oddsportal_debug.py --season 2024-regular \
+  --slug nfl-2024-regular/results/ \
+  --html-file reports/oddsportal_debug/20251216T200723Z_nfl-2024-regular-results.html
+
+# Hit OddsPortal live for all default slugs of a season
+python oddsportal_debug.py --season 2024-regular --log-level DEBUG
+```
+
+The script disables HTML overrides by default so you can confirm whether live
+requests are being blocked or whether the parser is failing on returned HTML.
+
 Example shell snippet for the default OddsPortal sync:
 
 ```bash
