@@ -30,6 +30,7 @@ import re
 import ssl
 import sys
 import time
+import textwrap
 import unicodedata
 import uuid
 from collections import defaultdict
@@ -38,6 +39,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
+
+from bs4 import BeautifulSoup
 from html import unescape
 
 import aiohttp
@@ -54,6 +57,7 @@ from requests.exceptions import (
     ConnectionError as RequestsConnectionError,
     JSONDecodeError as RequestsJSONDecodeError,
     ReadTimeout,
+    RequestException,
     SSLError,
 )
 from http import HTTPStatus
@@ -1079,14 +1083,52 @@ def _parse_decimal_odds(value: Optional[str]) -> Optional[float]:
     text = str(value).strip().replace(",", ".")
     if not text:
         return None
-    match = re.search(r"\d+(?:\.\d+)?", text)
-    if not match:
-        return None
-    try:
-        decimal = float(match.group(0))
-    except ValueError:
-        return None
-    if not math.isfinite(decimal) or decimal <= 1.0:
+
+    fraction_match = re.match(r"^([+-]?\d+)\s*/\s*(\d+)$", text)
+    if fraction_match:
+        try:
+            num = float(fraction_match.group(1))
+            den = float(fraction_match.group(2))
+            if den != 0:
+                decimal_fraction = num / den + 1.0
+            else:
+                decimal_fraction = math.nan
+        except ValueError:
+            decimal_fraction = math.nan
+        if math.isfinite(decimal_fraction) and decimal_fraction > 1.0:
+            return decimal_fraction
+
+    direct_match = re.match(r"^[+-]?\d+(?:\.\d+)?$", text)
+    decimal: Optional[float] = None
+    if direct_match:
+        raw = direct_match.group(0)
+        try:
+            number = float(raw)
+        except ValueError:
+            number = math.nan
+
+        is_signed = raw.startswith(("+", "-"))
+        has_decimal = "." in raw
+        # Treat signed integers (or large unsigned ints) as American moneylines.
+        if not has_decimal and (is_signed or abs(number) >= 20):
+            if number == 0 or not math.isfinite(number):
+                decimal = None
+            elif number < 0:
+                decimal = 1.0 + 100.0 / abs(number)
+            else:
+                decimal = 1.0 + number / 100.0
+        else:
+            decimal = number
+    else:
+        match = re.search(r"\d+(?:\.\d+)?", text)
+        if not match:
+            return None
+        try:
+            decimal = float(match.group(0))
+        except ValueError:
+            decimal = None
+
+    if decimal is None or not math.isfinite(decimal) or decimal <= 1.0:
         return None
     return decimal
 
@@ -1224,6 +1266,9 @@ class LocalClosingOddsFetcher:
 class OddsPortalFetcher:
     """Scrape historical closing odds from OddsPortal results pages."""
 
+    _ocr_dependencies_missing: bool = False
+    _ocr_dependencies_notice_logged: bool = False
+
     def __init__(
         self,
         session: requests.Session,
@@ -1235,9 +1280,13 @@ class OddsPortalFetcher:
         user_agents: Optional[Sequence[str]] = None,
     ) -> None:
         self.session = session
-        self.base_url = (base_url or "https://www.oddsportal.com/american-football/usa/").strip()
-        if not self.base_url.endswith("/"):
-            self.base_url += "/"
+        normalized_base = (base_url or "https://www.oddsportal.com/american-football/usa/").strip()
+        normalized_base = re.sub(
+            r"/nfl(?:-[^/]+)?/results/?$", "", normalized_base, flags=re.IGNORECASE
+        )
+        if not normalized_base.endswith("/"):
+            normalized_base += "/"
+        self.base_url = normalized_base
         self.results_path = results_path.strip("/") + "/" if results_path else "nfl/results/"
         self.season_path_template = season_path_template
         self.timeout = timeout
@@ -1261,6 +1310,7 @@ class OddsPortalFetcher:
         self._insecure_success_logged = False
         self._ssl_failure_logged = False
         self._insecure_adapter_installed = False
+        self._bot_wall_notice_logged = False
 
         self._debug_dump_enabled = False
         self._debug_dir: Optional[Path] = None
@@ -1268,6 +1318,29 @@ class OddsPortalFetcher:
         self._debug_capture_logged: Set[str] = set()
         self._no_rows_warned: Set[str] = set()
         self._auto_debug_remaining = 0
+        self._html_override_path: Optional[Path] = None
+        self._override_only = env_flag("NFL_ODDSPORTAL_OVERRIDE_ONLY", False)
+        debug_png_env = os.environ.get("NFL_ODDSPORTAL_DEBUG_PNG")
+        self._debug_png_enabled = str(debug_png_env or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._debug_png_notice_logged = False
+        self._ocr_enabled = env_flag("NFL_ODDSPORTAL_OCR_ENABLED", True)
+        self._ocr_disabled_notice_logged = False
+        self._ocr_dependencies_notice_logged = False
+        self._tesseract_cmd: Optional[str] = (
+            os.environ.get("NFL_ODDSPORTAL_TESSERACT_CMD")
+            or os.environ.get("TESSERACT_CMD")
+        )
+        manual_csv_env = os.environ.get("NFL_ODDSPORTAL_MANUAL_CSV")
+        self._manual_csv_path: Optional[Path] = (
+            Path(manual_csv_env).expanduser()
+            if manual_csv_env
+            else (SCRIPT_ROOT / "reports" / "oddsportal_manual_closing_odds.csv")
+        )
 
         debug_flag = os.environ.get("NFL_ODDSPORTAL_DEBUG_HTML", "")
         if str(debug_flag).strip().lower() in {"1", "true", "yes", "on", "debug"}:
@@ -1290,6 +1363,11 @@ class OddsPortalFetcher:
                     "NFL_ODDSPORTAL_DEBUG_HTML enabled; raw OddsPortal pages will be written to %s",
                     self._debug_dir,
                 )
+
+                if debug_png_env is None:
+                    # Automatically emit PNG text captures alongside HTML when debug HTML is on,
+                    # unless the user explicitly disables it via NFL_ODDSPORTAL_DEBUG_PNG.
+                    self._debug_png_enabled = True
 
         auto_debug_env = os.environ.get("NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES")
         default_auto_samples = 2
@@ -1318,6 +1396,21 @@ class OddsPortalFetcher:
                     "NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES=%d; will save the first empty OddsPortal pages to %s for triage",
                     self._auto_debug_remaining,
                     self._debug_dir,
+                )
+
+        html_override = os.environ.get("NFL_ODDSPORTAL_HTML_OVERRIDE")
+        if html_override:
+            candidate = Path(html_override).expanduser()
+            if candidate.exists():
+                self._html_override_path = candidate
+                logging.warning(
+                    "NFL_ODDSPORTAL_HTML_OVERRIDE set; will parse local HTML from %s before requesting OddsPortal",
+                    candidate,
+                )
+            else:
+                logging.warning(
+                    "NFL_ODDSPORTAL_HTML_OVERRIDE=%s does not exist; ignoring the override",
+                    html_override,
                 )
 
         if BeautifulSoup is None:
@@ -1374,12 +1467,36 @@ class OddsPortalFetcher:
 
     def _scrape_slug(self, slug: str, season_label: str) -> pd.DataFrame:
         url = urljoin(self.base_url, slug)
+
+        override_frames: List[pd.DataFrame] = []
+        override_html_list = list(self._load_override_html(slug))
+        for html in override_html_list:
+            parsed = self._parse_results_page(html, season_label, slug)
+            if not _is_effectively_empty_df(parsed):
+                override_frames.append(parsed)
+        if override_frames:
+            logging.info(
+                "Loaded OddsPortal HTML override for %s (%s) with %d frame(s)",
+                season_label,
+                slug,
+                len(override_frames),
+            )
+            return safe_concat(override_frames, ignore_index=True)
+
+        if override_html_list and self._override_only:
+            logging.warning(
+                "NFL_ODDSPORTAL_OVERRIDE_ONLY enabled; skipping live OddsPortal request for %s. "
+                "Provide complete override HTML or disable the flag to resume scraping.",
+                slug,
+            )
+            return pd.DataFrame()
+
         html = self._request(url)
         if not html:
             return pd.DataFrame()
 
         frames: List[pd.DataFrame] = []
-        parsed = self._parse_results_page(html, season_label)
+        parsed = self._parse_results_page(html, season_label, slug)
         if not _is_effectively_empty_df(parsed):
             frames.append(parsed)
         else:
@@ -1389,7 +1506,7 @@ class OddsPortalFetcher:
             page_html = self._request(page_url)
             if not page_html:
                 continue
-            chunk = self._parse_results_page(page_html, season_label)
+            chunk = self._parse_results_page(page_html, season_label, slug)
             if not _is_effectively_empty_df(chunk):
                 frames.append(chunk)
             else:
@@ -1399,6 +1516,51 @@ class OddsPortalFetcher:
         if _is_effectively_empty_df(result):
             self._debug_warn_no_rows(slug, season_label, url)
         return result
+
+    def _load_override_html(self, slug: str) -> Iterable[str]:
+        search_paths: List[Path] = []
+
+        if self._html_override_path is not None:
+            search_paths.append(self._html_override_path)
+        else:
+            if self._debug_dir is not None:
+                search_paths.append(self._debug_dir)
+            default_debug_dir = SCRIPT_ROOT / "reports" / "oddsportal_debug"
+            if default_debug_dir.exists():
+                search_paths.append(default_debug_dir)
+
+        sanitized_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/"))
+        html_list: List[str] = []
+
+        for path in search_paths:
+            if path.is_file():
+                try:
+                    html_list.append(path.read_text(encoding="utf-8", errors="ignore"))
+                except Exception:
+                    logging.exception("Failed to read NFL_ODDSPORTAL_HTML_OVERRIDE file %s", path)
+                continue
+
+            if not path.is_dir():
+                continue
+
+            for candidate in sorted(path.glob("*.html")):
+                if sanitized_slug and sanitized_slug not in candidate.stem:
+                    continue
+                try:
+                    html_list.append(candidate.read_text(encoding="utf-8", errors="ignore"))
+                except Exception:
+                    logging.exception(
+                        "Failed to read OddsPortal override HTML from %s", candidate
+                    )
+
+        if html_list:
+            logging.info(
+                "Using %d OddsPortal HTML override frame(s) for slug %s from %s",
+                len(html_list),
+                slug,
+                ", ".join(str(p) for p in search_paths),
+            )
+        return html_list
 
     def _discover_additional_pages(self, url: str, html: str) -> Iterable[str]:
         """Find paginated OddsPortal result pages linked from the provided HTML."""
@@ -1468,8 +1630,11 @@ class OddsPortalFetcher:
                 logging.error("OddsPortal SSL error for %s: %s", url, exc)
                 attempt_insecure = True
                 break
+            except RequestException as exc:
+                logging.warning("OddsPortal request error for %s: %s", url, exc)
+                response = None
             except Exception:
-                logging.exception("OddsPortal request error for %s", url)
+                logging.exception("Unexpected OddsPortal request error for %s", url)
                 response = None
 
             if response is not None:
@@ -1487,8 +1652,11 @@ class OddsPortalFetcher:
                 logging.error("OddsPortal SSL error for %s (JSON variant): %s", url, exc)
                 attempt_insecure = True
                 break
+            except RequestException as exc:
+                logging.warning("OddsPortal JSON request error for %s: %s", url, exc)
+                continue
             except Exception:
-                logging.exception("OddsPortal JSON request error for %s", url)
+                logging.exception("Unexpected OddsPortal JSON request error for %s", url)
                 continue
 
             result = self._process_oddsportal_response(response, url, insecure=False)
@@ -1603,6 +1771,24 @@ class OddsPortalFetcher:
         if response.status_code == HTTPStatus.OK:
             text = response.text or ""
             if text.strip():
+                lower_text = text.lower()
+                if not self._bot_wall_notice_logged and any(
+                    token in lower_text
+                    for token in (
+                        "enable javascript",
+                        "browser is checking",
+                        "access denied",
+                        "captcha",
+                        "waiting room",
+                        "bot protection",
+                    )
+                ):
+                    logging.warning(
+                        "OddsPortal responded with a bot-protection page for %s. "
+                        "Supply a browser-saved HTML file via NFL_ODDSPORTAL_HTML_OVERRIDE or update your session headers.",
+                        url,
+                    )
+                    self._bot_wall_notice_logged = True
                 if insecure and not self._insecure_success_logged:
                     logging.warning(
                         "OddsPortal request for %s succeeded only after disabling certificate "
@@ -1676,7 +1862,9 @@ class OddsPortalFetcher:
                     if timestamp is not None:
                         return timestamp
 
-    def _parse_results_page(self, html: str, season_label: str) -> pd.DataFrame:
+    def _parse_results_page(
+        self, html: str, season_label: str, slug: str = ""
+    ) -> pd.DataFrame:
         global _BEAUTIFULSOUP_WARNING_EMITTED
         if BeautifulSoup is None:
             if not _BEAUTIFULSOUP_WARNING_EMITTED:
@@ -1691,12 +1879,21 @@ class OddsPortalFetcher:
         if table is None:
             table = soup.find(id=re.compile("tournamentTable", re.IGNORECASE))
         if table is None:
+            attribute_rows = self._parse_attribute_tables(soup, season_label)
+            if not attribute_rows.empty:
+                return attribute_rows
             modern_rows = self._parse_modern_results(soup, season_label)
             if not modern_rows.empty:
                 return modern_rows
             state_rows = self._parse_embedded_state(html, season_label, soup=soup)
             if not state_rows.empty:
                 return state_rows
+            json_rows = self._parse_json_scripts(soup, html, season_label, slug)
+            if not json_rows.empty:
+                return json_rows
+            png_rows = self._parse_override_pngs(slug, season_label)
+            if not png_rows.empty:
+                return png_rows
             try:
                 frames = pd.read_html(io.StringIO(html))
             except Exception:
@@ -1704,12 +1901,9 @@ class OddsPortalFetcher:
             if not frames:
                 return pd.DataFrame()
             # Fallback: attempt to normalise first readable table
-            for frame in frames:
-                if frame.empty:
-                    continue
-                normalized = self._normalise_table(frame, season_label)
-                if not normalized.empty:
-                    return normalized
+            normalized = self._normalise_frames(frames, season_label)
+            if not normalized.empty:
+                return normalized
             return pd.DataFrame()
 
         rows: List[Dict[str, Any]] = []
@@ -1747,7 +1941,7 @@ class OddsPortalFetcher:
 
             decimals: List[float] = []
             for odds in odds_nodes:
-                value = _parse_decimal_odds(odds.get_text(" ", strip=True))
+                value = self._extract_decimal_from_node(odds)
                 if value is not None:
                     decimals.append(value)
             home_decimal = decimals[0] if decimals else None
@@ -1780,19 +1974,454 @@ class OddsPortalFetcher:
         state_rows = self._parse_embedded_state(html, season_label, soup=soup)
         if not state_rows.empty:
             return state_rows
+        png_rows = self._parse_override_pngs(slug, season_label)
+        if not png_rows.empty:
+            return png_rows
 
+        attribute_rows = self._parse_attribute_tables(soup, season_label)
+        if not attribute_rows.empty:
+            return attribute_rows
+
+        text_rows = self._parse_text_lines(
+            [line.strip() for line in soup.get_text("\n").splitlines() if line.strip()],
+            season_label,
+            source=f"text:{slug or season_label}",
+        )
+        if not text_rows.empty:
+            return text_rows
+
+        json_rows = self._parse_json_scripts(soup, html, season_label, slug)
+        if not json_rows.empty:
+            return json_rows
+
+        manual_rows = self._parse_manual_csv_override(season_label)
+        if not manual_rows.empty:
+            return manual_rows
+
+        # Some OddsPortal variants still wrap results in a table but rename row
+        # classes; if the legacy/modern selectors miss, fall back to read_html on
+        # the captured table (or full document) before giving up.
         try:
-            frames = pd.read_html(io.StringIO(html))
+            candidate_sources = [str(table), html]
+            for source in candidate_sources:
+                frames = pd.read_html(io.StringIO(source))
+                normalized = self._normalise_frames(frames, season_label)
+                if not normalized.empty:
+                    return normalized
         except Exception:
             return pd.DataFrame()
-        for frame in frames:
-            if frame.empty:
+
+        return pd.DataFrame()
+
+    def _normalise_frames(
+        self, frames: Sequence[pd.DataFrame], season_label: str
+    ) -> pd.DataFrame:
+        """Attempt to normalise a collection of read_html frames with diagnostics."""
+
+        logged = False
+        for idx, frame in enumerate(frames):
+            if frame is None or frame.empty:
                 continue
             normalized = self._normalise_table(frame, season_label)
             if not normalized.empty:
                 return normalized
+            if not logged:
+                sample = frame.head(3).to_dict(orient="records")
+                logging.info(
+                    "OddsPortal read_html frame %s could not be normalised; columns=%s shape=%s sample_rows=%s",
+                    idx,
+                    list(frame.columns),
+                    frame.shape,
+                    sample,
+                )
+                logged = True
+        return pd.DataFrame()
+
+    def _parse_attribute_tables(self, soup: BeautifulSoup, season_label: str) -> pd.DataFrame:
+        """Normalise tables whose odds live in data-* attributes instead of text.
+
+        When OddsPortal renders prices purely via attributes (e.g., data-odds,
+        data-odd, data-us, data-decimal), pandas.read_html returns empty strings.
+        This helper walks every <table> row, extracts both text and attribute
+        values, and feeds the synthetic frame back through the normaliser so team
+        and odds inference heuristics can still run.
+        """
+
+        tables = soup.find_all("table")
+        if not tables:
+            return pd.DataFrame()
+
+        frames: List[pd.DataFrame] = []
+
+        def _extract_attr_odds(cell: Any) -> Optional[float]:
+            for key, value in cell.attrs.items():
+                if value is None:
+                    continue
+                text_value = " ".join(value) if isinstance(value, list) else str(value)
+                parsed = _parse_decimal_odds(text_value)
+                if parsed is not None:
+                    return parsed
+                tokens = re.findall(r"[+-]?\d+(?:\.\d+)?", text_value)
+                for token in tokens[::-1]:
+                    parsed = _parse_decimal_odds(token)
+                    if parsed is not None:
+                        return parsed
+            return None
+
+        for table in tables:
+            rows: List[Dict[str, Any]] = []
+            for tr in table.find_all("tr"):
+                cells = tr.find_all(["td", "th"])
+                if not cells:
+                    continue
+                row: Dict[str, Any] = {}
+                for idx, cell in enumerate(cells):
+                    text = cell.get_text(" ", strip=True)
+                    row[f"col_{idx}"] = text
+                    attr_odds = _extract_attr_odds(cell)
+                    if attr_odds is not None:
+                        row[f"col_{idx}_attr_odds"] = attr_odds
+                rows.append(row)
+
+            if rows:
+                frames.append(pd.DataFrame(rows))
+
+        if not frames:
+            return pd.DataFrame()
+
+        normalized = self._normalise_frames(frames, season_label)
+        if normalized.empty:
+            sample = frames[0].head(3).to_dict(orient="records")
+            logging.info(
+                "OddsPortal attribute-table fallback produced frames but no odds; sample=%s",
+                sample,
+            )
+        else:
+            logging.info(
+                "OddsPortal attribute-table fallback extracted %d rows for %s", len(normalized), season_label
+            )
+        return normalized
+
+    def _parse_override_pngs(self, slug: str, season_label: str) -> pd.DataFrame:
+        """OCR fallback that extracts odds from debug PNG snapshots when provided."""
+
+        texts = self._load_override_png_text(slug)
+        if not texts:
+            return pd.DataFrame()
+
+        frames: List[pd.DataFrame] = []
+        for text in texts:
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if not lines:
+                continue
+            frame = pd.DataFrame({"row": lines})
+            normalized = self._normalise_table(frame, season_label)
+            if not normalized.empty:
+                frames.append(normalized)
+                continue
+
+            text_rows = self._parse_text_lines(
+                lines, season_label, source=f"png:{slug or season_label}"
+            )
+            if not text_rows.empty:
+                frames.append(text_rows)
+
+        if not frames:
+            logging.info(
+                "OCR fallback read %d OddsPortal PNG snapshot(s) for %s but found no odds",
+                len(texts),
+                slug or season_label,
+            )
+            return pd.DataFrame()
+
+        combined = safe_concat(frames, ignore_index=True)
+        logging.info(
+            "OCR fallback parsed %d closing-odds rows from PNG snapshot(s) for %s",
+            len(combined),
+            slug or season_label,
+        )
+        return combined
+
+    def _load_override_png_text(self, slug: str) -> List[str]:
+        if not self._ocr_enabled:
+            if not self._ocr_disabled_notice_logged:
+                logging.info(
+                    "OCR fallback disabled via NFL_ODDSPORTAL_OCR_ENABLED; skipping PNGs for all slugs"
+                )
+                self._ocr_disabled_notice_logged = True
+            return []
+
+        if OddsPortalFetcher._ocr_dependencies_missing:
+            if not OddsPortalFetcher._ocr_dependencies_notice_logged:
+                logging.info(
+                    "OCR fallback skipped for all slugs because Pillow+pytesseract are unavailable"
+                )
+                OddsPortalFetcher._ocr_dependencies_notice_logged = True
+            return []
+
+        try:
+            from PIL import Image
+            import pytesseract
+            TesseractNotFoundError = pytesseract.TesseractNotFoundError
+
+            if self._tesseract_cmd:
+                pytesseract.pytesseract.tesseract_cmd = self._tesseract_cmd
+            elif platform.system().lower().startswith("win"):
+                for candidate in (
+                    r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+                    r"C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe",
+                ):
+                    if Path(candidate).exists():
+                        pytesseract.pytesseract.tesseract_cmd = candidate
+                        break
+        except Exception:
+            OddsPortalFetcher._ocr_dependencies_missing = True
+            if not OddsPortalFetcher._ocr_dependencies_notice_logged:
+                logging.info(
+                    "OCR fallback skipped for all slugs because Pillow+pytesseract are unavailable"
+                )
+                OddsPortalFetcher._ocr_dependencies_notice_logged = True
+            return []
+
+        search_paths: List[Path] = []
+        if self._html_override_path is not None:
+            search_paths.append(self._html_override_path)
+        else:
+            if self._debug_dir is not None:
+                search_paths.append(self._debug_dir)
+            default_debug_dir = SCRIPT_ROOT / "reports" / "oddsportal_debug"
+            if default_debug_dir.exists():
+                search_paths.append(default_debug_dir)
+
+        sanitized_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/"))
+        texts: List[str] = []
+
+        for path in search_paths:
+            candidates: List[Path] = []
+            if path.is_file() and path.suffix.lower() == ".png":
+                candidates.append(path)
+            elif path.is_dir():
+                candidates.extend(sorted(path.glob("*.png")))
+            for candidate in candidates:
+                if sanitized_slug and sanitized_slug not in candidate.stem:
+                    continue
+                try:
+                    text = pytesseract.image_to_string(Image.open(candidate))
+                    if text.strip():
+                        texts.append(text)
+                except (TesseractNotFoundError, FileNotFoundError, OSError):
+                    OddsPortalFetcher._ocr_dependencies_missing = True
+                    if not OddsPortalFetcher._ocr_dependencies_notice_logged:
+                        hint = (
+                            "Set NFL_ODDSPORTAL_TESSERACT_CMD (or TESSERACT_CMD) to the tesseract.exe path, "
+                            "or install Tesseract and ensure it is on PATH."
+                        )
+                        logging.info(
+                            "OCR fallback skipped for all slugs because tesseract is not installed or not on PATH. %s",
+                            hint,
+                        )
+                        OddsPortalFetcher._ocr_dependencies_notice_logged = True
+                    return texts
+                except Exception:
+                    logging.exception("Failed OCR on OddsPortal PNG snapshot %s", candidate)
+
+        return texts
+
+    def _parse_text_lines(
+        self, lines: Sequence[str], season_label: str, *, source: str
+    ) -> pd.DataFrame:
+        """Heuristic parser for odds embedded in plain-text or OCR output."""
+
+        rows: List[Dict[str, Any]] = []
+
+        for line in lines:
+            cleaned = " ".join(line.split())
+            if not cleaned:
+                continue
+
+            odds_tokens = re.findall(r"[+-]?\d+(?:\.\d+)?", cleaned)
+            decimals = [
+                _parse_decimal_odds(token)
+                for token in odds_tokens
+                if _parse_decimal_odds(token) is not None
+            ]
+            if len(decimals) < 2:
+                continue
+
+            text_no_odds = re.sub(r"[+-]?\d+(?:\.\d+)?", " ", cleaned)
+            text_no_odds = re.sub(r"\s+", " ", text_no_odds).strip(" -–@")
+
+            splitters = [
+                r"\s+-\s+",
+                r"\s+–\s+",
+                r"\s+@\s+",
+                r"\s+vs\.?\s+",
+                r"\s+v\.?\s+",
+                r"\s+at\s+",
+            ]
+            parts: Optional[Sequence[str]] = None
+            for splitter in splitters:
+                candidate_parts = re.split(splitter, text_no_odds, maxsplit=1, flags=re.IGNORECASE)
+                if len(candidate_parts) == 2:
+                    parts = candidate_parts
+                    break
+
+            if parts is None:
+                spaced = re.split(r"\s{2,}", text_no_odds)
+                if len(spaced) == 2:
+                    parts = spaced
+
+            if parts is None:
+                tokens = text_no_odds.split(" ")
+                if len(tokens) >= 4:
+                    mid = len(tokens) // 2
+                    parts = [" ".join(tokens[:mid]), " ".join(tokens[mid:])]
+
+            if parts is None:
+                continue
+
+            home_team = normalize_team_abbr(parts[0].strip(" -–@"))
+            away_team = normalize_team_abbr(parts[1].strip(" -–@"))
+            if not home_team or not away_team:
+                continue
+
+            home_decimal = decimals[0]
+            away_decimal = decimals[1] if len(decimals) > 1 else None
+
+            rows.append(
+                {
+                    "season": season_label,
+                    "week": np.nan,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_closing_moneyline": _decimal_to_american(home_decimal),
+                    "away_closing_moneyline": _decimal_to_american(away_decimal),
+                    "closing_bookmaker": "OddsPortal",
+                    "closing_line_time": None,
+                    "kickoff_utc": None,
+                    "kickoff_date": "",
+                    "kickoff_weekday": "",
+                    "home_score": np.nan,
+                    "away_score": np.nan,
+                }
+            )
+
+        if rows:
+            logging.info(
+                "Text-line fallback extracted %d closing-odds rows from %s", len(rows), source
+            )
+            return pd.DataFrame(rows)
 
         return pd.DataFrame()
+
+    def _parse_manual_csv_override(self, season_label: str) -> pd.DataFrame:
+        """Allow users to supply a manual OddsPortal closing-odds CSV.
+
+        Expected columns: season, home_team, away_team, home_closing_moneyline,
+        away_closing_moneyline, and optional kickoff_date (YYYY-MM-DD).
+        """
+
+        if self._manual_csv_path is None:
+            return pd.DataFrame()
+
+        path = self._manual_csv_path
+        try:
+            if not path.exists():
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(
+                        "# Fill in closing odds when OddsPortal pages are empty\n"
+                        "# season,home_team,away_team,home_closing_moneyline,away_closing_moneyline,kickoff_date\n",
+                        encoding="utf-8",
+                    )
+                    logging.warning(
+                        "Created manual OddsPortal CSV template at %s; populate it with closing odds or "
+                        "set NFL_ODDSPORTAL_MANUAL_CSV to your file",
+                        path,
+                    )
+                except Exception:
+                    logging.exception(
+                        "Failed to create manual OddsPortal CSV template at %s", path
+                    )
+                return pd.DataFrame()
+            frame = pd.read_csv(path)
+        except Exception:
+            logging.exception("Failed to read manual OddsPortal CSV override at %s", path)
+            return pd.DataFrame()
+
+        required = {
+            "season",
+            "home_team",
+            "away_team",
+            "home_closing_moneyline",
+            "away_closing_moneyline",
+        }
+        missing = required - set(frame.columns)
+        if missing:
+            logging.warning(
+                "Manual OddsPortal CSV %s is missing required columns: %s",
+                path,
+                ", ".join(sorted(missing)),
+            )
+            return pd.DataFrame()
+
+        if frame.empty:
+            logging.warning(
+                "Manual OddsPortal CSV %s is empty; add rows for season=%s to load closing odds",
+                path,
+                season_label,
+            )
+            return pd.DataFrame()
+
+        filtered = frame.loc[frame["season"].astype(str) == str(season_label)].copy()
+        if filtered.empty:
+            return pd.DataFrame()
+
+        for col in ("home_team", "away_team"):
+            filtered[col] = filtered[col].astype(str).map(normalize_team_abbr)
+
+        for odds_col in ("home_closing_moneyline", "away_closing_moneyline"):
+            filtered[odds_col] = filtered[odds_col].apply(
+                lambda value: _parse_moneyline_text(str(value))
+                if not pd.isna(value)
+                else np.nan
+            )
+
+        filtered["closing_bookmaker"] = "OddsPortal"
+        filtered["kickoff_date"] = filtered.get("kickoff_date", "").fillna("")
+        filtered["kickoff_weekday"] = ""
+        filtered["kickoff_utc"] = pd.NaT
+        filtered["closing_line_time"] = pd.NaT
+        filtered["week"] = np.nan
+        filtered["home_score"] = np.nan
+        filtered["away_score"] = np.nan
+
+        filtered = filtered[
+            [
+                "season",
+                "week",
+                "home_team",
+                "away_team",
+                "home_closing_moneyline",
+                "away_closing_moneyline",
+                "closing_bookmaker",
+                "closing_line_time",
+                "kickoff_utc",
+                "kickoff_date",
+                "kickoff_weekday",
+                "home_score",
+                "away_score",
+            ]
+        ]
+
+        logging.info(
+            "Loaded %d manual closing odds rows from %s for season %s",
+            len(filtered),
+            path,
+            season_label,
+        )
+
+        return filtered
 
     def _debug_capture_failure(self, slug: str, html: str, *, source_url: str) -> None:
         if not html:
@@ -1887,7 +2516,91 @@ class OddsPortalFetcher:
             source_url,
         )
 
+        self._debug_dump_png(slug, path, html)
+
         return path
+
+    def _debug_dump_png(self, slug: str, html_path: Path, html: str) -> None:
+        if not self._debug_png_enabled:
+            return
+
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except Exception:
+            if not self._debug_png_notice_logged:
+                logging.warning(
+                    "NFL_ODDSPORTAL_DEBUG_PNG enabled but Pillow is not installed; cannot write OddsPortal PNG captures."
+                )
+                self._debug_png_notice_logged = True
+            return
+
+        text = html
+        if BeautifulSoup is not None:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                extracted = soup.get_text("\n")
+                if extracted:
+                    text = extracted
+            except Exception:
+                pass
+
+        header = [
+            "OddsPortal debug capture (HTML -> PNG)",
+            f"Slug: {slug}",
+            f"File: {html_path.name}",
+            "First 8000 characters rendered below:",
+            "",
+        ]
+
+        snippet = text[:8000]
+        wrapped_lines: List[str] = []
+        for raw_line in snippet.splitlines():
+            line = raw_line.rstrip()
+            if not line:
+                wrapped_lines.append("")
+                continue
+            wrapped_lines.extend(textwrap.wrap(line, width=180))
+
+        rendered_lines = header + wrapped_lines
+        if not rendered_lines:
+            rendered_lines = ["<empty HTML body>"]
+
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+
+        dummy = Image.new("RGB", (1, 1))
+        draw = ImageDraw.Draw(dummy)
+        line_height = max(draw.textbbox((0, 0), "Ag", font=font)[3], 12)
+        padding = 12
+        max_line_width = 0
+        for line in rendered_lines:
+            max_line_width = max(max_line_width, draw.textbbox((0, 0), line, font=font)[2])
+
+        width = min(max_line_width + padding * 2, 2400)
+        height = line_height * len(rendered_lines) + padding * 2
+
+        image = Image.new("RGB", (width, height), (250, 250, 250))
+        draw = ImageDraw.Draw(image)
+        y = padding
+        for line in rendered_lines:
+            draw.text((padding, y), line, fill=(0, 0, 0), font=font)
+            y += line_height
+
+        png_path = html_path.with_suffix(".png")
+        try:
+            image.save(png_path)
+        except Exception:
+            logging.exception("Failed to write OddsPortal debug PNG to %s", png_path)
+            return
+
+        logging.warning(
+            "Saved OddsPortal debug PNG snapshot to %s for slug %s (%s).",
+            png_path,
+            slug,
+            html_path,
+        )
 
     def _debug_warn_no_rows(self, slug: str, season_label: str, source_url: str) -> None:
         key = f"{season_label}|{slug}"
@@ -2122,7 +2835,8 @@ class OddsPortalFetcher:
                     )
                 ):
                     continue
-                price = _parse_moneyline_text(odd_container.get_text(" ", strip=True))
+
+                price = self._extract_moneyline_from_node(odd_container)
                 if price is None:
                     continue
                 odds_values.append(price)
@@ -2154,6 +2868,47 @@ class OddsPortalFetcher:
             return pd.DataFrame()
 
         return pd.DataFrame(rows)
+
+    def _parse_json_scripts(
+        self, soup: "BeautifulSoup", html: str, season_label: str, slug: str
+    ) -> pd.DataFrame:
+        """Parse any JSON-looking script payloads for closing odds."""
+
+        payloads = self._extract_json_payloads(html, soup)
+        if not payloads:
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, Optional[float], Optional[float]]] = set()
+
+        for payload in payloads:
+            data = self._safe_json_loads(payload)
+            if data is None:
+                continue
+
+            extracted = self._extract_loose_json_matchups(data, season_label)
+            for row in extracted:
+                key = (
+                    row.get("home_team"),
+                    row.get("away_team"),
+                    row.get("home_closing_moneyline"),
+                    row.get("away_closing_moneyline"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(row)
+
+        if rows:
+            frame = pd.DataFrame(rows)
+            logging.info(
+                "Parsed %d closing-odds rows from JSON scripts for slug %s",
+                len(frame),
+                slug or season_label,
+            )
+            return frame
+
+        return pd.DataFrame()
 
     def _parse_embedded_state(
         self,
@@ -2244,6 +2999,21 @@ class OddsPortalFetcher:
                 )
 
         if not rows:
+            loose_rows = self._extract_loose_json_matchups(data, season_label)
+            for entry in loose_rows:
+                key = (
+                    entry.get("home_team"),
+                    entry.get("away_team"),
+                    entry.get("kickoff_utc"),
+                    entry.get("home_closing_moneyline"),
+                    entry.get("away_closing_moneyline"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(entry)
+
+        if not rows:
             return pd.DataFrame()
 
         frame = pd.DataFrame(rows)
@@ -2257,6 +3027,216 @@ class OddsPortalFetcher:
         frame["away_score"] = frame["away_score"].where(frame["away_score"].notna(), np.nan)
 
         return frame.reset_index(drop=True)
+
+    def _extract_decimal_from_node(self, node: Any) -> Optional[float]:
+        """Parse decimal odds from a BeautifulSoup node or return None.
+
+        Some OddsPortal variants hide prices in data attributes while leaving the
+        text content empty; this helper checks both the rendered text and common
+        attribute names before giving up.
+        """
+
+        if node is None:
+            return None
+
+        candidates: List[str] = []
+        try:
+            text = node.get_text(" ", strip=True)
+        except Exception:
+            text = ""
+        if text:
+            candidates.append(text)
+
+        for attr in (
+            "data-odds",
+            "data-odd",
+            "data-odd-value",
+            "data-odds-value",
+            "data-selection-price",
+            "data-selection-odds",
+        ):
+            try:
+                value = node.get(attr)
+            except Exception:
+                value = None
+            if value:
+                candidates.append(str(value))
+
+        for candidate in candidates:
+            parsed = _parse_decimal_odds(candidate)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _extract_moneyline_from_node(self, node: Any) -> Optional[int]:
+        """Parse a moneyline price from text or data attributes on a node."""
+
+        if node is None:
+            return None
+
+        candidates: List[str] = []
+        try:
+            text = node.get_text(" ", strip=True)
+        except Exception:
+            text = ""
+        if text:
+            candidates.append(text)
+
+        for attr in (
+            "data-odds",
+            "data-odd",
+            "data-odd-value",
+            "data-odds-value",
+            "data-selection-price",
+            "data-selection-odds",
+        ):
+            try:
+                value = node.get(attr)
+            except Exception:
+                value = None
+            if value:
+                candidates.append(str(value))
+
+        for candidate in candidates:
+            moneyline = _parse_moneyline_text(candidate)
+            if moneyline is not None:
+                return moneyline
+            decimal = _parse_decimal_odds(candidate)
+            if decimal is not None:
+                converted = _decimal_to_american(decimal)
+                if converted is not None:
+                    return converted
+        return None
+
+    def _extract_loose_json_matchups(
+        self, data: Any, season_label: str
+    ) -> List[Dict[str, Any]]:
+        """Fallback JSON scraper for OddsPortal when no participant lists are found.
+
+        Some OddsPortal variants embed game data as loosely structured home/away
+        objects (or flat dictionaries) without participant arrays. This helper
+        scans dicts for home/away team names and any numeric odds fields and
+        emits rows when a plausible pair is detected.
+        """
+
+        if not isinstance(data, (dict, list)):
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, Optional[float], Optional[float]]] = set()
+
+        def _parse_team(value: Any) -> Optional[str]:
+            if isinstance(value, str):
+                cleaned = value.strip()
+                if cleaned:
+                    return cleaned
+            if isinstance(value, dict):
+                return self._extract_json_team_name(value, {})
+            return None
+
+        def _parse_odds_field(value: Any) -> Optional[float]:
+            if isinstance(value, (int, float)):
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    return None
+                return _parse_decimal_odds(str(numeric))
+            if isinstance(value, str):
+                return _parse_decimal_odds(value)
+            return None
+
+        def _scan_odds(node: Any) -> List[float]:
+            if isinstance(node, dict):
+                found: List[float] = []
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    if any(
+                        token in lower
+                        for token in (
+                            "odd",
+                            "price",
+                            "line",
+                            "moneyline",
+                            "money",
+                            "ml",
+                            "american",
+                            "decimal",
+                        )
+                    ):
+                        parsed = _parse_odds_field(value)
+                        if parsed is not None:
+                            found.append(parsed)
+                    if isinstance(value, (dict, list)):
+                        found.extend(_scan_odds(value))
+                return found
+            if isinstance(node, list):
+                aggregated: List[float] = []
+                for item in node:
+                    aggregated.extend(_scan_odds(item))
+                return aggregated
+            parsed = _parse_odds_field(node)
+            return [parsed] if parsed is not None else []
+
+        stack: List[Any] = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                home_name = None
+                away_name = None
+
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    if "home" in lower and home_name is None:
+                        home_name = _parse_team(value)
+                    if "away" in lower and away_name is None:
+                        away_name = _parse_team(value)
+
+                if home_name and away_name:
+                    odds_list = _scan_odds(node)
+                    home_decimal = odds_list[0] if odds_list else None
+                    away_decimal = odds_list[1] if len(odds_list) > 1 else None
+
+                    key = (
+                        home_name,
+                        away_name,
+                        home_decimal,
+                        away_decimal,
+                    )
+                    if key not in seen and (home_decimal or away_decimal):
+                        seen.add(key)
+                        rows.append(
+                            {
+                                "season": season_label,
+                                "week": np.nan,
+                                "home_team": normalize_team_abbr(home_name),
+                                "away_team": normalize_team_abbr(away_name),
+                                "home_closing_moneyline": _decimal_to_american(
+                                    home_decimal
+                                ),
+                                "away_closing_moneyline": _decimal_to_american(
+                                    away_decimal
+                                ),
+                                "closing_bookmaker": "OddsPortal",
+                                "closing_line_time": pd.NaT,
+                                "kickoff_utc": pd.NaT,
+                                "kickoff_date": "",
+                                "kickoff_weekday": "",
+                                "home_score": np.nan,
+                                "away_score": np.nan,
+                            }
+                        )
+
+                for value in node.values():
+                    if isinstance(value, (dict, list)):
+                        stack.append(value)
+            elif isinstance(node, list):
+                stack.extend(node)
+
+        if rows:
+            logging.info(
+                "OddsPortal loose JSON fallback recovered %d rows", len(rows)
+            )
+        return rows
 
     def _extract_json_payloads(
         self, html: str, soup: Optional["BeautifulSoup"]
@@ -2796,6 +3776,18 @@ class OddsPortalFetcher:
         if away_decimal is None and len(odds_columns) >= 2:
             away_decimal = odds_columns[1]
 
+        if (home_decimal is None or away_decimal is None) and not odds_columns:
+            numeric_density = {
+                col: pd.to_numeric(frame[col], errors="coerce").notna().mean()
+                for col in frame.columns
+                if col not in {home_col, away_col}
+            }
+            numeric_cols = [col for col, ratio in numeric_density.items() if ratio >= 0.5]
+            if home_decimal is None and numeric_cols:
+                home_decimal = numeric_cols[0]
+            if away_decimal is None and len(numeric_cols) >= 2:
+                away_decimal = numeric_cols[1]
+
         def _split_teams(value: Any) -> Tuple[str, str]:
             text = str(value or "").strip()
             separators = [" - ", " – ", " vs ", " vs. ", " v ", " @ "]
@@ -2807,6 +3799,30 @@ class OddsPortalFetcher:
             tokens = re.split(r"\s+vs\.?\s+|\s+@\s+", text, maxsplit=1, flags=re.IGNORECASE)
             if len(tokens) == 2:
                 return tokens[0].strip(), tokens[1].strip()
+
+            # Heuristic: scan token windows to find the first two recognizable
+            # team names/abbreviations when no explicit separator exists.
+            words = re.findall(r"[A-Za-z]+", text)
+            hits: List[Tuple[int, int, str]] = []
+            for start in range(len(words)):
+                for end in range(start, min(len(words), start + 3)):
+                    phrase = " ".join(words[start : end + 1])
+                    abbr = normalize_team_abbr(phrase)
+                    if abbr:
+                        hits.append((start, end, abbr))
+            if hits:
+                hits.sort(key=lambda item: (item[0], item[1] - item[0]))
+                selected: List[Tuple[int, int, str]] = []
+                for start, end, abbr in hits:
+                    if any(s <= start <= e or s <= end <= e for s, e, _ in selected):
+                        continue
+                    selected.append((start, end, abbr))
+                    if len(selected) == 2:
+                        break
+                if len(selected) == 2:
+                    selected.sort(key=lambda item: item[0])
+                    return selected[0][2], selected[1][2]
+
             return "", ""
 
         if match_col and (not home_col or not away_col):
@@ -2815,6 +3831,63 @@ class OddsPortalFetcher:
             frame["__away"] = extracted.apply(lambda pair: pair[1])
             home_col = home_col or "__home"
             away_col = away_col or "__away"
+
+        if not home_col or not away_col:
+            text_density = {
+                col: frame[col]
+                .astype(str)
+                .str.contains(r"[A-Za-z]", regex=True)
+                .mean()
+                for col in frame.columns
+            }
+            text_cols = [col for col, ratio in text_density.items() if ratio >= 0.5]
+            if len(text_cols) >= 2:
+                home_col = home_col or text_cols[0]
+                away_col = away_col or text_cols[1]
+            elif not text_cols:
+                ranked = sorted(text_density.items(), key=lambda item: item[1], reverse=True)
+                ranked = [col for col, ratio in ranked if ratio >= 0.2]
+                if len(ranked) >= 2:
+                    home_col = home_col or ranked[0]
+                    away_col = away_col or ranked[1]
+
+        # Final fallback: if no explicit home/away columns were found, try to
+        # extract them from the concatenated row text. This captures unlabeled
+        # OddsPortal tables that pandas flattens into positional columns.
+        if not home_col or not away_col:
+            row_text = frame.apply(lambda row: " ".join(str(v) for v in row if pd.notna(v)), axis=1)
+            teams = row_text.apply(_split_teams)
+            if teams.apply(lambda pair: any(pair)).any():
+                frame["__home"] = teams.apply(lambda pair: pair[0])
+                frame["__away"] = teams.apply(lambda pair: pair[1])
+                home_col = home_col or "__home"
+                away_col = away_col or "__away"
+                frame["__row_text"] = row_text
+                logging.info(
+                    "OddsPortal row-text fallback inferred home/away columns; columns=%s shape=%s",
+                    list(frame.columns),
+                    frame.shape,
+                )
+                # Extract the last two decimal-looking numbers per row as odds
+                decimals = row_text.apply(
+                    lambda text: [
+                        _parse_decimal_odds(match)
+                        for match in re.findall(r"[+-]?\d+(?:\.\d+)?", text)
+                    ]
+                )
+                if home_decimal is None or away_decimal is None:
+                    def _pick_tail(vals: List[Optional[float]], offset: int) -> float:
+                        parsed = [val for val in vals if val is not None]
+                        if len(parsed) > offset:
+                            return parsed[-(offset + 1)]
+                        return math.nan
+
+                    if home_decimal is None:
+                        frame["__home_odds"] = decimals.apply(lambda vals: _pick_tail(vals, 1))
+                        home_decimal = "__home_odds"
+                    if away_decimal is None:
+                        frame["__away_odds"] = decimals.apply(lambda vals: _pick_tail(vals, 0))
+                        away_decimal = "__away_odds"
 
         if not home_col or not away_col:
             return pd.DataFrame()
@@ -2852,6 +3925,15 @@ class OddsPortalFetcher:
             result["home_score"] = scores.apply(lambda vals: float(vals[0]) if len(vals) >= 1 else np.nan)
             result["away_score"] = scores.apply(lambda vals: float(vals[1]) if len(vals) >= 2 else np.nan)
 
+        if result["home_closing_moneyline"].notna().sum() == 0 and result[
+            "away_closing_moneyline"
+        ].notna().sum() == 0:
+            logging.info(
+                "OddsPortal normalized frame but moneyline columns were empty; columns=%s sample_rows=%s",
+                list(frame.columns),
+                result.head(5).to_dict(orient="records"),
+            )
+
         return result.reset_index(drop=True)
 
 
@@ -2875,6 +3957,65 @@ def _season_param_from_label(label: str) -> Optional[str]:
     except ValueError:
         return year
     return f"{year}-{next_year}"
+
+
+def _parse_killersports_html_table(html: str) -> pd.DataFrame:
+    if not html:
+        return pd.DataFrame()
+
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+    if not tables:
+        return pd.DataFrame()
+
+    def _table_score(table: Any) -> Tuple[int, int]:
+        return (len(table.find_all("tr")), len(table.find_all("th")))
+
+    best_first = sorted(tables, key=_table_score, reverse=True)
+
+    for table in best_first:
+        headers = [th.get_text(strip=True) for th in table.find_all("th")]
+        rows: List[List[str]] = []
+
+        for tr in table.find_all("tr"):
+            cells = [cell.get_text(strip=True) for cell in tr.find_all(["td", "th"])]
+            cells = [cell for cell in cells if cell]
+            if not cells:
+                continue
+
+            rows.append(cells)
+
+        if not rows:
+            continue
+
+        if not headers:
+            # Treat the first non-empty row as headers when the table uses <td>
+            # instead of <th> for the header row (common on some KillerSports
+            # exports). This preserves the original column names rather than
+            # falling back to numeric keys that won't match moneyline columns.
+            headers = rows[0]
+            rows = rows[1:]
+
+        shaped_rows: List[Dict[str, str]] = []
+        for cells in rows:
+            # Pad or trim so rows align with headers even when the table includes
+            # expandable/collapsed cells.
+            padded = cells + [""] * max(0, len(headers) - len(cells))
+            trimmed = padded[: len(headers)]
+            shaped_rows.append(dict(zip(headers, trimmed)))
+
+        if not shaped_rows:
+            continue
+
+        try:
+            frame = pd.DataFrame(shaped_rows)
+        except Exception:
+            continue
+
+        if not frame.empty:
+            return frame
+
+    return pd.DataFrame()
 
 
 class KillerSportsFetcher:
@@ -2985,11 +4126,20 @@ class KillerSportsFetcher:
             try:
                 payload = pd.read_html(io.BytesIO(response.content))[0]
             except Exception:
-                logging.warning(
-                    "KillerSports response for season %s was not a readable CSV/HTML table",
-                    season,
-                )
-                return pd.DataFrame()
+                parsed = _parse_killersports_html_table(response.text)
+                if parsed.empty:
+                    snippet = (response.text or "")[:320].replace("\n", " ")
+                    logging.warning(
+                        "KillerSports response for season %s was not a readable CSV/HTML table "
+                        "(content-type=%s, body starts with: %s). Provide a full CSV export link "
+                        "from the KillerSports query tool (include any querystring like export=csv), "
+                        "not the generic landing page.",
+                        season,
+                        response.headers.get("Content-Type"),
+                        snippet,
+                    )
+                    return pd.DataFrame()
+                payload = parsed
 
         normalized = _normalize_historical_closing_frame(payload, "KillerSports", season)
         if normalized.empty:
@@ -2997,6 +4147,9 @@ class KillerSportsFetcher:
                 "KillerSports data for season %s could not be normalized", season
             )
         return normalized
+
+
+DEFAULT_KILLERSPORTS_BASE_URL = None
 
 
 class ClosingOddsArchiveSyncer:
@@ -3035,9 +4188,21 @@ class ClosingOddsArchiveSyncer:
             seasons = [str(season) for season in self.config.seasons]
 
             local_provider = False
+            closing_history_path = (
+                self.config.closing_odds_history_path or "data/closing_odds_history.csv"
+            )
+
+            killersports_base_url = (self.config.killersports_base_url or "").strip()
+
+            if provider in {"killersports", "ks"} and not killersports_base_url:
+                logging.warning(
+                    "KillerSports provider selected but KILLERSPORTS_BASE_URL is unset; "
+                    "falling back to OddsPortal for closing odds.",
+                )
+                provider = "oddsportal"
 
             if provider in {"local", "csv", "file", "history", "offline"}:
-                fetcher = LocalClosingOddsFetcher(self.config.closing_odds_history_path)
+                fetcher = LocalClosingOddsFetcher(closing_history_path)
                 provider_name = "Local CSV"
                 local_provider = True
             elif provider in {"oddsportal", "odds-portal", "op"}:
@@ -3053,7 +4218,7 @@ class ClosingOddsArchiveSyncer:
             elif provider in {"killersports", "ks"}:
                 fetcher = KillerSportsFetcher(
                     self.session,
-                    base_url=self.config.killersports_base_url,
+                    base_url=killersports_base_url,
                     timeout=self.config.closing_odds_timeout,
                     api_key=self.config.killersports_api_key,
                     username=self.config.killersports_username,
@@ -3065,6 +4230,33 @@ class ClosingOddsArchiveSyncer:
                 return
 
             archive = fetcher.fetch(seasons)
+
+            if archive.empty and provider_name == "KillerSports":
+                logging.warning(
+                    "KillerSports returned no closing odds; falling back to OddsPortal.",
+                )
+                fetcher = OddsPortalFetcher(
+                    self.session,
+                    base_url=self.config.oddsportal_base_url,
+                    results_path=self.config.oddsportal_results_path,
+                    season_path_template=self.config.oddsportal_season_template,
+                    timeout=self.config.closing_odds_timeout,
+                    user_agents=self.config.oddsportal_user_agents,
+                )
+                provider_name = "OddsPortal"
+                local_provider = False
+                archive = fetcher.fetch(seasons)
+
+            if archive.empty and provider_name == "OddsPortal":
+                local_path_exists = Path(closing_history_path).exists()
+                if local_path_exists:
+                    logging.warning(
+                        "OddsPortal returned no closing odds; falling back to local CSV.",
+                    )
+                    fetcher = LocalClosingOddsFetcher(closing_history_path)
+                    provider_name = "Local CSV"
+                    local_provider = True
+                    archive = fetcher.fetch(seasons)
             if archive.empty:
                 logging.warning(
                     "%s did not return any closing odds for seasons %s",
@@ -19875,6 +21067,46 @@ def main() -> None:
         if args.predict:
             logging.error("Prediction generation skipped because no models were available.")
         return
+
+    def _log_training_inputs(builder: FeatureBuilder) -> None:
+        games = builder.games_frame if builder else None
+        players = builder.player_feature_frame if builder else None
+        odds_lookup = builder.latest_odds_lookup if builder else None
+        prop_lines = builder.player_prop_lines_frame if builder else None
+        totals = builder.game_totals_frame if builder else None
+
+        def _count_rows(frame: Optional[pd.DataFrame]) -> int:
+            return int(len(frame)) if frame is not None else 0
+
+        def _count_complete(frame: Optional[pd.DataFrame], columns: Sequence[str]) -> int:
+            if frame is None or frame.empty:
+                return 0
+            available = [col for col in columns if col in frame.columns]
+            if len(available) < len(columns):
+                return 0
+            return int(frame[available].dropna(how="any").shape[0])
+
+        def _count_unique(frame: Optional[pd.DataFrame], columns: Sequence[str]) -> int:
+            if frame is None or frame.empty:
+                return 0
+            for col in columns:
+                if col in frame.columns:
+                    return int(frame[col].nunique())
+            return 0
+
+        logging.info(
+            "Training input snapshot | games=%d (with scores=%d, with closing odds=%d) | player rows=%d (unique players=%d) | prop lines=%d | totals lines=%d | odds rows=%d",
+            _count_rows(games),
+            _count_complete(games, ["home_score", "away_score"]),
+            _count_complete(games, ["home_closing_moneyline", "away_closing_moneyline"]),
+            _count_rows(players),
+            _count_unique(players, ["player_id", "player"]),
+            _count_rows(prop_lines),
+            _count_rows(totals),
+            _count_rows(odds_lookup),
+        )
+
+    _log_training_inputs(trainer.feature_builder)
 
     games_frame = getattr(trainer.feature_builder, "games_frame", None)
     if games_frame is None:
