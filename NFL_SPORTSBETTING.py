@@ -4208,7 +4208,12 @@ class ClosingOddsArchiveSyncer:
                 local_provider = False
                 archive = fetcher.fetch(seasons)
 
-            if archive.empty and provider_name == "OddsPortal" and closing_history_path:
+            if (
+                archive.empty
+                and provider_name == "OddsPortal"
+                and self.config.closing_odds_history_path
+            ):
+                closing_history_path = self.config.closing_odds_history_path
                 local_path_exists = Path(closing_history_path).exists()
                 if local_path_exists:
                     logging.warning(
