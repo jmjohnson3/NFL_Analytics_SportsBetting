@@ -209,7 +209,7 @@ pipeline:
 | `ODDSPORTAL_RESULTS_PATH` | Override the relative results path (defaults to `nfl/results/`). |
 | `ODDSPORTAL_SEASON_TEMPLATE` | Customize the fallback slug template (defaults to `nfl-{season}/results/`). |
 | `ODDSPORTAL_USER_AGENTS` | Comma- or semicolon-separated list of additional User-Agent strings to rotate when scraping OddsPortal. |
-| `NFL_ODDSPORTAL_HTML_OVERRIDE` | Optional file or directory of saved OddsPortal HTML (e.g., downloaded in a browser). When set, those snapshots are parsed first before live requests. |
+| `NFL_ODDSPORTAL_HTML_OVERRIDE` | Optional **file path** to a single browser-saved OddsPortal HTML snapshot (e.g., `reports/oddsportal_debug/20251216T200723Z_nfl-2024-regular-results.html`). When set, that file is parsed first before any live requests. To scan a folder of snapshots, use `NFL_ODDSPORTAL_HTML_OVERRIDE_DIR` instead. |
 | `NFL_ODDSPORTAL_HTML_OVERRIDE_DIR` | Optional directory to scan for slug-matching snapshots (e.g., the `reports/oddsportal_debug/` captures from a previous run). If unset, the scraper will still look in `reports/oddsportal_debug/` when it exists. |
 | `NFL_ODDSPORTAL_OVERRIDE_ONLY` | Optional flag (`1/true/on`). When set, the scraper will **not** make live OddsPortal HTTP requests and will rely solely on the provided override/debug HTML. |
 | `NFL_ODDSPORTAL_AUTO_DEBUG_SAMPLES` | Optional integer. Defaults to `2`. The scraper will save that many empty OddsPortal pages to `reports/oddsportal_debug/` even if `NFL_ODDSPORTAL_DEBUG_HTML` is off. Set to `0` to disable. |
@@ -239,6 +239,9 @@ just the first handful. Saved snapshots in `reports/oddsportal_debug/` (or any
 folder provided via `NFL_ODDSPORTAL_HTML_OVERRIDE_DIR`) are automatically reused
 as offline overrides on the next run, so you can accept cookies once in a
 browser, drop the resulting HTML into that directory, and parse it locally.
+If you only want to test a single page, point `NFL_ODDSPORTAL_HTML_OVERRIDE`
+at the exact HTML file; for multiple slugs, prefer
+`NFL_ODDSPORTAL_HTML_OVERRIDE_DIR` so the scraper can match filenames to slugs.
 
 #### Troubleshooting OddsPortal scraping failures
 
