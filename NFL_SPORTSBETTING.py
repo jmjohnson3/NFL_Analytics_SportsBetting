@@ -4144,23 +4144,10 @@ class ClosingOddsArchiveSyncer:
             provider_name: str
 
             if provider in {"local", "csv", "file", "history", "offline"}:
-                if not closing_history_path:
-                    logging.warning(
-                        "Local closing odds requested but no NFL_CLOSING_ODDS_HISTORY_PATH is configured; skipping local provider."
-                    )
-                    continue
-
-                path_obj = Path(closing_history_path)
-                if not path_obj.exists():
-                    logging.warning(
-                        "Local closing odds requested but %s does not exist; skipping local provider.",
-                        closing_history_path,
-                    )
-                    continue
-
-                fetcher = LocalClosingOddsFetcher(closing_history_path)
-                provider_name = "Local CSV"
-                local_provider = True
+                logging.warning(
+                    "Local closing odds providers are deprecated; configure NFL_CLOSING_ODDS_PROVIDER=oddsportal to scrape live closing lines."
+                )
+                continue
             elif provider in {"oddsportal", "odds-portal", "op"}:
                 fetcher = OddsPortalFetcher(
                     self.session,
@@ -4218,22 +4205,9 @@ class ClosingOddsArchiveSyncer:
                 archive = fetcher.fetch(seasons)
 
             if archive.empty and provider_name == "OddsPortal":
-                closing_history_path = self.config.closing_odds_history_path
-                if closing_history_path:
-                    local_path_exists = Path(closing_history_path).exists()
-                    if local_path_exists:
-                        logging.warning(
-                            "OddsPortal returned no closing odds; falling back to local CSV.",
-                        )
-                        fetcher = LocalClosingOddsFetcher(closing_history_path)
-                        provider_name = "Local CSV"
-                        local_provider = True
-                        archive = fetcher.fetch(seasons)
-                    else:
-                        logging.info(
-                            "No local closing odds file at %s to fall back to after empty OddsPortal scrape.",
-                            closing_history_path,
-                        )
+                logging.warning(
+                    "OddsPortal returned no closing odds; verify access or provide an HTML override via NFL_ODDSPORTAL_HTML_OVERRIDE."
+                )
             if archive.empty:
                 logging.warning(
                     "%s did not return any closing odds for seasons %s; trying next provider if available",
