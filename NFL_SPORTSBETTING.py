@@ -134,7 +134,7 @@ def _default_data_file(name: str) -> Optional[str]:
     return None
 
 
-DEFAULT_CLOSING_ODDS_PATH: Optional[str] = None
+DEFAULT_CLOSING_ODDS_PATH: Optional[str] = _default_data_file("closing_odds_history.csv")
 DEFAULT_TRAVEL_CONTEXT_PATH: Optional[str] = None
 # Coverage data can come from an API or scraped HTML; local CSVs are optional
 DEFAULT_COVERAGE_ADJUSTMENTS_PATH = None
@@ -1210,10 +1210,54 @@ class LocalClosingOddsFetcher:
         self.csv_path = Path(csv_path).expanduser() if csv_path else None
 
     def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
+        if self.csv_path is None:
+            logging.warning(
+                "No closing odds CSV configured. Set NFL_CLOSING_ODDS_PATH to point at your odds_history.csv file."
+            )
+            return pd.DataFrame()
+
+        if not self.csv_path.exists():
+            logging.warning(
+                "Closing odds CSV %s not found; add odds_history.csv to load closing lines.",
+                self.csv_path,
+            )
+            return pd.DataFrame()
+
+        try:
+            raw = pd.read_csv(self.csv_path)
+        except Exception:
+            logging.exception(
+                "Unable to read closing odds CSV from %s; ensure the file is a valid CSV.",
+                self.csv_path,
+            )
+            return pd.DataFrame()
+
+        normalized = _standardize_closing_odds_frame(raw, "Local CSV")
+        if normalized.empty:
+            logging.warning(
+                "Closing odds CSV %s contained no usable rows after normalization.",
+                self.csv_path,
+            )
+            return pd.DataFrame()
+
+        season_labels = {str(season) for season in seasons}
+        if season_labels:
+            normalized = normalized[normalized["season"].isin(season_labels)]
+
+        if normalized.empty:
+            logging.warning(
+                "No closing odds in %s matched seasons %s.",
+                self.csv_path,
+                ", ".join(season_labels) if season_labels else "(none)",
+            )
+            return pd.DataFrame()
+
         logging.info(
-            "Local closing odds CSVs are no longer supported. Configure NFL_CLOSING_ODDS_PROVIDER to an API or scrape source."
+            "Loaded %d closing odds rows from %s",
+            len(normalized),
+            self.csv_path,
         )
-        return pd.DataFrame()
+        return normalized
 
 
 class OddsPortalFetcher:
@@ -4172,11 +4216,11 @@ class ClosingOddsArchiveSyncer:
             self.session.verify = certifi.where()
 
     def sync(self) -> None:
-        providers_raw = (self.config.closing_odds_provider or "").strip() or "oddsportal"
+        providers_raw = (self.config.closing_odds_provider or "").strip() or "local"
         providers = [p.strip().lower() for p in providers_raw.split(",") if p.strip()]
 
         if not providers:
-            providers = ["oddsportal"]
+            providers = ["local"]
 
         if providers[0] in {"none", "off", "disable", "disabled"}:
             logging.info(
@@ -4188,52 +4232,17 @@ class ClosingOddsArchiveSyncer:
         seasons = [str(season) for season in self.config.seasons]
         closing_history_path = self.config.closing_odds_history_path
         for provider in providers:
-            fetcher: Optional[OddsPortalFetcher | KillerSportsFetcher]
+            fetcher: Optional[LocalClosingOddsFetcher]
             provider_name: str
 
             if provider in {"local", "csv", "file", "history", "offline"}:
-                logging.warning(
-                    "Local closing odds providers are deprecated; configure NFL_CLOSING_ODDS_PROVIDER=oddsportal to scrape live closing lines."
-                )
-                continue
-            elif provider in {"oddsportal", "odds-portal", "op"}:
-                oddsportal_headers: Dict[str, str] = {}
-                if self.config.oddsportal_cookie:
-                    oddsportal_headers["Cookie"] = self.config.oddsportal_cookie
-                if self.config.oddsportal_accept_language:
-                    oddsportal_headers["Accept-Language"] = self.config.oddsportal_accept_language
-
-                fetcher = OddsPortalFetcher(
-                    self.session,
-                    base_url=self.config.oddsportal_base_url,
-                    results_path=self.config.oddsportal_results_path,
-                    season_path_template=self.config.oddsportal_season_template,
-                    timeout=self.config.closing_odds_timeout,
-                    user_agents=self.config.oddsportal_user_agents,
-                    extra_headers=oddsportal_headers or None,
-                )
-                provider_name = "OddsPortal"
-            elif provider in {"killersports", "ks"}:
-                if not (
-                    self.config.killersports_api_key
-                    or self.config.killersports_username
-                    or self.config.killersports_password
-                ):
-                    logging.warning(
-                        "Skipping KillerSports fallback because credentials are not configured (set NFL_KILLERSPORTS_API_KEY or username/password)."
-                    )
-                    continue
-                fetcher = KillerSportsFetcher(
-                    self.session,
-                    base_url=killersports_base_url,
-                    timeout=self.config.closing_odds_timeout,
-                    api_key=self.config.killersports_api_key,
-                    username=self.config.killersports_username,
-                    password=self.config.killersports_password,
-                )
-                provider_name = "KillerSports"
+                fetcher = LocalClosingOddsFetcher(closing_history_path)
+                provider_name = "Local CSV"
             else:
-                logging.warning("Unknown closing odds provider '%s'", provider)
+                logging.warning(
+                    "Unknown closing odds provider '%s'; only the local odds_history.csv file is supported.",
+                    provider,
+                )
                 continue
 
             logging.info(
@@ -4243,33 +4252,6 @@ class ClosingOddsArchiveSyncer:
             )
             archive = fetcher.fetch(seasons)
 
-            if archive.empty and provider_name == "KillerSports":
-                logging.warning(
-                    "KillerSports returned no closing odds; falling back to OddsPortal.",
-                )
-                oddsportal_headers: Dict[str, str] = {}
-                if self.config.oddsportal_cookie:
-                    oddsportal_headers["Cookie"] = self.config.oddsportal_cookie
-                if self.config.oddsportal_accept_language:
-                    oddsportal_headers["Accept-Language"] = self.config.oddsportal_accept_language
-
-                fetcher = OddsPortalFetcher(
-                    self.session,
-                    base_url=self.config.oddsportal_base_url,
-                    results_path=self.config.oddsportal_results_path,
-                    season_path_template=self.config.oddsportal_season_template,
-                    timeout=self.config.closing_odds_timeout,
-                    user_agents=self.config.oddsportal_user_agents,
-                    extra_headers=oddsportal_headers or None,
-                )
-                provider_name = "OddsPortal"
-                local_provider = False
-                archive = fetcher.fetch(seasons)
-
-            if archive.empty and provider_name == "OddsPortal":
-                logging.warning(
-                    "OddsPortal returned no closing odds; verify access or provide an HTML override via NFL_ODDSPORTAL_HTML_OVERRIDE."
-                )
             if archive.empty:
                 logging.warning(
                     "%s did not return any closing odds for seasons %s; trying next provider if available",
@@ -7789,14 +7771,32 @@ class SupplementalDataLoader:
         self.weather_records = self._load_records(config.weather_forecast_path)
         self.travel_context_records = self._load_records(config.rest_travel_context_path)
 
-        # Historical closing odds must come from a verified API/scrape or the database;
-        # ignore any legacy CSV paths to prevent stale data from being ingested.
-        if config.closing_odds_history_path:
-            logging.info(
-                "Ignoring local closing odds history file %s; use a live provider instead.",
-                config.closing_odds_history_path,
-            )
         self.closing_odds_records: List[Dict[str, Any]] = []
+        if config.closing_odds_history_path:
+            closing_path = Path(config.closing_odds_history_path)
+            if not closing_path.exists():
+                logging.warning(
+                    "Closing odds history file %s not found; update NFL_CLOSING_ODDS_PATH or place odds_history.csv in the data folder.",
+                    closing_path,
+                )
+            else:
+                try:
+                    self.closing_odds_records = pd.read_csv(closing_path).to_dict(orient="records")
+                    logging.info(
+                        "Loaded %d closing odds rows from %s",
+                        len(self.closing_odds_records),
+                        closing_path,
+                    )
+                except Exception:
+                    logging.exception(
+                        "Unable to load closing odds history from %s; ensure it is a valid CSV.",
+                        closing_path,
+                    )
+                    self.closing_odds_records = []
+        else:
+            logging.info(
+                "No closing odds history path configured; set NFL_CLOSING_ODDS_PATH to load odds_history.csv instead of scraping.",
+            )
 
         self.injuries_by_game = self._index_records(self.injury_records, "game_id")
         self.injuries_by_team = self._index_records(self.injury_records, "team")
@@ -8395,11 +8395,7 @@ class NFLConfig:
     )
     closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER")
     if not closing_odds_provider:
-        closing_odds_provider = (
-            "oddsportal,killersports"
-            if _ks_api_key_env or (_ks_username_env and _ks_password_env)
-            else "oddsportal"
-        )
+        closing_odds_provider = "local"
     closing_odds_timeout: int = int(os.getenv("NFL_CLOSING_ODDS_TIMEOUT", "45"))
     closing_odds_download_dir: Optional[str] = os.getenv("NFL_CLOSING_ODDS_DOWNLOAD_DIR")
     oddsportal_base_url: str = os.getenv(
@@ -10244,9 +10240,9 @@ class NFLIngestor:
             return
 
         provider_hint = (self.config.closing_odds_provider or "").strip().lower()
-        if provider_hint in {"none", "off", "disable", "disabled", "local", "csv", "file", "history", "offline", ""}:
+        if provider_hint in {"none", "off", "disable", "disabled", ""}:
             logging.warning(
-                "Closing odds provider is disabled. Set NFL_CLOSING_ODDS_PROVIDER to oddsportal or killersports to download verified lines."
+                "Closing odds provider is disabled; odds will not be refreshed automatically."
             )
             return
 
@@ -21064,10 +21060,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "extras",
         nargs="*",
-        help=(
-            "Unsupported positional arguments. Run `python oddsportal_debug.py ...` directly "
-            "for OddsPortal troubleshooting instead of passing it here."
-        ),
+        help="Unsupported positional arguments; this script only accepts the documented pipeline flags.",
     )
     return parser.parse_args()
 
@@ -21164,14 +21157,10 @@ def log_observability_samples(db: NFLDatabase, seasons: Sequence[str]) -> None:
 
 
 def main() -> None:
-    # Enable HTML capture by default so empty OddsPortal responses are saved automatically
-    # for troubleshooting unless the user explicitly opts out.
-    os.environ.setdefault("NFL_ODDSPORTAL_DEBUG_HTML", "1")
-
     args = parse_args()
     if getattr(args, "extras", None):
         logging.error(
-            "Unrecognized arguments: %s. To inspect OddsPortal slugs use `python oddsportal_debug.py --season ... --slug ...`.",
+            "Unrecognized arguments: %s. Remove the extra values and rerun.",
             " ".join(args.extras),
         )
         sys.exit(2)
