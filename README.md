@@ -302,6 +302,10 @@ python oddsportal_debug.py --season 2024-regular --log-level DEBUG
 > an extra argument to `NFL_SPORTSBETTING.py` will be rejected because the main
 > CLI only accepts the documented pipeline flags.
 
+If you point `--html-file` at a document that does not resemble an OddsPortal
+results page (for example `README.md`), the helper now stops with a clear error
+so you can swap in a browser-saved OddsPortal page source instead.
+
 The script disables HTML overrides by default so you can confirm whether live
 requests are being blocked or whether the parser is failing on returned HTML.
 If you pass `--html-file`, make sure the file is a saved OddsPortal **page

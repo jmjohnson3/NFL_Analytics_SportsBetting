@@ -97,7 +97,7 @@ def _load_html(fetcher: Any, slug: str, html_file: Optional[Path]) -> tuple[str 
     return html, url
 
 
-def inspect_slug(fetcher: Any, slug: str, season: str, html_file: Optional[Path]) -> None:
+def inspect_slug(fetcher: Any, slug: str, season: str, html_file: Optional[Path]) -> bool:
     html, source = _load_html(fetcher, slug, html_file)
     if not html:
         logging.error("No HTML returned for %s", source)
@@ -111,6 +111,12 @@ def inspect_slug(fetcher: Any, slug: str, season: str, html_file: Optional[Path]
             "Input HTML does not look like an OddsPortal results page (%s). If you passed --html-file, make sure it is a saved OddsPortal page source.",
             ops_reason,
         )
+        if html_file:
+            logging.error(
+                "Provided --html-file %s does not resemble an OddsPortal page; supply a saved OddsPortal results HTML instead.",
+                html_file,
+            )
+            return False
 
     # Surface bot-wall signals immediately.
     fetcher._detect_bot_wall(html, url=source)
@@ -134,13 +140,15 @@ def inspect_slug(fetcher: Any, slug: str, season: str, html_file: Optional[Path]
         frame = fetcher._parse_results_page(html, season, slug)
     except Exception:
         logging.exception("Parser raised an exception for %s", source)
-        return
+        return False
 
     if frame.empty:
         logging.warning("Parser returned an empty frame for %s", source)
-    else:
-        logging.info("Parser returned %d rows and columns: %s", len(frame), list(frame.columns))
-        logging.debug("First rows:\n%s", frame.head().to_string())
+        return False
+
+    logging.info("Parser returned %d rows and columns: %s", len(frame), list(frame.columns))
+    logging.debug("First rows:\n%s", frame.head().to_string())
+    return True
 
 
 def main() -> None:
@@ -208,8 +216,20 @@ def main() -> None:
     else:
         slugs = fetcher._season_slugs(args.season)
 
+    any_success = False
     for slug in slugs:
-        inspect_slug(fetcher, slug, args.season, args.html_file)
+        parsed = inspect_slug(fetcher, slug, args.season, args.html_file)
+        any_success = any_success or parsed
+
+    if args.html_file and not any_success:
+        raise SystemExit(
+            "No closing odds could be parsed from the provided --html-file. Pass a saved OddsPortal results HTML page (Ctrl+S page source) or omit --html-file to fetch live.",
+        )
+
+    if not args.html_file and not any_success:
+        raise SystemExit(
+            "No closing odds were parsed from live OddsPortal requests. Check the logs above for bot-wall guidance and confirm the slugs are correct.",
+        )
 
 
 if __name__ == "__main__":
