@@ -221,9 +221,19 @@ def main() -> None:
         parsed = inspect_slug(fetcher, slug, args.season, args.html_file)
         any_success = any_success or parsed
 
+        # If a provided HTML file is not a valid OddsPortal page or parsed empty,
+        # fall back to a live fetch so users can quickly compare local vs live.
+        if args.html_file and not parsed:
+            logging.warning(
+                "Falling back to live OddsPortal request for %s because the provided --html-file did not yield closing odds.",
+                slug,
+            )
+            parsed_live = inspect_slug(fetcher, slug, args.season, None)
+            any_success = any_success or parsed_live
+
     if args.html_file and not any_success:
         raise SystemExit(
-            "No closing odds could be parsed from the provided --html-file. Pass a saved OddsPortal results HTML page (Ctrl+S page source) or omit --html-file to fetch live.",
+            "No closing odds could be parsed from the provided --html-file or the live fallback. Pass a browser-saved OddsPortal results HTML page (Ctrl+S page source) or omit --html-file to fetch live only.",
         )
 
     if not args.html_file and not any_success:
