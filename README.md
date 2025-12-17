@@ -337,6 +337,40 @@ source** (e.g., right-click → View Page Source → Save) rather than a rendere
 screenshot or unrelated text file; the helper now logs a warning when the HTML
 does not look like an OddsPortal page.
 
+###### Everything-at-once example
+
+Below is a maximal example that exercises every flag. Replace the placeholder
+values (`<...>`) with your own cookies/headers/proxy and point `--html-file`
+at a saved OddsPortal page source if you want to compare local versus live
+fetching:
+
+```bash
+python oddsportal_debug.py \
+  --season nfl-2024-2025 \
+  --slug nfl-2024-2025/results/ \
+  --html-file reports/oddsportal_debug/<saved-page>.html \
+  --base-url "https://www.oddsportal.com/american-football/usa/" \
+  --results-path nfl/results/ \
+  --season-template "nfl-{season}/results/" \
+  --timeout 60 \
+  --cookie "cf_clearance=<your-cookie>; other_cookie=<value>" \
+  --header "Accept-Language: en-US,en;q=0.8" \
+  --header "User-Agent: <your-browser-user-agent>" \
+  --proxy "http://user:pass@proxy-host:8080" \
+  --log-level DEBUG
+```
+
+Notes:
+
+- `--slug` can be repeated; when omitted the helper builds slugs from
+  `--season-template`.
+- Use `--header` as many times as needed to mirror your browser (user agent,
+  language, cache-control, etc.).
+- The proxy flag accepts HTTP or HTTPS URLs. If not needed, drop the argument
+  and the helper will connect directly.
+- If `--html-file` is omitted, the helper only fetches live HTML with the
+  headers/cookies/proxy you provided.
+
 Example shell snippet for the default OddsPortal sync:
 
 ```bash
