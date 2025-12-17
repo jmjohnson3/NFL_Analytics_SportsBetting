@@ -158,11 +158,28 @@ evaluation you intend to trust for live betting decisions.
 
 ### Choosing a closing-odds source
 
-Closing odds are now loaded exclusively from a local CSV archive (the included
-`data/closing_odds_history.csv` or any file you point to via
-`NFL_CLOSING_ODDS_PATH`). Populate that file with your vetted
-`odds_history.csv` data and the run will ingest those closing moneylines—no
-scraping or third-party downloads are attempted.
+You now have two supported options for filling closing moneylines:
+
+1) **Local CSV (default).** Point `NFL_CLOSING_ODDS_PATH` at your
+   `odds_history.csv` (the bundled `data/closing_odds_history.csv` sample still
+   works). Set `NFL_CLOSING_ODDS_PROVIDER=local` (or leave unset) to rely solely
+   on your archive.
+
+2) **The Odds API.** Set `NFL_CLOSING_ODDS_PROVIDER=oddsapi` and provide the
+   following environment variables to download closes directly from
+   https://the-odds-api.com instead of scraping:
+
+   - `NFL_ODDS_API_KEY` – your The Odds API key (required)
+   - `NFL_ODDS_API_SPORT` – defaults to `americanfootball_nfl`
+   - `NFL_ODDS_API_REGIONS` – defaults to `us`
+   - `NFL_ODDS_API_MARKETS` – defaults to `h2h` (moneyline)
+   - `NFL_ODDS_API_BOOKMAKER` – optional bookmaker key to prefer
+   - `NFL_ODDS_API_FORMAT` – defaults to `american`
+   - `NFL_ODDS_API_SNAPSHOT` – optional ISO timestamp to pull historical
+     snapshots (paid plans only)
+
+Historical snapshots via The Odds API require a paid plan; without the snapshot
+parameter the provider fetches the latest available odds for each event.
 
 ## Play-by-play simulation vs. current scope
 

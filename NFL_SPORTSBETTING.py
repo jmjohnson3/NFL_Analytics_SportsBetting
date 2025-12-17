@@ -4054,6 +4054,191 @@ def _parse_killersports_html_table(html: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+class OddsApiFetcher:
+    """Retrieve closing odds from The Odds API instead of scraping."""
+
+    def __init__(
+        self,
+        session: requests.Session,
+        *,
+        api_key: Optional[str],
+        sport_key: str = "americanfootball_nfl",
+        regions: str = "us",
+        markets: str = "h2h",
+        odds_format: str = "american",
+        bookmaker: Optional[str] = None,
+        snapshot: Optional[str] = None,
+        timeout: int = 45,
+    ) -> None:
+        self.session = session
+        self.api_key = (api_key or "").strip()
+        self.sport_key = sport_key or "americanfootball_nfl"
+        self.regions = regions or "us"
+        self.markets = markets or "h2h"
+        self.odds_format = odds_format or "american"
+        self.bookmaker = (bookmaker or "").strip() or None
+        self.snapshot = (snapshot or "").strip() or None
+        self.timeout = timeout
+
+    def _build_url(self) -> str:
+        if self.snapshot:
+            return f"https://api.the-odds-api.com/v4/historical/sports/{self.sport_key}/odds"
+        return f"https://api.the-odds-api.com/v4/sports/{self.sport_key}/odds"
+
+    def _request_payload(self) -> Dict[str, str]:
+        params: Dict[str, str] = {
+            "apiKey": self.api_key,
+            "regions": self.regions,
+            "markets": self.markets,
+            "oddsFormat": self.odds_format,
+        }
+        if self.bookmaker:
+            params["bookmakers"] = self.bookmaker
+        if self.snapshot:
+            params["date"] = self.snapshot
+        return params
+
+    def _extract_market_prices(
+        self,
+        bookmakers: Sequence[Dict[str, Any]],
+        home_team: Optional[str],
+        away_team: Optional[str],
+    ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+        target_bookmaker_key = self.bookmaker.lower() if self.bookmaker else None
+        selection: Optional[Dict[str, Any]] = None
+
+        for book in bookmakers or []:
+            key = (book.get("key") or "").lower()
+            if target_bookmaker_key and key != target_bookmaker_key:
+                continue
+            selection = book
+            break
+
+        if selection is None and bookmakers:
+            selection = bookmakers[0]
+
+        if selection is None:
+            return None, None, None
+
+        markets = selection.get("markets") or []
+        market = None
+        for candidate in markets:
+            if (candidate.get("key") or "").lower() == "h2h":
+                market = candidate
+                break
+        if market is None and markets:
+            market = markets[0]
+
+        if market is None:
+            return None, None, None
+
+        outcomes = market.get("outcomes") or []
+        home_ml: Optional[float] = None
+        away_ml: Optional[float] = None
+
+        for outcome in outcomes:
+            name_norm = normalize_team_abbr(outcome.get("name"))
+            desc_norm = normalize_team_abbr(outcome.get("description"))
+            price = outcome.get("price")
+            if home_team and name_norm == home_team:
+                home_ml = price
+            elif home_team and desc_norm == home_team:
+                home_ml = price
+            elif away_team and name_norm == away_team:
+                away_ml = price
+            elif away_team and desc_norm == away_team:
+                away_ml = price
+
+        if home_ml is None and away_ml is None:
+            if len(outcomes) >= 2:
+                home_ml = outcomes[0].get("price")
+                away_ml = outcomes[1].get("price")
+
+        bookmaker_name = selection.get("title") or selection.get("key")
+        return home_ml, away_ml, bookmaker_name
+
+    def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
+        if not self.api_key:
+            logging.warning(
+                "NFL_ODDS_API_KEY not set; skipping The Odds API closing odds provider."
+            )
+            return pd.DataFrame()
+
+        url = self._build_url()
+        params = self._request_payload()
+        logging.info(
+            "Requesting closing odds from The Odds API (%s) with regions=%s markets=%s%s",
+            url,
+            self.regions,
+            self.markets,
+            f" snapshot={self.snapshot}" if self.snapshot else "",
+        )
+
+        try:
+            response = self.session.get(url, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            logging.exception("Failed to download closing odds from The Odds API")
+            return pd.DataFrame()
+
+        events = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
+        if not isinstance(events, list):
+            logging.warning(
+                "The Odds API response did not contain an event list; received: %s",
+                type(events).__name__,
+            )
+            return pd.DataFrame()
+
+        season_labels = {str(season) for season in seasons} if seasons else set()
+        records: List[Dict[str, Any]] = []
+
+        for event in events:
+            try:
+                commence_raw = event.get("commence_time")
+                kickoff = pd.to_datetime(commence_raw, errors="coerce", utc=True)
+                season_label = _infer_regular_season_label_from_timestamp(kickoff)
+                if season_labels and season_label not in season_labels:
+                    continue
+
+                home_team = normalize_team_abbr(event.get("home_team"))
+                away_team = normalize_team_abbr(event.get("away_team"))
+
+                home_ml, away_ml, bookmaker_name = self._extract_market_prices(
+                    event.get("bookmakers") or [],
+                    home_team,
+                    away_team,
+                )
+
+                if home_ml is None and away_ml is None:
+                    logging.debug(
+                        "Skipping event %s because no moneyline prices were present",
+                        event.get("id"),
+                    )
+                    continue
+
+                records.append(
+                    {
+                        "season": season_label,
+                        "home_team": home_team,
+                        "away_team": away_team,
+                        "home_closing_moneyline": home_ml,
+                        "away_closing_moneyline": away_ml,
+                        "closing_line_time": kickoff,
+                        "closing_bookmaker": bookmaker_name or "The Odds API",
+                    }
+                )
+            except Exception:
+                logging.debug("Unable to parse The Odds API event payload", exc_info=True)
+
+        if not records:
+            logging.warning("The Odds API returned zero usable moneyline records")
+            return pd.DataFrame()
+
+        frame = pd.DataFrame.from_records(records)
+        return _standardize_closing_odds_frame(frame, "The Odds API")
+
+
 class KillerSportsFetcher:
     def __init__(
         self,
@@ -4232,15 +4417,28 @@ class ClosingOddsArchiveSyncer:
         seasons = [str(season) for season in self.config.seasons]
         closing_history_path = self.config.closing_odds_history_path
         for provider in providers:
-            fetcher: Optional[LocalClosingOddsFetcher]
+            fetcher: Optional[Any]
             provider_name: str
 
             if provider in {"local", "csv", "file", "history", "offline"}:
                 fetcher = LocalClosingOddsFetcher(closing_history_path)
                 provider_name = "Local CSV"
+            elif provider in {"oddsapi", "odds-api", "theoddsapi"}:
+                fetcher = OddsApiFetcher(
+                    self.session,
+                    api_key=self.config.odds_api_key,
+                    sport_key=self.config.odds_api_sport_key,
+                    regions=self.config.odds_api_regions,
+                    markets=self.config.odds_api_markets,
+                    odds_format=self.config.odds_api_format,
+                    bookmaker=self.config.odds_api_bookmaker,
+                    snapshot=self.config.odds_api_snapshot,
+                    timeout=self.config.closing_odds_timeout,
+                )
+                provider_name = "The Odds API"
             else:
                 logging.warning(
-                    "Unknown closing odds provider '%s'; only the local odds_history.csv file is supported.",
+                    "Unknown closing odds provider '%s'; supported providers: local, oddsapi.",
                     provider,
                 )
                 continue
@@ -8398,6 +8596,13 @@ class NFLConfig:
         closing_odds_provider = "local"
     closing_odds_timeout: int = int(os.getenv("NFL_CLOSING_ODDS_TIMEOUT", "45"))
     closing_odds_download_dir: Optional[str] = os.getenv("NFL_CLOSING_ODDS_DOWNLOAD_DIR")
+    odds_api_key: Optional[str] = os.getenv("NFL_ODDS_API_KEY")
+    odds_api_sport_key: str = os.getenv("NFL_ODDS_API_SPORT", "americanfootball_nfl")
+    odds_api_regions: str = os.getenv("NFL_ODDS_API_REGIONS", "us")
+    odds_api_markets: str = os.getenv("NFL_ODDS_API_MARKETS", "h2h")
+    odds_api_format: str = os.getenv("NFL_ODDS_API_FORMAT", "american")
+    odds_api_bookmaker: Optional[str] = os.getenv("NFL_ODDS_API_BOOKMAKER")
+    odds_api_snapshot: Optional[str] = os.getenv("NFL_ODDS_API_SNAPSHOT")
     oddsportal_base_url: str = os.getenv(
         "ODDSPORTAL_BASE_URL",
         "https://www.oddsportal.com/american-football/usa/",
