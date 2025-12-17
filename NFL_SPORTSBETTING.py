@@ -4149,6 +4149,12 @@ class ClosingOddsArchiveSyncer:
         self.config = config
         self.db = db
         self.session = requests.Session()
+        if config.oddsportal_proxy:
+            self.session.proxies.update({"http": config.oddsportal_proxy, "https": config.oddsportal_proxy})
+            logging.info(
+                "Routing OddsPortal requests through proxy %s (set via NFL_ODDSPORTAL_PROXY)",
+                config.oddsportal_proxy,
+            )
         if config.odds_ssl_cert_path:
             self.session.verify = config.odds_ssl_cert_path
             logging.info(
@@ -8418,6 +8424,7 @@ class NFLConfig:
     )
     oddsportal_cookie: Optional[str] = os.getenv("NFL_ODDSPORTAL_COOKIE")
     oddsportal_accept_language: Optional[str] = os.getenv("NFL_ODDSPORTAL_ACCEPT_LANGUAGE")
+    oddsportal_proxy: Optional[str] = os.getenv("NFL_ODDSPORTAL_PROXY")
     killersports_base_url: Optional[str] = os.getenv("KILLERSPORTS_BASE_URL")
     killersports_api_key: Optional[str] = _ks_api_key_env
     killersports_username: Optional[str] = _ks_username_env

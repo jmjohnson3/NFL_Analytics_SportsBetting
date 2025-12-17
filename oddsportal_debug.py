@@ -173,6 +173,12 @@ def main() -> None:
         help="Optional Cookie header copied from a browser session to bypass bot walls.",
     )
     parser.add_argument(
+        "--proxy",
+        help=(
+            "Optional HTTP/HTTPS proxy URL (e.g., http://user:pass@host:port) to mimic a browser path or run through a trusted gateway."
+        ),
+    )
+    parser.add_argument(
         "--header",
         action="append",
         help="Extra request header(s) in Key:Value format (can be repeated).",
@@ -206,6 +212,10 @@ def main() -> None:
         ) from exc
 
     session = requests.Session()
+    proxy = args.proxy or os.getenv("NFL_ODDSPORTAL_PROXY")
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+        logging.info("Routing OddsPortal requests through proxy %s", proxy)
     extra_headers = {}
     if args.cookie:
         extra_headers["Cookie"] = args.cookie.strip()
