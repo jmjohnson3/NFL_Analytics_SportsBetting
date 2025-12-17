@@ -17270,6 +17270,27 @@ class ModelTrainer:
             w_tr = w_all[tr_idx] if w_all is not None else None
             w_va = w_all[va_idx] if w_all is not None else None
 
+            usable_cols = [col for col in X_tr.columns if X_tr[col].notna().any()]
+            dropped_cols = sorted(set(X_tr.columns) - set(usable_cols))
+            if dropped_cols:
+                logging.debug(
+                    "%s: fold %d dropping features with no observed training values: %s",
+                    target,
+                    k,
+                    ", ".join(dropped_cols),
+                )
+
+            if not usable_cols:
+                logging.warning(
+                    "%s: fold %d has no usable features after removing all-NaN columns; skipping fold",
+                    target,
+                    k,
+                )
+                continue
+
+            X_tr = X_tr[usable_cols]
+            X_va = X_va[usable_cols]
+
             est = clone(model)
             fit_kwargs = {"regressor__sample_weight": w_tr} if w_tr is not None else {}
             est.fit(X_tr, y_tr, **fit_kwargs)
