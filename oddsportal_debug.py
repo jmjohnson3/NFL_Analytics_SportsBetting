@@ -169,6 +169,15 @@ def main() -> None:
     )
     parser.add_argument("--timeout", type=int, default=45, help="Request timeout in seconds")
     parser.add_argument(
+        "--cookie",
+        help="Optional Cookie header copied from a browser session to bypass bot walls.",
+    )
+    parser.add_argument(
+        "--header",
+        action="append",
+        help="Extra request header(s) in Key:Value format (can be repeated).",
+    )
+    parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging verbosity"
     )
     args = parser.parse_args()
@@ -197,12 +206,26 @@ def main() -> None:
         ) from exc
 
     session = requests.Session()
+    extra_headers = {}
+    if args.cookie:
+        extra_headers["Cookie"] = args.cookie.strip()
+    for header in args.header or []:
+        if not header or ":" not in header:
+            logging.warning("Ignoring malformed --header value (expected Key:Value): %s", header)
+            continue
+        key, value = header.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if key and value:
+            extra_headers[key] = value
+
     fetcher = OddsPortalFetcher(
         session,
         base_url=args.base_url,
         results_path=args.results_path,
         season_path_template=args.season_template,
         timeout=args.timeout,
+        extra_headers=extra_headers or None,
     )
 
     # Ensure overrides from the main pipeline do not mask live debugging behaviour.

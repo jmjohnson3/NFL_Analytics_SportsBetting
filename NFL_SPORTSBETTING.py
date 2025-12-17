@@ -1231,6 +1231,7 @@ class OddsPortalFetcher:
         season_path_template: str = "nfl-{season}/results/",
         timeout: int = 45,
         user_agents: Optional[Sequence[str]] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> None:
         self.session = session
         normalized_base = (base_url or "https://www.oddsportal.com/american-football/usa/").strip()
@@ -1259,6 +1260,30 @@ class OddsPortalFetcher:
         if not candidates:
             candidates.append("Mozilla/5.0")
         self.user_agents = candidates
+        self._extra_headers: Dict[str, str] = {}
+
+        if extra_headers:
+            for key, value in extra_headers.items():
+                if value is None:
+                    continue
+                cleaned_key = str(key).strip()
+                cleaned_value = str(value).strip()
+                if cleaned_key and cleaned_value:
+                    self._extra_headers[cleaned_key] = cleaned_value
+
+        cookie_env = os.environ.get("NFL_ODDSPORTAL_COOKIE")
+        if cookie_env and "Cookie" not in self._extra_headers:
+            self._extra_headers["Cookie"] = cookie_env.strip()
+            logging.warning(
+                "NFL_ODDSPORTAL_COOKIE set; requests will include a custom Cookie header for OddsPortal."
+            )
+
+        language_env = os.environ.get("NFL_ODDSPORTAL_ACCEPT_LANGUAGE")
+        if language_env and "Accept-Language" not in self._extra_headers:
+            self._extra_headers["Accept-Language"] = language_env.strip()
+            logging.info(
+                "NFL_ODDSPORTAL_ACCEPT_LANGUAGE set; overriding Accept-Language for OddsPortal requests."
+            )
         self._insecure_notice_logged = False
         self._insecure_success_logged = False
         self._ssl_failure_logged = False
@@ -1552,6 +1577,7 @@ class OddsPortalFetcher:
             "Referer": self.base_url,
             "Upgrade-Insecure-Requests": "1",
         }
+        base_headers.update(self._extra_headers)
 
         def _build_headers(user_agent: str, *, json_variant: bool) -> Dict[str, str]:
             headers = dict(base_headers)
@@ -4165,6 +4191,12 @@ class ClosingOddsArchiveSyncer:
                 )
                 continue
             elif provider in {"oddsportal", "odds-portal", "op"}:
+                oddsportal_headers: Dict[str, str] = {}
+                if self.config.oddsportal_cookie:
+                    oddsportal_headers["Cookie"] = self.config.oddsportal_cookie
+                if self.config.oddsportal_accept_language:
+                    oddsportal_headers["Accept-Language"] = self.config.oddsportal_accept_language
+
                 fetcher = OddsPortalFetcher(
                     self.session,
                     base_url=self.config.oddsportal_base_url,
@@ -4172,6 +4204,7 @@ class ClosingOddsArchiveSyncer:
                     season_path_template=self.config.oddsportal_season_template,
                     timeout=self.config.closing_odds_timeout,
                     user_agents=self.config.oddsportal_user_agents,
+                    extra_headers=oddsportal_headers or None,
                 )
                 provider_name = "OddsPortal"
             elif provider in {"killersports", "ks"}:
@@ -4208,6 +4241,12 @@ class ClosingOddsArchiveSyncer:
                 logging.warning(
                     "KillerSports returned no closing odds; falling back to OddsPortal.",
                 )
+                oddsportal_headers: Dict[str, str] = {}
+                if self.config.oddsportal_cookie:
+                    oddsportal_headers["Cookie"] = self.config.oddsportal_cookie
+                if self.config.oddsportal_accept_language:
+                    oddsportal_headers["Accept-Language"] = self.config.oddsportal_accept_language
+
                 fetcher = OddsPortalFetcher(
                     self.session,
                     base_url=self.config.oddsportal_base_url,
@@ -4215,6 +4254,7 @@ class ClosingOddsArchiveSyncer:
                     season_path_template=self.config.oddsportal_season_template,
                     timeout=self.config.closing_odds_timeout,
                     user_agents=self.config.oddsportal_user_agents,
+                    extra_headers=oddsportal_headers or None,
                 )
                 provider_name = "OddsPortal"
                 local_provider = False
@@ -8376,6 +8416,8 @@ class NFLConfig:
         )
         if ua.strip()
     )
+    oddsportal_cookie: Optional[str] = os.getenv("NFL_ODDSPORTAL_COOKIE")
+    oddsportal_accept_language: Optional[str] = os.getenv("NFL_ODDSPORTAL_ACCEPT_LANGUAGE")
     killersports_base_url: Optional[str] = os.getenv("KILLERSPORTS_BASE_URL")
     killersports_api_key: Optional[str] = _ks_api_key_env
     killersports_username: Optional[str] = _ks_username_env

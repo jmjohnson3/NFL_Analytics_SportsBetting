@@ -220,6 +220,8 @@ pipeline:
 | `ODDSPORTAL_RESULTS_PATH` | Override the relative results path (defaults to `nfl/results/`). |
 | `ODDSPORTAL_SEASON_TEMPLATE` | Customize the fallback slug template (defaults to `nfl-{season}/results/`). |
 | `ODDSPORTAL_USER_AGENTS` | Comma- or semicolon-separated list of additional User-Agent strings to rotate when scraping OddsPortal. |
+| `NFL_ODDSPORTAL_COOKIE` | Optional raw `Cookie` header copied from a real browser session. Set when OddsPortal returns bot walls so the scraper reuses your authenticated/verified cookies. |
+| `NFL_ODDSPORTAL_ACCEPT_LANGUAGE` | Optional language header override (e.g., `en-US,en;q=0.7`). Used when OddsPortal varies responses by locale or blocks unknown language settings. |
 | `NFL_ODDSPORTAL_HTML_OVERRIDE` | Optional **file path** to a single browser-saved OddsPortal HTML snapshot (e.g., `reports/oddsportal_debug/20251216T200723Z_nfl-2024-regular-results.html`). When set, that file is parsed first before any live requests. To scan a folder of snapshots, use `NFL_ODDSPORTAL_HTML_OVERRIDE_DIR` instead. |
 | `NFL_ODDSPORTAL_HTML_OVERRIDE_DIR` | Optional directory to scan for slug-matching snapshots (e.g., the `reports/oddsportal_debug/` captures from a previous run). If unset, the scraper will still look in `reports/oddsportal_debug/` when it exists. |
 | `NFL_ODDSPORTAL_OVERRIDE_ONLY` | Optional flag (`1/true/on`). When set, the scraper will **not** make live OddsPortal HTTP requests and will rely solely on the provided override/debug HTML. |
@@ -269,11 +271,16 @@ checks before rerunning:
 2. **Rotate User-Agents.** Add extra strings to `ODDSPORTAL_USER_AGENTS` so the
    scraper cycles through more realistic headers. Some regions require a
    desktop-like agent to receive the standard HTML.
-3. **Confirm the results path.** Ensure `ODDSPORTAL_RESULTS_PATH` and
+3. **Reuse your browser cookies.** If the saved HTML looks like a bot wall
+   (Cloudflare/Datadome waiting room, "enable JavaScript", etc.), copy the
+   `Cookie` header from a successful browser visit into `NFL_ODDSPORTAL_COOKIE`
+   (or `--cookie` when using `oddsportal_debug.py`). Pairing this with
+   `NFL_ODDSPORTAL_ACCEPT_LANGUAGE` often restores the normal results page.
+4. **Confirm the results path.** Ensure `ODDSPORTAL_RESULTS_PATH` and
    `ODDSPORTAL_SEASON_TEMPLATE` match the slugs you expect (e.g.,
    `nfl/results/`, `nfl-2024-2025/results/`). Mistyped values will return valid
    pages with no odds rows.
-4. **Share the captured HTML.** If the snapshot clearly contains the odds table
+5. **Share the captured HTML.** If the snapshot clearly contains the odds table
    but parsing still yields zero rows, send the saved file with your bug report
    so the CSS selectors can be updated without re-scraping the season.
 
@@ -301,6 +308,19 @@ python oddsportal_debug.py --season 2024-regular --log-level DEBUG
 > Tip: run the helper directly as shown above. Passing `oddsportal_debug.py` as
 > an extra argument to `NFL_SPORTSBETTING.py` will be rejected because the main
 > CLI only accepts the documented pipeline flags.
+
+When OddsPortal serves a bot wall, rerun with a browser cookie header copied
+from a successful visit:
+
+```bash
+python oddsportal_debug.py --season 2024-regular \
+  --slug nfl-2024-regular/results/ \
+  --cookie "cf_clearance=...; other_cookie=..." \
+  --header "Accept-Language: en-US,en;q=0.7"
+```
+The `--cookie` and repeated `--header` flags feed directly into the scraper so
+you can mirror the exact headers your browser used when the page rendered
+properly.
 
 If you point `--html-file` at a document that does not resemble an OddsPortal
 results page (for example `README.md`), the helper logs the issue and will
