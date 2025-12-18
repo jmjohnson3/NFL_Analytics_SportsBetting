@@ -8131,6 +8131,37 @@ class DefensiveSplitsAPIClient:
 
         return pd.DataFrame(rows)
 
+    def _parse_response(self, text: str) -> pd.DataFrame:
+        cleaned_text = textwrap.dedent(text or "").strip()
+        if not cleaned_text:
+            return pd.DataFrame()
+
+        parse_attempts: List[pd.DataFrame] = []
+        try:
+            parse_attempts.append(pd.read_csv(io.StringIO(cleaned_text), skipinitialspace=True))
+        except Exception:
+            parse_attempts.append(pd.DataFrame())
+
+        normalized_lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+        if normalized_lines:
+            try:
+                parse_attempts.append(
+                    pd.read_csv(io.StringIO("\n".join(normalized_lines)), skipinitialspace=True)
+                )
+            except Exception:
+                parse_attempts.append(pd.DataFrame())
+
+        try:
+            reader = csv.DictReader(normalized_lines)
+            parse_attempts.append(pd.DataFrame(list(reader)))
+        except Exception:
+            parse_attempts.append(pd.DataFrame())
+
+        for frame in parse_attempts:
+            if frame is not None and not frame.empty:
+                return frame
+        return pd.DataFrame()
+
     def fetch(self) -> pd.DataFrame:
         response: Optional[requests.Response] = None
         request_attempts = [
@@ -8152,20 +8183,7 @@ class DefensiveSplitsAPIClient:
             return pd.DataFrame()
 
         try:
-            cleaned_text = textwrap.dedent(response.text).strip()
-            raw_frame = pd.read_csv(io.StringIO(cleaned_text), skipinitialspace=True)
-            if raw_frame.empty and cleaned_text:
-                normalized_lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
-                if normalized_lines:
-                    raw_frame = pd.read_csv(
-                        io.StringIO("\n".join(normalized_lines)), skipinitialspace=True
-                    )
-            if raw_frame.empty and cleaned_text:
-                try:
-                    reader = csv.DictReader(line for line in cleaned_text.splitlines() if line.strip())
-                    raw_frame = pd.DataFrame(list(reader))
-                except Exception:
-                    raw_frame = pd.DataFrame()
+            raw_frame = self._parse_response(response.text)
         except Exception:
             logging.exception(
                 "Failed to parse defensive splits response as CSV from %s", self.api_url
@@ -8342,6 +8360,38 @@ class CoverageSplitsAPIClient:
 
         return standardized
 
+    def _parse_response(self, text: str) -> pd.DataFrame:
+        cleaned_text = textwrap.dedent(text or "").strip()
+        if not cleaned_text:
+            return pd.DataFrame()
+
+        normalized_lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+
+        parse_attempts: List[pd.DataFrame] = []
+        try:
+            parse_attempts.append(pd.read_csv(io.StringIO(cleaned_text), skipinitialspace=True))
+        except Exception:
+            parse_attempts.append(pd.DataFrame())
+
+        if normalized_lines:
+            try:
+                parse_attempts.append(
+                    pd.read_csv(io.StringIO("\n".join(normalized_lines)), skipinitialspace=True)
+                )
+            except Exception:
+                parse_attempts.append(pd.DataFrame())
+
+        try:
+            reader = csv.DictReader(normalized_lines)
+            parse_attempts.append(pd.DataFrame(list(reader)))
+        except Exception:
+            parse_attempts.append(pd.DataFrame())
+
+        for frame in parse_attempts:
+            if frame is not None and not frame.empty:
+                return frame
+        return pd.DataFrame()
+
     def fetch(self) -> pd.DataFrame:
         response: Optional[requests.Response] = None
         request_attempts = [
@@ -8361,20 +8411,7 @@ class CoverageSplitsAPIClient:
             return pd.DataFrame()
 
         try:
-            cleaned_text = textwrap.dedent(response.text).strip()
-            raw_frame = pd.read_csv(io.StringIO(cleaned_text), skipinitialspace=True)
-            if raw_frame.empty and cleaned_text:
-                normalized_lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
-                if normalized_lines:
-                    raw_frame = pd.read_csv(
-                        io.StringIO("\n".join(normalized_lines)), skipinitialspace=True
-                    )
-            if raw_frame.empty and cleaned_text:
-                try:
-                    reader = csv.DictReader(line for line in cleaned_text.splitlines() if line.strip())
-                    raw_frame = pd.DataFrame(list(reader))
-                except Exception:
-                    raw_frame = pd.DataFrame()
+            raw_frame = self._parse_response(response.text)
         except Exception:
             logging.exception(
                 "Failed to parse coverage splits response as CSV from %s", self.api_url
