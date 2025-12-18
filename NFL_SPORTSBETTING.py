@@ -8139,7 +8139,7 @@ class DefensiveSplitsAPIClient:
             return pd.DataFrame()
 
         try:
-            raw_frame = pd.read_csv(io.StringIO(response.text))
+            raw_frame = pd.read_csv(io.StringIO(response.text), skipinitialspace=True)
         except Exception:
             logging.exception(
                 "Failed to parse defensive splits response as CSV from %s", self.api_url
@@ -8325,7 +8325,7 @@ class CoverageSplitsAPIClient:
             return pd.DataFrame()
 
         try:
-            raw_frame = pd.read_csv(io.StringIO(response.text))
+            raw_frame = pd.read_csv(io.StringIO(response.text), skipinitialspace=True)
         except Exception:
             logging.exception(
                 "Failed to parse coverage splits response as CSV from %s", self.api_url
