@@ -139,6 +139,7 @@ DEFAULT_TRAVEL_CONTEXT_PATH: Optional[str] = None
 # Coverage data can come from an API or scraped HTML; local CSVs are optional
 DEFAULT_COVERAGE_ADJUSTMENTS_PATH = None
 DEFAULT_TEAM_COVERAGE_PATH = None
+DEFAULT_DEFENSIVE_SPLITS_PATH: Optional[str] = None
 
 # Guardrails used to decide when paper trading is mandatory due to incomplete
 # market/situational coverage.
@@ -7792,6 +7793,14 @@ def normalize_position(value: Any) -> str:
     return text
 
 
+def _coerce_position_group(position: str, groups: Dict[str, Set[str]]) -> str:
+    normalized = normalize_position(position)
+    for key, values in groups.items():
+        if normalized in values:
+            return key
+    return "OTHER"
+
+
 def normalize_practice_status(value: Any) -> str:
     text = str(value or "").lower().strip()
     if not text:
@@ -7968,6 +7977,7 @@ class SupplementalDataLoader:
         self.advanced_records = self._load_records(config.advanced_metrics_path)
         self.weather_records = self._load_records(config.weather_forecast_path)
         self.travel_context_records = self._load_records(config.rest_travel_context_path)
+        self.defensive_split_records = self._load_records(config.defensive_splits_path)
 
         self.closing_odds_records: List[Dict[str, Any]] = []
         if config.closing_odds_history_path:
@@ -8010,6 +8020,9 @@ class SupplementalDataLoader:
 
         self.closing_odds_frame = self._build_closing_odds_frame(self.closing_odds_records)
         self.travel_context_frame = self._build_travel_context_frame(self.travel_context_records)
+        self.defensive_splits_frame = self._build_defensive_splits_frame(
+            self.defensive_split_records
+        )
 
     @staticmethod
     def _load_records(path: Optional[str]) -> List[Dict[str, Any]]:
@@ -8033,6 +8046,9 @@ class SupplementalDataLoader:
                     return [dict(item) for item in payload]
                 logging.warning("Unsupported JSON format in %s", file_path)
                 return []
+
+            if file_path.suffix.lower() == ".csv":
+                return pd.read_csv(file_path).to_dict(orient="records")
 
             logging.info(
                 "Ignoring supplemental file %s (unsupported extension); rely on database/API sources instead.",
@@ -8152,6 +8168,30 @@ class SupplementalDataLoader:
         for col in numeric_cols:
             if col in frame.columns:
                 frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        return frame
+
+    def _build_defensive_splits_frame(
+        self, records: List[Dict[str, Any]]
+    ) -> pd.DataFrame:
+        if not records:
+            return pd.DataFrame(
+                columns=[
+                    "defense_team",
+                    "position_group",
+                    "passing_yards_multiplier",
+                    "rushing_yards_multiplier",
+                    "receiving_targets_multiplier",
+                    "receiving_yards_multiplier",
+                    "receptions_multiplier",
+                ]
+            )
+
+        frame = pd.DataFrame(records)
+        team_col = "defense_team" if "defense_team" in frame.columns else "team"
+        frame[team_col] = frame[team_col].apply(normalize_team_abbr)
+        if "position_group" in frame.columns:
+            frame["position_group"] = frame["position_group"].astype(str).str.upper()
+        frame = frame.rename(columns={team_col: "defense_team"})
         return frame
 
     @staticmethod
@@ -8543,6 +8583,9 @@ class NFLConfig:
     rest_travel_context_path: Optional[str] = os.getenv("NFL_TRAVEL_CONTEXT_PATH") or DEFAULT_TRAVEL_CONTEXT_PATH
     coverage_adjustments_path: Optional[str] = os.getenv("NFL_COVERAGE_ADJUSTMENTS_PATH")
     team_coverage_scheme_path: Optional[str] = os.getenv("NFL_TEAM_COVERAGE_PATH")
+    defensive_splits_path: Optional[str] = os.getenv(
+        "NFL_DEFENSIVE_SPLITS_PATH", DEFAULT_DEFENSIVE_SPLITS_PATH
+    )
     coverage_api_base: Optional[str] = os.getenv("NFL_COVERAGE_API_BASE")
     coverage_api_key: Optional[str] = os.getenv("NFL_COVERAGE_API_KEY")
     coverage_api_player_endpoint: Optional[str] = os.getenv(
@@ -8582,6 +8625,7 @@ class NFLConfig:
     player_history_cap_headroom: float = float(
         os.getenv("NFL_PLAYER_HISTORY_CAP_HEADROOM", str(PLAYER_HISTORY_CAP_HEADROOM))
     )
+    enable_defensive_splits: bool = env_flag("NFL_ENABLE_DEFENSIVE_SPLITS", False)
     _ks_api_key_env: Optional[str] = os.getenv("KILLERSPORTS_API_KEY") or os.getenv(
         "NFL_KILLERSPORTS_API_KEY"
     )
@@ -12013,6 +12057,7 @@ class FeatureBuilder:
         self.injury_frame: Optional[pd.DataFrame] = None
         self.depth_chart_frame: Optional[pd.DataFrame] = None
         self.advanced_metrics_frame: Optional[pd.DataFrame] = None
+        self.defensive_splits_frame: Optional[pd.DataFrame] = None
         self.latest_odds_lookup: Optional[pd.DataFrame] = None
         self.game_totals_frame: Optional[pd.DataFrame] = None
         self.player_prop_lines_frame: Optional[pd.DataFrame] = None
@@ -14100,6 +14145,8 @@ class FeatureBuilder:
             "TE": {"TE"},
         }
 
+        apply_defensive_adjustment = env_flag("NFL_ENABLE_DEFENSIVE_SPLITS", False)
+
         def _is_stale_lineup_entry(row: Any, now: Optional[Union[str, dt.datetime]] = None) -> bool:
             if isinstance(row, pd.Series):
                 series = row
@@ -14145,6 +14192,46 @@ class FeatureBuilder:
                 normalize_position
             )
 
+        matchup_rows: list[dict[str, Any]] = []
+        for game in upcoming_games.itertuples(index=False):
+            home_team = normalize_team_abbr(getattr(game, "home_team", ""))
+            away_team = normalize_team_abbr(getattr(game, "away_team", ""))
+            matchup_rows.append({"team": home_team, "_upcoming_opponent": away_team})
+            matchup_rows.append({"team": away_team, "_upcoming_opponent": home_team})
+
+        matchup_df = pd.DataFrame(matchup_rows)
+        if "team" in latest_players.columns:
+            latest_players["team"] = latest_players["team"].apply(normalize_team_abbr)
+        if not matchup_df.empty:
+            latest_players = latest_players.merge(matchup_df, on="team", how="left")
+        else:
+            latest_players["_upcoming_opponent"] = np.nan
+
+        latest_players["position_group"] = latest_players.get("position", "").apply(
+            lambda pos: _coerce_position_group(pos, position_groups)
+        )
+
+        defensive_splits = self.defensive_splits_frame
+        if (defensive_splits is None or defensive_splits.empty) and getattr(
+            self, "supplemental_loader", None
+        ) is not None:
+            defensive_splits = getattr(self.supplemental_loader, "defensive_splits_frame", None)
+
+        if defensive_splits is not None and not defensive_splits.empty:
+            defense_frame = defensive_splits.copy()
+            defense_frame["defense_team"] = defense_frame["defense_team"].apply(
+                normalize_team_abbr
+            )
+            defense_frame["position_group"] = defense_frame["position_group"].astype(
+                str
+            ).str.upper()
+            latest_players = latest_players.merge(
+                defense_frame,
+                left_on=["_upcoming_opponent", "position_group"],
+                right_on=["defense_team", "position_group"],
+                how="left",
+            )
+
         stat_columns = [
             "passing_attempts",
             "passing_yards",
@@ -14163,6 +14250,45 @@ class FeatureBuilder:
             recent_source.get("start_time"), errors="coerce"
         )
         present_stats = [col for col in stat_columns if col in recent_source.columns]
+
+        def _defensive_multiplier(df: pd.DataFrame, stat: str) -> pd.Series:
+            if not apply_defensive_adjustment:
+                return pd.Series(1.0, index=df.index, dtype=float)
+
+            candidates: List[pd.Series] = []
+            direct_col = f"{stat}_multiplier"
+            if direct_col in df.columns:
+                candidates.append(pd.to_numeric(df[direct_col], errors="coerce"))
+
+            allowed_cols = [
+                f"{stat}_allowed",
+                f"{stat}_per_game_allowed",
+                f"{stat}_per_opportunity_allowed",
+            ]
+            baseline_cols = [
+                f"league_{stat}",
+                f"{stat}_league_avg",
+                f"{stat}_baseline",
+            ]
+
+            for allowed_col in allowed_cols:
+                if allowed_col not in df.columns:
+                    continue
+                allowed = pd.to_numeric(df[allowed_col], errors="coerce")
+                for baseline_col in baseline_cols:
+                    if baseline_col not in df.columns:
+                        continue
+                    baseline = pd.to_numeric(df[baseline_col], errors="coerce")
+                    baseline = baseline.replace(0, np.nan)
+                    candidates.append(allowed / baseline)
+
+            if candidates:
+                combined = candidates[0]
+                for series in candidates[1:]:
+                    combined = combined.combine_first(series)
+                return combined.fillna(1.0)
+
+            return pd.Series(1.0, index=df.index, dtype=float)
 
         if present_stats:
             recent_stats = (
@@ -14290,6 +14416,9 @@ class FeatureBuilder:
                 weight_sum = weight_sum.replace(0, np.nan)
                 weighted_values = sum(series * weight for series, weight in components)
                 weighted_values = weighted_values / weight_sum
+                weighted_values = weighted_values * _defensive_multiplier(
+                    latest_players, col
+                )
 
                 # Where data is missing, fall back gracefully in priority order: season -> recent -> latest
                 blended = weighted_values
