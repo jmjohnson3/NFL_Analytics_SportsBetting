@@ -8132,11 +8132,23 @@ class DefensiveSplitsAPIClient:
         return pd.DataFrame(rows)
 
     def fetch(self) -> pd.DataFrame:
-        try:
-            response = requests.get(self.api_url, timeout=self.timeout_seconds)
-            response.raise_for_status()
-        except Exception:  # pragma: no cover - network variability
-            logging.exception("Unable to download defensive splits from %s", self.api_url)
+        response: Optional[requests.Response] = None
+        request_attempts = [
+            lambda: requests.Session().get(self.api_url, timeout=self.timeout_seconds),
+            lambda: requests.get(self.api_url, timeout=self.timeout_seconds),
+        ]
+        for attempt in request_attempts:
+            try:
+                candidate = attempt()
+                candidate.raise_for_status()
+                response = candidate
+                break
+            except Exception:
+                logging.exception(
+                    "Unable to download defensive splits from %s", self.api_url
+                )
+                continue
+        if response is None:
             return pd.DataFrame()
 
         try:
@@ -8331,11 +8343,21 @@ class CoverageSplitsAPIClient:
         return standardized
 
     def fetch(self) -> pd.DataFrame:
-        try:
-            response = requests.get(self.api_url, timeout=self.timeout_seconds)
-            response.raise_for_status()
-        except Exception:
-            logging.exception("Unable to download coverage splits from %s", self.api_url)
+        response: Optional[requests.Response] = None
+        request_attempts = [
+            lambda: requests.get(self.api_url, timeout=self.timeout_seconds),
+            lambda: requests.Session().get(self.api_url, timeout=self.timeout_seconds),
+        ]
+        for attempt in request_attempts:
+            try:
+                candidate = attempt()
+                candidate.raise_for_status()
+                response = candidate
+                break
+            except Exception:
+                logging.exception("Unable to download coverage splits from %s", self.api_url)
+                continue
+        if response is None:
             return pd.DataFrame()
 
         try:
