@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import dataclasses
 import datetime as dt
 import io
@@ -8147,6 +8148,12 @@ class DefensiveSplitsAPIClient:
                     raw_frame = pd.read_csv(
                         io.StringIO("\n".join(normalized_lines)), skipinitialspace=True
                     )
+            if raw_frame.empty and cleaned_text:
+                try:
+                    reader = csv.DictReader(line for line in cleaned_text.splitlines() if line.strip())
+                    raw_frame = pd.DataFrame(list(reader))
+                except Exception:
+                    raw_frame = pd.DataFrame()
         except Exception:
             logging.exception(
                 "Failed to parse defensive splits response as CSV from %s", self.api_url
@@ -8340,6 +8347,12 @@ class CoverageSplitsAPIClient:
                     raw_frame = pd.read_csv(
                         io.StringIO("\n".join(normalized_lines)), skipinitialspace=True
                     )
+            if raw_frame.empty and cleaned_text:
+                try:
+                    reader = csv.DictReader(line for line in cleaned_text.splitlines() if line.strip())
+                    raw_frame = pd.DataFrame(list(reader))
+                except Exception:
+                    raw_frame = pd.DataFrame()
         except Exception:
             logging.exception(
                 "Failed to parse coverage splits response as CSV from %s", self.api_url
