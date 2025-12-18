@@ -140,6 +140,9 @@ DEFAULT_TRAVEL_CONTEXT_PATH: Optional[str] = None
 DEFAULT_COVERAGE_ADJUSTMENTS_PATH = None
 DEFAULT_TEAM_COVERAGE_PATH = None
 DEFAULT_DEFENSIVE_SPLITS_PATH: Optional[str] = None
+DEFAULT_DEFENSIVE_SPLITS_API_URL: str = (
+    "https://raw.githubusercontent.com/nflverse/nflverse-data/master/defense/defense_stats.csv"
+)
 
 # Guardrails used to decide when paper trading is mandatory due to incomplete
 # market/situational coverage.
@@ -7968,6 +7971,180 @@ def ensure_lineup_players_in_latest(
 # ---------------------------------------------------------------------------
 
 
+class DefensiveSplitsAPIClient:
+    """Fetch defensive split multipliers from a free public API.
+
+    The default endpoint uses the nflverse public dataset hosted on GitHub,
+    which exposes per-team defensive efficiency that can be consumed without
+    authentication.
+    """
+
+    def __init__(
+        self, api_url: str = DEFAULT_DEFENSIVE_SPLITS_API_URL, *, timeout_seconds: int = 20
+    ) -> None:
+        self.api_url = api_url
+        self.timeout_seconds = timeout_seconds
+
+    @staticmethod
+    def _choose_column(frame: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+        for col in candidates:
+            if col in frame.columns:
+                return col
+        return None
+
+    @staticmethod
+    def _numeric(frame: pd.DataFrame, col: Optional[str]) -> pd.Series:
+        if col is None or col not in frame.columns:
+            return pd.Series(dtype=float)
+        return pd.to_numeric(frame[col], errors="coerce")
+
+    @staticmethod
+    def _team_column(frame: pd.DataFrame) -> Optional[str]:
+        return DefensiveSplitsAPIClient._choose_column(
+            frame,
+            [
+                "defense_team",
+                "team",
+                "defteam",
+                "club_code",
+                "abbr",
+                "team_abbr",
+                "recent_team",
+            ],
+        )
+
+    def _standardize(self, frame: pd.DataFrame) -> pd.DataFrame:
+        team_col = self._team_column(frame)
+        if team_col is None:
+            logging.warning(
+                "Defensive splits API payload missing a team column; received columns: %s",
+                list(frame.columns),
+            )
+            return pd.DataFrame()
+
+        frame = frame.copy()
+        frame["defense_team"] = frame[team_col].apply(normalize_team_abbr)
+        pass_yards = self._numeric(
+            frame,
+            self._choose_column(
+                frame,
+                [
+                    "pass_yards_allowed",
+                    "pass_yds_allowed",
+                    "pass_yards",
+                    "pass_yds",
+                    "passing_yards_allowed",
+                ],
+            ),
+        )
+        pass_attempts = self._numeric(
+            frame,
+            self._choose_column(
+                frame,
+                ["pass_att_allowed", "pass_att", "pass_attempts_allowed", "pass_attempts"],
+            ),
+        ).replace(0, np.nan)
+        rush_yards = self._numeric(
+            frame,
+            self._choose_column(
+                frame,
+                [
+                    "rush_yards_allowed",
+                    "rush_yds_allowed",
+                    "rush_yards",
+                    "rush_yds",
+                    "rushing_yards_allowed",
+                ],
+            ),
+        )
+        rush_attempts = self._numeric(
+            frame,
+            self._choose_column(
+                frame,
+                ["rush_att_allowed", "rush_att", "rushing_attempts_allowed", "rush_attempts"],
+            ),
+        ).replace(0, np.nan)
+        targets_allowed = self._numeric(
+            frame,
+            self._choose_column(frame, ["targets_allowed", "pass_targets_allowed", "targets"]),
+        )
+        receptions_allowed = self._numeric(
+            frame,
+            self._choose_column(frame, ["receptions_allowed", "receptions", "rec_allowed"]),
+        )
+
+        pass_per_attempt = (pass_yards / pass_attempts).replace([np.inf, -np.inf], np.nan)
+        rush_per_attempt = (rush_yards / rush_attempts).replace([np.inf, -np.inf], np.nan)
+        rec_yards_per_target = pass_per_attempt
+        targets_per_attempt = pass_attempts.where(~pass_attempts.isna(), np.nan)
+        if targets_allowed.notna().any() and pass_attempts.notna().any():
+            targets_per_attempt = (targets_allowed / pass_attempts).replace([np.inf, -np.inf], np.nan)
+        receptions_per_target = (receptions_allowed / targets_allowed).replace(
+            [np.inf, -np.inf], np.nan
+        )
+
+        league_pass = pass_per_attempt.mean(skipna=True)
+        league_rush = rush_per_attempt.mean(skipna=True)
+        league_targets = targets_per_attempt.mean(skipna=True)
+        league_rec_pct = receptions_per_target.mean(skipna=True)
+
+        def _ratio(series: pd.Series, baseline: float) -> pd.Series:
+            if math.isnan(baseline) or baseline == 0:
+                return pd.Series(1.0, index=series.index)
+            return (series / baseline).fillna(1.0)
+
+        pass_multiplier = _ratio(pass_per_attempt, league_pass)
+        rush_multiplier = _ratio(rush_per_attempt, league_rush)
+        target_multiplier = _ratio(targets_per_attempt, league_targets)
+        reception_multiplier = _ratio(receptions_per_target, league_rec_pct)
+
+        position_groups = ["QB", "RB", "WR", "TE"]
+        rows: List[Dict[str, Any]] = []
+        for idx, team in enumerate(frame["defense_team"]):
+            for group in position_groups:
+                rows.append(
+                    {
+                        "defense_team": team,
+                        "position_group": group,
+                        "passing_yards_multiplier": pass_multiplier.iloc[idx]
+                        if group in {"QB", "WR", "TE"}
+                        else 1.0,
+                        "rushing_yards_multiplier": rush_multiplier.iloc[idx]
+                        if group == "RB"
+                        else 1.0,
+                        "receiving_targets_multiplier": target_multiplier.iloc[idx]
+                        if group in {"RB", "WR", "TE"}
+                        else 1.0,
+                        "receiving_yards_multiplier": pass_multiplier.iloc[idx]
+                        if group in {"RB", "WR", "TE"}
+                        else 1.0,
+                        "receptions_multiplier": reception_multiplier.iloc[idx]
+                        if group in {"RB", "WR", "TE"}
+                        else 1.0,
+                    }
+                )
+
+        return pd.DataFrame(rows)
+
+    def fetch(self) -> pd.DataFrame:
+        try:
+            response = requests.get(self.api_url, timeout=self.timeout_seconds)
+            response.raise_for_status()
+        except Exception:  # pragma: no cover - network variability
+            logging.exception("Unable to download defensive splits from %s", self.api_url)
+            return pd.DataFrame()
+
+        try:
+            raw_frame = pd.read_csv(io.StringIO(response.text))
+        except Exception:
+            logging.exception(
+                "Failed to parse defensive splits response as CSV from %s", self.api_url
+            )
+            return pd.DataFrame()
+
+        return self._standardize(raw_frame)
+
+
 class SupplementalDataLoader:
     """Loads optional injury, depth chart, advanced metric, and weather feeds."""
 
@@ -7978,6 +8155,17 @@ class SupplementalDataLoader:
         self.weather_records = self._load_records(config.weather_forecast_path)
         self.travel_context_records = self._load_records(config.rest_travel_context_path)
         self.defensive_split_records = self._load_records(config.defensive_splits_path)
+        if (
+            not self.defensive_split_records
+            and config.enable_defensive_splits
+            and config.defensive_splits_api_url
+        ):
+            client = DefensiveSplitsAPIClient(
+                config.defensive_splits_api_url, timeout_seconds=config.api_timeout_seconds
+            )
+            api_frame = client.fetch()
+            if not api_frame.empty:
+                self.defensive_split_records = api_frame.to_dict(orient="records")
 
         self.closing_odds_records: List[Dict[str, Any]] = []
         if config.closing_odds_history_path:
@@ -8173,18 +8361,18 @@ class SupplementalDataLoader:
     def _build_defensive_splits_frame(
         self, records: List[Dict[str, Any]]
     ) -> pd.DataFrame:
+        columns = [
+            "defense_team",
+            "position_group",
+            "passing_yards_multiplier",
+            "rushing_yards_multiplier",
+            "receiving_targets_multiplier",
+            "receiving_yards_multiplier",
+            "receptions_multiplier",
+        ]
+
         if not records:
-            return pd.DataFrame(
-                columns=[
-                    "defense_team",
-                    "position_group",
-                    "passing_yards_multiplier",
-                    "rushing_yards_multiplier",
-                    "receiving_targets_multiplier",
-                    "receiving_yards_multiplier",
-                    "receptions_multiplier",
-                ]
-            )
+            return pd.DataFrame(columns=columns)
 
         frame = pd.DataFrame(records)
         team_col = "defense_team" if "defense_team" in frame.columns else "team"
@@ -8192,7 +8380,14 @@ class SupplementalDataLoader:
         if "position_group" in frame.columns:
             frame["position_group"] = frame["position_group"].astype(str).str.upper()
         frame = frame.rename(columns={team_col: "defense_team"})
-        return frame
+        for col in columns:
+            if col not in frame.columns:
+                frame[col] = np.nan
+        for col in columns:
+            if col == "position_group" or col == "defense_team":
+                continue
+            frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(1.0)
+        return frame[columns]
 
     @staticmethod
     def _index_records(records: List[Dict[str, Any]], key: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -8586,6 +8781,9 @@ class NFLConfig:
     defensive_splits_path: Optional[str] = os.getenv(
         "NFL_DEFENSIVE_SPLITS_PATH", DEFAULT_DEFENSIVE_SPLITS_PATH
     )
+    defensive_splits_api_url: Optional[str] = os.getenv(
+        "NFL_DEFENSIVE_SPLITS_API_URL", DEFAULT_DEFENSIVE_SPLITS_API_URL
+    )
     coverage_api_base: Optional[str] = os.getenv("NFL_COVERAGE_API_BASE")
     coverage_api_key: Optional[str] = os.getenv("NFL_COVERAGE_API_KEY")
     coverage_api_player_endpoint: Optional[str] = os.getenv(
@@ -8603,6 +8801,7 @@ class NFLConfig:
     msf_timeout_backoff: float = float(
         os.getenv("NFL_API_TIMEOUT_BACKOFF", str(DEFAULT_NFL_API_TIMEOUT_BACKOFF))
     )
+    api_timeout_seconds: int = int(os.getenv("NFL_HTTP_TIMEOUT", "20"))
     msf_http_retries: int = int(os.getenv("NFL_API_HTTP_RETRIES", str(DEFAULT_NFL_API_HTTP_RETRIES)))
     respect_lineups: bool = True
     odds_allow_insecure_ssl: bool = env_flag("ODDS_ALLOW_INSECURE_SSL", False)
