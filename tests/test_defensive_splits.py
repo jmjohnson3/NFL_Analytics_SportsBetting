@@ -1,5 +1,13 @@
+import pathlib
+import sys
+
 import pytest
 
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+pytest.importorskip("aiohttp")
 pd = pytest.importorskip("pandas")
 sqlalchemy = pytest.importorskip("sqlalchemy")
 create_engine = sqlalchemy.create_engine

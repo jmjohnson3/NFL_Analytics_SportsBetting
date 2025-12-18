@@ -1,10 +1,15 @@
+import pathlib
+import sys
+
 import pytest
 
-try:
-    from NFL_SPORTSBETTING import FeatureBuilder
-    from NFL_SPORTSBETTING import NFLConfig, SupplementalDataLoader
-except ModuleNotFoundError as exc:  # pragma: no cover - environment dependency guard
-    pytest.skip(f"NFL_SPORTSBETTING dependency missing: {exc}", allow_module_level=True)
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+pytest.importorskip("aiohttp")
+from NFL_SPORTSBETTING import FeatureBuilder
+from NFL_SPORTSBETTING import NFLConfig, SupplementalDataLoader
 
 sqlalchemy = pytest.importorskip("sqlalchemy")
 create_engine = sqlalchemy.create_engine
