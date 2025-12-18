@@ -40,7 +40,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
 
-from bs4 import BeautifulSoup
 from html import unescape
 
 import aiohttp
@@ -135,7 +134,7 @@ def _default_data_file(name: str) -> Optional[str]:
     return None
 
 
-DEFAULT_CLOSING_ODDS_PATH: Optional[str] = None
+DEFAULT_CLOSING_ODDS_PATH: Optional[str] = _default_data_file("closing_odds_history.csv")
 DEFAULT_TRAVEL_CONTEXT_PATH: Optional[str] = None
 # Coverage data can come from an API or scraped HTML; local CSVs are optional
 DEFAULT_COVERAGE_ADJUSTMENTS_PATH = None
@@ -1211,10 +1210,54 @@ class LocalClosingOddsFetcher:
         self.csv_path = Path(csv_path).expanduser() if csv_path else None
 
     def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
+        if self.csv_path is None:
+            logging.warning(
+                "No closing odds CSV configured. Set NFL_CLOSING_ODDS_PATH to point at your odds_history.csv file."
+            )
+            return pd.DataFrame()
+
+        if not self.csv_path.exists():
+            logging.warning(
+                "Closing odds CSV %s not found; add odds_history.csv to load closing lines.",
+                self.csv_path,
+            )
+            return pd.DataFrame()
+
+        try:
+            raw = pd.read_csv(self.csv_path)
+        except Exception:
+            logging.exception(
+                "Unable to read closing odds CSV from %s; ensure the file is a valid CSV.",
+                self.csv_path,
+            )
+            return pd.DataFrame()
+
+        normalized = _standardize_closing_odds_frame(raw, "Local CSV")
+        if normalized.empty:
+            logging.warning(
+                "Closing odds CSV %s contained no usable rows after normalization.",
+                self.csv_path,
+            )
+            return pd.DataFrame()
+
+        season_labels = {str(season) for season in seasons}
+        if season_labels:
+            normalized = normalized[normalized["season"].isin(season_labels)]
+
+        if normalized.empty:
+            logging.warning(
+                "No closing odds in %s matched seasons %s.",
+                self.csv_path,
+                ", ".join(season_labels) if season_labels else "(none)",
+            )
+            return pd.DataFrame()
+
         logging.info(
-            "Local closing odds CSVs are no longer supported. Configure NFL_CLOSING_ODDS_PROVIDER to an API or scrape source."
+            "Loaded %d closing odds rows from %s",
+            len(normalized),
+            self.csv_path,
         )
-        return pd.DataFrame()
+        return normalized
 
 
 class OddsPortalFetcher:
@@ -1232,6 +1275,7 @@ class OddsPortalFetcher:
         season_path_template: str = "nfl-{season}/results/",
         timeout: int = 45,
         user_agents: Optional[Sequence[str]] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> None:
         self.session = session
         normalized_base = (base_url or "https://www.oddsportal.com/american-football/usa/").strip()
@@ -1260,6 +1304,30 @@ class OddsPortalFetcher:
         if not candidates:
             candidates.append("Mozilla/5.0")
         self.user_agents = candidates
+        self._extra_headers: Dict[str, str] = {}
+
+        if extra_headers:
+            for key, value in extra_headers.items():
+                if value is None:
+                    continue
+                cleaned_key = str(key).strip()
+                cleaned_value = str(value).strip()
+                if cleaned_key and cleaned_value:
+                    self._extra_headers[cleaned_key] = cleaned_value
+
+        cookie_env = os.environ.get("NFL_ODDSPORTAL_COOKIE")
+        if cookie_env and "Cookie" not in self._extra_headers:
+            self._extra_headers["Cookie"] = cookie_env.strip()
+            logging.warning(
+                "NFL_ODDSPORTAL_COOKIE set; requests will include a custom Cookie header for OddsPortal."
+            )
+
+        language_env = os.environ.get("NFL_ODDSPORTAL_ACCEPT_LANGUAGE")
+        if language_env and "Accept-Language" not in self._extra_headers:
+            self._extra_headers["Accept-Language"] = language_env.strip()
+            logging.info(
+                "NFL_ODDSPORTAL_ACCEPT_LANGUAGE set; overriding Accept-Language for OddsPortal requests."
+            )
         self._insecure_notice_logged = False
         self._insecure_success_logged = False
         self._ssl_failure_logged = False
@@ -1477,11 +1545,7 @@ class OddsPortalFetcher:
         if self._html_override_path is not None:
             search_paths.append(self._html_override_path)
         else:
-            if self._debug_dir is not None:
-                search_paths.append(self._debug_dir)
-            default_debug_dir = SCRIPT_ROOT / "reports" / "oddsportal_debug"
-            if default_debug_dir.exists():
-                search_paths.append(default_debug_dir)
+            return []
 
         sanitized_slug = re.sub(r"[^0-9A-Za-z]+", "-", slug.strip("/"))
         html_list: List[str] = []
@@ -1557,6 +1621,7 @@ class OddsPortalFetcher:
             "Referer": self.base_url,
             "Upgrade-Insecure-Requests": "1",
         }
+        base_headers.update(self._extra_headers)
 
         def _build_headers(user_agent: str, *, json_variant: bool) -> Dict[str, str]:
             headers = dict(base_headers)
@@ -1725,24 +1790,7 @@ class OddsPortalFetcher:
         if response.status_code == HTTPStatus.OK:
             text = response.text or ""
             if text.strip():
-                lower_text = text.lower()
-                if not self._bot_wall_notice_logged and any(
-                    token in lower_text
-                    for token in (
-                        "enable javascript",
-                        "browser is checking",
-                        "access denied",
-                        "captcha",
-                        "waiting room",
-                        "bot protection",
-                    )
-                ):
-                    logging.warning(
-                        "OddsPortal responded with a bot-protection page for %s. "
-                        "Supply a browser-saved HTML file via NFL_ODDSPORTAL_HTML_OVERRIDE or update your session headers.",
-                        url,
-                    )
-                    self._bot_wall_notice_logged = True
+                self._detect_bot_wall(text, url=url)
                 if insecure and not self._insecure_success_logged:
                     logging.warning(
                         "OddsPortal request for %s succeeded only after disabling certificate "
@@ -1763,6 +1811,39 @@ class OddsPortalFetcher:
             "OddsPortal request for %s returned status %s", url, response.status_code
         )
         return None
+
+    def _detect_bot_wall(self, html: str, *, url: str) -> None:
+        """Detect and log common bot-protection responses returned by OddsPortal."""
+
+        if self._bot_wall_notice_logged:
+            return
+
+        lower_text = html.lower()
+        bot_tokens = (
+            "enable javascript",
+            "browser is checking",
+            "access denied",
+            "captcha",
+            "waiting room",
+            "bot protection",
+            "pardon the interruption",
+            "unusual traffic",
+            "verify you are human",
+            "please enable cookies",
+            "datadome",
+            "cloudflare",
+            "ddos-guard",
+        )
+
+        if any(token in lower_text for token in bot_tokens):
+            logging.warning(
+                "OddsPortal responded with content that looks like bot-protection for %s. "
+                "Fetch the page in a browser and set NFL_ODDSPORTAL_HTML_OVERRIDE to the saved HTML, "
+                "or adjust your headers/cookies (User-Agent, Accept-Language, session cookies) to mimic a browser.",
+                url,
+            )
+            self._bot_wall_notice_logged = True
+            return
 
     def _extract_json_score(self, entry: Dict[str, Any]) -> Optional[float]:
         values: List[float] = []
@@ -1829,6 +1910,7 @@ class OddsPortalFetcher:
             return pd.DataFrame()
 
         soup = BeautifulSoup(html, "html.parser")
+        self._detect_bot_wall(html, url=urljoin(self.base_url, slug))
         table = soup.find(class_=re.compile(r"\btable-main\b"))
         if table is None:
             table = soup.find(id=re.compile("tournamentTable", re.IGNORECASE))
@@ -3972,6 +4054,191 @@ def _parse_killersports_html_table(html: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+class OddsApiFetcher:
+    """Retrieve closing odds from The Odds API instead of scraping."""
+
+    def __init__(
+        self,
+        session: requests.Session,
+        *,
+        api_key: Optional[str],
+        sport_key: str = "americanfootball_nfl",
+        regions: str = "us",
+        markets: str = "h2h",
+        odds_format: str = "american",
+        bookmaker: Optional[str] = None,
+        snapshot: Optional[str] = None,
+        timeout: int = 45,
+    ) -> None:
+        self.session = session
+        self.api_key = (api_key or "").strip()
+        self.sport_key = sport_key or "americanfootball_nfl"
+        self.regions = regions or "us"
+        self.markets = markets or "h2h"
+        self.odds_format = odds_format or "american"
+        self.bookmaker = (bookmaker or "").strip() or None
+        self.snapshot = (snapshot or "").strip() or None
+        self.timeout = timeout
+
+    def _build_url(self) -> str:
+        if self.snapshot:
+            return f"https://api.the-odds-api.com/v4/historical/sports/{self.sport_key}/odds"
+        return f"https://api.the-odds-api.com/v4/sports/{self.sport_key}/odds"
+
+    def _request_payload(self) -> Dict[str, str]:
+        params: Dict[str, str] = {
+            "apiKey": self.api_key,
+            "regions": self.regions,
+            "markets": self.markets,
+            "oddsFormat": self.odds_format,
+        }
+        if self.bookmaker:
+            params["bookmakers"] = self.bookmaker
+        if self.snapshot:
+            params["date"] = self.snapshot
+        return params
+
+    def _extract_market_prices(
+        self,
+        bookmakers: Sequence[Dict[str, Any]],
+        home_team: Optional[str],
+        away_team: Optional[str],
+    ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+        target_bookmaker_key = self.bookmaker.lower() if self.bookmaker else None
+        selection: Optional[Dict[str, Any]] = None
+
+        for book in bookmakers or []:
+            key = (book.get("key") or "").lower()
+            if target_bookmaker_key and key != target_bookmaker_key:
+                continue
+            selection = book
+            break
+
+        if selection is None and bookmakers:
+            selection = bookmakers[0]
+
+        if selection is None:
+            return None, None, None
+
+        markets = selection.get("markets") or []
+        market = None
+        for candidate in markets:
+            if (candidate.get("key") or "").lower() == "h2h":
+                market = candidate
+                break
+        if market is None and markets:
+            market = markets[0]
+
+        if market is None:
+            return None, None, None
+
+        outcomes = market.get("outcomes") or []
+        home_ml: Optional[float] = None
+        away_ml: Optional[float] = None
+
+        for outcome in outcomes:
+            name_norm = normalize_team_abbr(outcome.get("name"))
+            desc_norm = normalize_team_abbr(outcome.get("description"))
+            price = outcome.get("price")
+            if home_team and name_norm == home_team:
+                home_ml = price
+            elif home_team and desc_norm == home_team:
+                home_ml = price
+            elif away_team and name_norm == away_team:
+                away_ml = price
+            elif away_team and desc_norm == away_team:
+                away_ml = price
+
+        if home_ml is None and away_ml is None:
+            if len(outcomes) >= 2:
+                home_ml = outcomes[0].get("price")
+                away_ml = outcomes[1].get("price")
+
+        bookmaker_name = selection.get("title") or selection.get("key")
+        return home_ml, away_ml, bookmaker_name
+
+    def fetch(self, seasons: Sequence[str]) -> pd.DataFrame:
+        if not self.api_key:
+            logging.warning(
+                "NFL_ODDS_API_KEY not set; skipping The Odds API closing odds provider."
+            )
+            return pd.DataFrame()
+
+        url = self._build_url()
+        params = self._request_payload()
+        logging.info(
+            "Requesting closing odds from The Odds API (%s) with regions=%s markets=%s%s",
+            url,
+            self.regions,
+            self.markets,
+            f" snapshot={self.snapshot}" if self.snapshot else "",
+        )
+
+        try:
+            response = self.session.get(url, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            logging.exception("Failed to download closing odds from The Odds API")
+            return pd.DataFrame()
+
+        events = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
+        if not isinstance(events, list):
+            logging.warning(
+                "The Odds API response did not contain an event list; received: %s",
+                type(events).__name__,
+            )
+            return pd.DataFrame()
+
+        season_labels = {str(season) for season in seasons} if seasons else set()
+        records: List[Dict[str, Any]] = []
+
+        for event in events:
+            try:
+                commence_raw = event.get("commence_time")
+                kickoff = pd.to_datetime(commence_raw, errors="coerce", utc=True)
+                season_label = _infer_regular_season_label_from_timestamp(kickoff)
+                if season_labels and season_label not in season_labels:
+                    continue
+
+                home_team = normalize_team_abbr(event.get("home_team"))
+                away_team = normalize_team_abbr(event.get("away_team"))
+
+                home_ml, away_ml, bookmaker_name = self._extract_market_prices(
+                    event.get("bookmakers") or [],
+                    home_team,
+                    away_team,
+                )
+
+                if home_ml is None and away_ml is None:
+                    logging.debug(
+                        "Skipping event %s because no moneyline prices were present",
+                        event.get("id"),
+                    )
+                    continue
+
+                records.append(
+                    {
+                        "season": season_label,
+                        "home_team": home_team,
+                        "away_team": away_team,
+                        "home_closing_moneyline": home_ml,
+                        "away_closing_moneyline": away_ml,
+                        "closing_line_time": kickoff,
+                        "closing_bookmaker": bookmaker_name or "The Odds API",
+                    }
+                )
+            except Exception:
+                logging.debug("Unable to parse The Odds API event payload", exc_info=True)
+
+        if not records:
+            logging.warning("The Odds API returned zero usable moneyline records")
+            return pd.DataFrame()
+
+        frame = pd.DataFrame.from_records(records)
+        return _standardize_closing_odds_frame(frame, "The Odds API")
+
+
 class KillerSportsFetcher:
     def __init__(
         self,
@@ -4111,6 +4378,12 @@ class ClosingOddsArchiveSyncer:
         self.config = config
         self.db = db
         self.session = requests.Session()
+        if config.oddsportal_proxy:
+            self.session.proxies.update({"http": config.oddsportal_proxy, "https": config.oddsportal_proxy})
+            logging.info(
+                "Routing OddsPortal requests through proxy %s (set via NFL_ODDSPORTAL_PROXY)",
+                config.oddsportal_proxy,
+            )
         if config.odds_ssl_cert_path:
             self.session.verify = config.odds_ssl_cert_path
             logging.info(
@@ -4128,11 +4401,11 @@ class ClosingOddsArchiveSyncer:
             self.session.verify = certifi.where()
 
     def sync(self) -> None:
-        providers_raw = (self.config.closing_odds_provider or "").strip() or "oddsportal"
+        providers_raw = (self.config.closing_odds_provider or "").strip() or "local"
         providers = [p.strip().lower() for p in providers_raw.split(",") if p.strip()]
 
         if not providers:
-            providers = ["oddsportal"]
+            providers = ["local"]
 
         if providers[0] in {"none", "off", "disable", "disabled"}:
             logging.info(
@@ -4142,46 +4415,32 @@ class ClosingOddsArchiveSyncer:
             return
 
         seasons = [str(season) for season in self.config.seasons]
+        closing_history_path = self.config.closing_odds_history_path
         for provider in providers:
-            fetcher: Optional[OddsPortalFetcher | KillerSportsFetcher]
+            fetcher: Optional[Any]
             provider_name: str
 
             if provider in {"local", "csv", "file", "history", "offline"}:
-                logging.warning(
-                    "Local CSV closing odds are no longer supported. Switch NFL_CLOSING_ODDS_PROVIDER to oddsportal or killersports."
-                )
-                continue
-            elif provider in {"oddsportal", "odds-portal", "op"}:
-                fetcher = OddsPortalFetcher(
+                fetcher = LocalClosingOddsFetcher(closing_history_path)
+                provider_name = "Local CSV"
+            elif provider in {"oddsapi", "odds-api", "theoddsapi"}:
+                fetcher = OddsApiFetcher(
                     self.session,
-                    base_url=self.config.oddsportal_base_url,
-                    results_path=self.config.oddsportal_results_path,
-                    season_path_template=self.config.oddsportal_season_template,
+                    api_key=self.config.odds_api_key,
+                    sport_key=self.config.odds_api_sport_key,
+                    regions=self.config.odds_api_regions,
+                    markets=self.config.odds_api_markets,
+                    odds_format=self.config.odds_api_format,
+                    bookmaker=self.config.odds_api_bookmaker,
+                    snapshot=self.config.odds_api_snapshot,
                     timeout=self.config.closing_odds_timeout,
-                    user_agents=self.config.oddsportal_user_agents,
                 )
-                provider_name = "OddsPortal"
-            elif provider in {"killersports", "ks"}:
-                if not (
-                    self.config.killersports_api_key
-                    or self.config.killersports_username
-                    or self.config.killersports_password
-                ):
-                    logging.warning(
-                        "Skipping KillerSports fallback because credentials are not configured (set NFL_KILLERSPORTS_API_KEY or username/password)."
-                    )
-                    continue
-                fetcher = KillerSportsFetcher(
-                    self.session,
-                    base_url=killersports_base_url,
-                    timeout=self.config.closing_odds_timeout,
-                    api_key=self.config.killersports_api_key,
-                    username=self.config.killersports_username,
-                    password=self.config.killersports_password,
-                )
-                provider_name = "KillerSports"
+                provider_name = "The Odds API"
             else:
-                logging.warning("Unknown closing odds provider '%s'", provider)
+                logging.warning(
+                    "Unknown closing odds provider '%s'; supported providers: local, oddsapi.",
+                    provider,
+                )
                 continue
 
             logging.info(
@@ -4191,32 +4450,6 @@ class ClosingOddsArchiveSyncer:
             )
             archive = fetcher.fetch(seasons)
 
-            if archive.empty and provider_name == "KillerSports":
-                logging.warning(
-                    "KillerSports returned no closing odds; falling back to OddsPortal.",
-                )
-                fetcher = OddsPortalFetcher(
-                    self.session,
-                    base_url=self.config.oddsportal_base_url,
-                    results_path=self.config.oddsportal_results_path,
-                    season_path_template=self.config.oddsportal_season_template,
-                    timeout=self.config.closing_odds_timeout,
-                    user_agents=self.config.oddsportal_user_agents,
-                )
-                provider_name = "OddsPortal"
-                local_provider = False
-                archive = fetcher.fetch(seasons)
-
-            if archive.empty and provider_name == "OddsPortal":
-                local_path_exists = Path(closing_history_path).exists()
-                if local_path_exists:
-                    logging.warning(
-                        "OddsPortal returned no closing odds; falling back to local CSV.",
-                    )
-                    fetcher = LocalClosingOddsFetcher(closing_history_path)
-                    provider_name = "Local CSV"
-                    local_provider = True
-                    archive = fetcher.fetch(seasons)
             if archive.empty:
                 logging.warning(
                     "%s did not return any closing odds for seasons %s; trying next provider if available",
@@ -7736,14 +7969,32 @@ class SupplementalDataLoader:
         self.weather_records = self._load_records(config.weather_forecast_path)
         self.travel_context_records = self._load_records(config.rest_travel_context_path)
 
-        # Historical closing odds must come from a verified API/scrape or the database;
-        # ignore any legacy CSV paths to prevent stale data from being ingested.
-        if config.closing_odds_history_path:
-            logging.info(
-                "Ignoring local closing odds history file %s; use a live provider instead.",
-                config.closing_odds_history_path,
-            )
         self.closing_odds_records: List[Dict[str, Any]] = []
+        if config.closing_odds_history_path:
+            closing_path = Path(config.closing_odds_history_path)
+            if not closing_path.exists():
+                logging.warning(
+                    "Closing odds history file %s not found; update NFL_CLOSING_ODDS_PATH or place odds_history.csv in the data folder.",
+                    closing_path,
+                )
+            else:
+                try:
+                    self.closing_odds_records = pd.read_csv(closing_path).to_dict(orient="records")
+                    logging.info(
+                        "Loaded %d closing odds rows from %s",
+                        len(self.closing_odds_records),
+                        closing_path,
+                    )
+                except Exception:
+                    logging.exception(
+                        "Unable to load closing odds history from %s; ensure it is a valid CSV.",
+                        closing_path,
+                    )
+                    self.closing_odds_records = []
+        else:
+            logging.info(
+                "No closing odds history path configured; set NFL_CLOSING_ODDS_PATH to load odds_history.csv instead of scraping.",
+            )
 
         self.injuries_by_game = self._index_records(self.injury_records, "game_id")
         self.injuries_by_team = self._index_records(self.injury_records, "team")
@@ -8342,13 +8593,16 @@ class NFLConfig:
     )
     closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER")
     if not closing_odds_provider:
-        closing_odds_provider = (
-            "oddsportal,killersports"
-            if _ks_api_key_env or (_ks_username_env and _ks_password_env)
-            else "oddsportal"
-        )
+        closing_odds_provider = "local"
     closing_odds_timeout: int = int(os.getenv("NFL_CLOSING_ODDS_TIMEOUT", "45"))
     closing_odds_download_dir: Optional[str] = os.getenv("NFL_CLOSING_ODDS_DOWNLOAD_DIR")
+    odds_api_key: Optional[str] = os.getenv("NFL_ODDS_API_KEY")
+    odds_api_sport_key: str = os.getenv("NFL_ODDS_API_SPORT", "americanfootball_nfl")
+    odds_api_regions: str = os.getenv("NFL_ODDS_API_REGIONS", "us")
+    odds_api_markets: str = os.getenv("NFL_ODDS_API_MARKETS", "h2h")
+    odds_api_format: str = os.getenv("NFL_ODDS_API_FORMAT", "american")
+    odds_api_bookmaker: Optional[str] = os.getenv("NFL_ODDS_API_BOOKMAKER")
+    odds_api_snapshot: Optional[str] = os.getenv("NFL_ODDS_API_SNAPSHOT")
     oddsportal_base_url: str = os.getenv(
         "ODDSPORTAL_BASE_URL",
         "https://www.oddsportal.com/american-football/usa/",
@@ -8369,6 +8623,9 @@ class NFLConfig:
         )
         if ua.strip()
     )
+    oddsportal_cookie: Optional[str] = os.getenv("NFL_ODDSPORTAL_COOKIE")
+    oddsportal_accept_language: Optional[str] = os.getenv("NFL_ODDSPORTAL_ACCEPT_LANGUAGE")
+    oddsportal_proxy: Optional[str] = os.getenv("NFL_ODDSPORTAL_PROXY")
     killersports_base_url: Optional[str] = os.getenv("KILLERSPORTS_BASE_URL")
     killersports_api_key: Optional[str] = _ks_api_key_env
     killersports_username: Optional[str] = _ks_username_env
@@ -10188,9 +10445,9 @@ class NFLIngestor:
             return
 
         provider_hint = (self.config.closing_odds_provider or "").strip().lower()
-        if provider_hint in {"none", "off", "disable", "disabled", "local", "csv", "file", "history", "offline", ""}:
+        if provider_hint in {"none", "off", "disable", "disabled", ""}:
             logging.warning(
-                "Closing odds provider is disabled. Set NFL_CLOSING_ODDS_PROVIDER to oddsportal or killersports to download verified lines."
+                "Closing odds provider is disabled; odds will not be refreshed automatically."
             )
             return
 
@@ -17218,6 +17475,27 @@ class ModelTrainer:
             w_tr = w_all[tr_idx] if w_all is not None else None
             w_va = w_all[va_idx] if w_all is not None else None
 
+            usable_cols = [col for col in X_tr.columns if X_tr[col].notna().any()]
+            dropped_cols = sorted(set(X_tr.columns) - set(usable_cols))
+            if dropped_cols:
+                logging.debug(
+                    "%s: fold %d dropping features with no observed training values: %s",
+                    target,
+                    k,
+                    ", ".join(dropped_cols),
+                )
+
+            if not usable_cols:
+                logging.warning(
+                    "%s: fold %d has no usable features after removing all-NaN columns; skipping fold",
+                    target,
+                    k,
+                )
+                continue
+
+            X_tr = X_tr[usable_cols]
+            X_va = X_va[usable_cols]
+
             est = clone(model)
             fit_kwargs = {"regressor__sample_weight": w_tr} if w_tr is not None else {}
             est.fit(X_tr, y_tr, **fit_kwargs)
@@ -21005,6 +21283,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Simulate recent slates with recorded sportsbook odds to validate ROI",
     )
+    parser.add_argument(
+        "extras",
+        nargs="*",
+        help="Unsupported positional arguments; this script only accepts the documented pipeline flags.",
+    )
     return parser.parse_args()
 
 
@@ -21100,11 +21383,13 @@ def log_observability_samples(db: NFLDatabase, seasons: Sequence[str]) -> None:
 
 
 def main() -> None:
-    # Enable HTML capture by default so empty OddsPortal responses are saved automatically
-    # for troubleshooting unless the user explicitly opts out.
-    os.environ.setdefault("NFL_ODDSPORTAL_DEBUG_HTML", "1")
-
     args = parse_args()
+    if getattr(args, "extras", None):
+        logging.error(
+            "Unrecognized arguments: %s. Remove the extra values and rerun.",
+            " ".join(args.extras),
+        )
+        sys.exit(2)
     config = load_config(args.config)
     if getattr(args, "respect_lineups", None) is not None:
         config.respect_lineups = bool(args.respect_lineups)
