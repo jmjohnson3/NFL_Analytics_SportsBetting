@@ -8141,6 +8141,12 @@ class DefensiveSplitsAPIClient:
         try:
             cleaned_text = textwrap.dedent(response.text).strip()
             raw_frame = pd.read_csv(io.StringIO(cleaned_text), skipinitialspace=True)
+            if raw_frame.empty and cleaned_text:
+                normalized_lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+                if normalized_lines:
+                    raw_frame = pd.read_csv(
+                        io.StringIO("\n".join(normalized_lines)), skipinitialspace=True
+                    )
         except Exception:
             logging.exception(
                 "Failed to parse defensive splits response as CSV from %s", self.api_url
@@ -8328,6 +8334,12 @@ class CoverageSplitsAPIClient:
         try:
             cleaned_text = textwrap.dedent(response.text).strip()
             raw_frame = pd.read_csv(io.StringIO(cleaned_text), skipinitialspace=True)
+            if raw_frame.empty and cleaned_text:
+                normalized_lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+                if normalized_lines:
+                    raw_frame = pd.read_csv(
+                        io.StringIO("\n".join(normalized_lines)), skipinitialspace=True
+                    )
         except Exception:
             logging.exception(
                 "Failed to parse coverage splits response as CSV from %s", self.api_url
