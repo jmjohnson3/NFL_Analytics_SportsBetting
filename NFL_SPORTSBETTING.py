@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import dataclasses
 import datetime as dt
 import io
@@ -7792,6 +7793,14 @@ def normalize_position(value: Any) -> str:
     return text
 
 
+def _coerce_position_group(position: str, groups: Dict[str, Set[str]]) -> str:
+    normalized = normalize_position(position)
+    for key, values in groups.items():
+        if normalized in values:
+            return key
+    return "OTHER"
+
+
 def normalize_practice_status(value: Any) -> str:
     text = str(value or "").lower().strip()
     if not text:
@@ -8034,6 +8043,9 @@ class SupplementalDataLoader:
                 logging.warning("Unsupported JSON format in %s", file_path)
                 return []
 
+            if file_path.suffix.lower() == ".csv":
+                return pd.read_csv(file_path).to_dict(orient="records")
+
             logging.info(
                 "Ignoring supplemental file %s (unsupported extension); rely on database/API sources instead.",
                 file_path,
@@ -8154,8 +8166,11 @@ class SupplementalDataLoader:
                 frame[col] = pd.to_numeric(frame[col], errors="coerce")
         return frame
 
-    @staticmethod
-    def _index_records(records: List[Dict[str, Any]], key: str) -> Dict[str, List[Dict[str, Any]]]:
+    
+    
+    def _index_records(
+        self, records: List[Dict[str, Any]], key: str
+    ) -> Dict[str, List[Dict[str, Any]]]:
         index: Dict[str, List[Dict[str, Any]]] = {}
         for record in records:
             raw_value = record.get(key)
@@ -8560,6 +8575,7 @@ class NFLConfig:
     msf_timeout_backoff: float = float(
         os.getenv("NFL_API_TIMEOUT_BACKOFF", str(DEFAULT_NFL_API_TIMEOUT_BACKOFF))
     )
+    api_timeout_seconds: int = int(os.getenv("NFL_HTTP_TIMEOUT", "20"))
     msf_http_retries: int = int(os.getenv("NFL_API_HTTP_RETRIES", str(DEFAULT_NFL_API_HTTP_RETRIES)))
     respect_lineups: bool = True
     odds_allow_insecure_ssl: bool = env_flag("ODDS_ALLOW_INSECURE_SSL", False)
@@ -14145,6 +14161,25 @@ class FeatureBuilder:
                 normalize_position
             )
 
+        matchup_rows: list[dict[str, Any]] = []
+        for game in upcoming_games.itertuples(index=False):
+            home_team = normalize_team_abbr(getattr(game, "home_team", ""))
+            away_team = normalize_team_abbr(getattr(game, "away_team", ""))
+            matchup_rows.append({"team": home_team, "_upcoming_opponent": away_team})
+            matchup_rows.append({"team": away_team, "_upcoming_opponent": home_team})
+
+        matchup_df = pd.DataFrame(matchup_rows)
+        if "team" in latest_players.columns:
+            latest_players["team"] = latest_players["team"].apply(normalize_team_abbr)
+        if not matchup_df.empty:
+            latest_players = latest_players.merge(matchup_df, on="team", how="left")
+        else:
+            latest_players["_upcoming_opponent"] = np.nan
+
+        latest_players["position_group"] = latest_players.get("position", "").apply(
+            lambda pos: _coerce_position_group(pos, position_groups)
+        )
+
         stat_columns = [
             "passing_attempts",
             "passing_yards",
@@ -14290,7 +14325,6 @@ class FeatureBuilder:
                 weight_sum = weight_sum.replace(0, np.nan)
                 weighted_values = sum(series * weight for series, weight in components)
                 weighted_values = weighted_values / weight_sum
-
                 # Where data is missing, fall back gracefully in priority order: season -> recent -> latest
                 blended = weighted_values
                 blended = blended.where(weighted_values.notna(), season_values)
