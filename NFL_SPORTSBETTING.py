@@ -8168,7 +8168,9 @@ class SupplementalDataLoader:
 
     
     
-    def _index_records(records: List[Dict[str, Any]], key: str) -> Dict[str, List[Dict[str, Any]]]:
+    def _index_records(
+        self, records: List[Dict[str, Any]], key: str
+    ) -> Dict[str, List[Dict[str, Any]]]:
         index: Dict[str, List[Dict[str, Any]]] = {}
         for record in records:
             raw_value = record.get(key)
