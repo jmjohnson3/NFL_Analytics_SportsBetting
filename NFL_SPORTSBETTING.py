@@ -385,6 +385,151 @@ def load_team_coverage_profiles(
     return {}
 
 
+
+
+@dataclasses.dataclass(frozen=True)
+class TeamCoverageTendencies:
+    """Defense coverage tendencies, sourced from Sharp Football Analysis.
+
+    Rates are percentages (0-100) from Sharp's charting.
+    """
+
+    man_rate: float
+    zone_rate: float
+    middle_closed_rate: float
+    middle_open_rate: float
+
+
+def fetch_sharp_team_coverage_rates(
+    season: str = '2025',
+    *,
+    timeout: int = 30,
+) -> Dict[str, TeamCoverageTendencies]:
+    """Scrape team-level coverage rates from Sharp Football Analysis.
+
+    This uses the public HTML table on Sharp's site (no API key required). If the
+    page structure changes or the request fails, the function returns an empty dict.
+
+    Source page: https://www.sharpfootballanalysis.com/stats-nfl/nfl-coverage-schemes/
+    """
+
+    url = 'https://www.sharpfootballanalysis.com/stats-nfl/nfl-coverage-schemes/'
+    try:
+        resp = requests.get(url, timeout=timeout, headers={'User-Agent': 'Mozilla/5.0'})
+        resp.raise_for_status()
+    except Exception:
+        logging.exception('Failed to fetch Sharp coverage schemes from %s', url)
+        return {}
+
+    html = resp.text
+    try:
+        # pandas can parse the table without BeautifulSoup installed.
+        tables = pd.read_html(html)
+    except Exception:
+        logging.exception('Failed to parse Sharp coverage schemes table')
+        return {}
+
+    frame = None
+    for table in tables:
+        lowered = {str(c).strip().lower() for c in table.columns}
+        expected = {'team', 'man rate', 'zone rate'}
+        if expected.issubset(lowered):
+            frame = table
+            break
+
+    if frame is None or frame.empty:
+        logging.warning('Sharp coverage schemes table not found at %s', url)
+        return {}
+
+    # Normalize columns.
+    col_map = {}
+    for col in frame.columns:
+        key = str(col).strip().lower()
+        if key in {'team', 'man rate', 'zone rate', 'middle closed rate', 'middle open rate'}:
+            col_map[col] = key.replace(' ', '_')
+    frame = frame.rename(columns=col_map)
+
+    required = {'team', 'man_rate', 'zone_rate'}
+    if not required.issubset(frame.columns):
+        logging.warning('Sharp table is missing expected columns: %s', sorted(required - set(frame.columns)))
+        return {}
+
+    def _to_float(val: object) -> float:
+        try:
+            return float(str(val).strip())
+        except Exception:
+            return float('nan')
+
+    tendencies: Dict[str, TeamCoverageTendencies] = {}
+    for _, row in frame.iterrows():
+        team = normalize_team_abbr(str(row.get('team', '')).strip())
+        if not team:
+            continue
+        tendencies[team] = TeamCoverageTendencies(
+            man_rate=_to_float(row.get('man_rate')),
+            zone_rate=_to_float(row.get('zone_rate')),
+            middle_closed_rate=_to_float(row.get('middle_closed_rate', float('nan'))),
+            middle_open_rate=_to_float(row.get('middle_open_rate', float('nan'))),
+        )
+
+    return tendencies
+
+
+def build_coverage_matchup_matrix(
+    *,
+    defenses: Dict[str, TeamCoverageTendencies],
+    pass_catchers: Dict[str, Dict[str, float]],
+    min_routes: int = 0,
+) -> pd.DataFrame:
+    """Create a defense x pass-catcher matrix using coverage-specific efficiencies.
+
+    pass_catchers is expected to be:
+        {
+          "player_key": {"vs_man": <metric>, "vs_zone": <metric>, "routes": <optional>}
+        }
+
+    The output is a dataframe with one row per player and one column per defense.
+    Each value is a weighted score based on defense man/zone rates.
+
+    This is intentionally generic so you can plug in *your* man/zone splits
+    (YPRR vs man/zone, EPA/target vs man/zone, target rate vs man/zone, etc.).
+    """
+
+    if not defenses or not pass_catchers:
+        return pd.DataFrame()
+
+    def _routes_ok(d: Dict[str, float]) -> bool:
+        try:
+            return float(d.get('routes', 0.0)) >= float(min_routes)
+        except Exception:
+            return True
+
+    rows = []
+    for player_key, splits in pass_catchers.items():
+        if not _routes_ok(splits):
+            continue
+        try:
+            vs_man = float(splits.get('vs_man', float('nan')))
+            vs_zone = float(splits.get('vs_zone', float('nan')))
+        except Exception:
+            continue
+        if math.isnan(vs_man) or math.isnan(vs_zone):
+            continue
+
+        row = {'player_key': player_key, 'vs_man': vs_man, 'vs_zone': vs_zone}
+        for team, tend in defenses.items():
+            man_w = (tend.man_rate or 0.0) / 100.0
+            zone_w = (tend.zone_rate or 0.0) / 100.0
+            # Weighted expected efficiency in this matchup.
+            row[team] = (vs_man * man_w) + (vs_zone * zone_w)
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(rows).set_index('player_key')
+    return frame
+
 def apply_coverage_adjustments(
     table: pd.DataFrame,
     player_adjustments: Dict[str, Dict[str, float]],
@@ -6439,6 +6584,21 @@ DEFAULT_NFL_API_TIMEOUT = 45
 DEFAULT_NFL_API_TIMEOUT_RETRIES = 2
 DEFAULT_NFL_API_HTTP_RETRIES = 3
 DEFAULT_NFL_API_TIMEOUT_BACKOFF = 1.5
+# ---------------------------------------------------------------------------
+# Hard-coded runtime configuration (no env/config files)
+# ---------------------------------------------------------------------------
+
+HARD_CODED_PG_USER = "josh"
+HARD_CODED_PG_PASSWORD = "password"
+HARD_CODED_PG_HOST = "localhost"
+HARD_CODED_PG_PORT = "5432"
+HARD_CODED_PG_DATABASE = "nfl"
+
+HARD_CODED_LOG_LEVEL = "INFO"
+
+# Closing odds ingest: set to "oddsapi" to pull live markets from The Odds API,
+# or "local" if you wire up a local closing lines source.
+HARD_CODED_CLOSING_ODDS_PROVIDER = "oddsapi"
 
 # Hard-code the Odds API key; replace with your key if you want live odds ingestion.
 # NOTE: The odds key is intentionally hard-coded for this pipeline run.
@@ -8542,110 +8702,95 @@ def _extract_lineup_rows(json_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 @dataclasses.dataclass
 class NFLConfig:
-    pg_user: str = os.getenv("PGUSER", "josh")
-    pg_password: str = os.getenv("PGPASSWORD", "password")
-    pg_host: str = os.getenv("PGHOST", "localhost")
-    pg_port: str = os.getenv("PGPORT", "5432")
-    pg_database: str = os.getenv("PGDATABASE", "nfl")
+    """Runtime configuration for this pipeline.
 
-    seasons: Tuple[str, ...] = tuple(NFL_SEASONS)
-    log_level: str = DEFAULT_LOG_LEVEL
-    injury_report_path: Optional[str] = os.getenv("NFL_INJURY_PATH")
-    depth_chart_path: Optional[str] = os.getenv("NFL_DEPTH_PATH")
-    advanced_metrics_path: Optional[str] = os.getenv("NFL_ADVANCED_PATH")
-    weather_forecast_path: Optional[str] = os.getenv("NFL_FORECAST_PATH")
-    closing_odds_history_path: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PATH") or DEFAULT_CLOSING_ODDS_PATH
-    rest_travel_context_path: Optional[str] = os.getenv("NFL_TRAVEL_CONTEXT_PATH") or DEFAULT_TRAVEL_CONTEXT_PATH
-    coverage_adjustments_path: Optional[str] = os.getenv("NFL_COVERAGE_ADJUSTMENTS_PATH")
-    team_coverage_scheme_path: Optional[str] = os.getenv("NFL_TEAM_COVERAGE_PATH")
-    coverage_api_base: Optional[str] = os.getenv("NFL_COVERAGE_API_BASE")
-    coverage_api_key: Optional[str] = os.getenv("NFL_COVERAGE_API_KEY")
-    coverage_api_player_endpoint: Optional[str] = os.getenv(
-        "NFL_COVERAGE_API_PLAYER_ENDPOINT", "player-adjustments"
-    )
-    coverage_api_team_endpoint: Optional[str] = os.getenv(
-        "NFL_COVERAGE_API_TEAM_ENDPOINT", "team-coverage"
-    )
-    coverage_scrape_player_url: Optional[str] = os.getenv("NFL_COVERAGE_SCRAPE_PLAYER_URL")
-    coverage_scrape_team_url: Optional[str] = os.getenv("NFL_COVERAGE_SCRAPE_TEAM_URL")
-    msf_user: str = os.getenv("NFL_API_USER", DEFAULT_NFL_API_USER)
-    msf_password: str = os.getenv("NFL_API_PASS", DEFAULT_NFL_API_PASS)
-    msf_timeout_seconds: int = int(os.getenv("NFL_API_TIMEOUT", str(DEFAULT_NFL_API_TIMEOUT)))
-    msf_timeout_retries: int = int(os.getenv("NFL_API_TIMEOUT_RETRIES", str(DEFAULT_NFL_API_TIMEOUT_RETRIES)))
-    msf_timeout_backoff: float = float(
-        os.getenv("NFL_API_TIMEOUT_BACKOFF", str(DEFAULT_NFL_API_TIMEOUT_BACKOFF))
-    )
-    api_timeout_seconds: int = int(os.getenv("NFL_HTTP_TIMEOUT", "20"))
-    msf_http_retries: int = int(os.getenv("NFL_API_HTTP_RETRIES", str(DEFAULT_NFL_API_HTTP_RETRIES)))
+    This project intentionally avoids external config/env files; update the
+    HARD_CODED_* constants in the Configuration section to change credentials
+    and runtime behavior.
+    """
+
+    pg_user: str = HARD_CODED_PG_USER
+    pg_password: str = HARD_CODED_PG_PASSWORD
+    pg_host: str = HARD_CODED_PG_HOST
+    pg_port: str = HARD_CODED_PG_PORT
+    pg_database: str = HARD_CODED_PG_DATABASE
+
+    seasons: tuple[str, ...] = tuple(NFL_SEASONS)
+    log_level: str = HARD_CODED_LOG_LEVEL
+
+    # Optional enrichment inputs (disabled by default in the hard-coded mode).
+    injury_report_path: str | None = None
+    depth_chart_path: str | None = None
+    advanced_metrics_path: str | None = None
+    weather_forecast_path: str | None = None
+    rest_travel_context_path: str | None = DEFAULT_TRAVEL_CONTEXT_PATH
+
+    # Coverage adjustments (optional). Keep disabled unless you wire an API/scraper.
+    coverage_adjustments_path: str | None = None
+    team_coverage_scheme_path: str | None = None
+    coverage_api_base: str | None = None
+    coverage_api_key: str | None = None
+    coverage_api_player_endpoint: str | None = 'player-adjustments'
+    coverage_api_team_endpoint: str | None = 'team-coverage'
+    coverage_scrape_player_url: str | None = None
+    coverage_scrape_team_url: str | None = None
+
+    # Data providers.
+    msf_user: str = DEFAULT_NFL_API_USER
+    msf_password: str = DEFAULT_NFL_API_PASS
+    msf_timeout_seconds: int = DEFAULT_NFL_API_TIMEOUT
+    msf_timeout_retries: int = DEFAULT_NFL_API_TIMEOUT_RETRIES
+    msf_timeout_backoff: float = DEFAULT_NFL_API_TIMEOUT_BACKOFF
+    api_timeout_seconds: int = 20
+    msf_http_retries: int = DEFAULT_NFL_API_HTTP_RETRIES
+
     respect_lineups: bool = True
-    odds_allow_insecure_ssl: bool = env_flag("ODDS_ALLOW_INSECURE_SSL", False)
-    odds_ssl_cert_path: Optional[str] = os.getenv("NFL_ODDS_SSL_CERT")
-    enable_paper_trading: bool = env_flag("NFL_PAPER_TRADE", False)
+
+    # Odds/closing odds settings.
+    odds_allow_insecure_ssl: bool = False
+    odds_ssl_cert_path: str | None = None
+
+    closing_odds_provider: str = HARD_CODED_CLOSING_ODDS_PROVIDER
+    closing_odds_timeout: int = 45
+    closing_odds_download_dir: str | None = None
+
+    # When not using "local", leave history path unset to avoid CSV usage.
+    closing_odds_history_path: str | None = None
+
+    odds_api_key: str | None = ODDS_API_KEY
+    odds_api_sport_key: str = NFL_SPORT_KEY
+    odds_api_regions: str = 'us'
+    odds_api_markets: str = 'h2h'
+    odds_api_format: str = ODDS_FORMAT
+    odds_api_bookmaker: str | None = None
+    odds_api_snapshot: str | None = None
+
+    # OddsPortal / KillerSports (disabled in hard-coded mode unless you re-enable).
+    oddsportal_base_url: str = 'https://www.oddsportal.com/american-football/usa/'
+    oddsportal_results_path: str = 'nfl/results/'
+    oddsportal_season_template: str = 'nfl-{season}/results/'
+    oddsportal_user_agents: tuple[str, ...] = tuple()
+    oddsportal_cookie: str | None = None
+    oddsportal_accept_language: str | None = None
+    oddsportal_proxy: str | None = None
+
+    killersports_base_url: str | None = None
+    killersports_api_key: str | None = None
+    killersports_username: str | None = None
+    killersports_password: str | None = None
+
+    enable_paper_trading: bool = False
     paper_trade_lookback_days: int = 21
     paper_trade_edge_threshold: float = 0.02
     paper_trade_bankroll: float = 1_000.0
     paper_trade_max_fraction: float = 0.05
-    recent_form_games: int = int(os.getenv("NFL_RECENT_FORM_GAMES", str(RECENT_FORM_GAMES)))
-    recent_form_last_game_weight: float = float(
-        os.getenv("NFL_RECENT_FORM_LAST_WEIGHT", str(RECENT_FORM_LAST_GAME_WEIGHT))
-    )
-    recent_form_window_weight: float = float(
-        os.getenv("NFL_RECENT_FORM_WINDOW_WEIGHT", str(RECENT_FORM_WINDOW_WEIGHT))
-    )
-    player_history_cap_quantile: float = float(
-        os.getenv("NFL_PLAYER_HISTORY_CAP_QUANTILE", str(PLAYER_HISTORY_CAP_QUANTILE))
-    )
-    player_history_cap_headroom: float = float(
-        os.getenv("NFL_PLAYER_HISTORY_CAP_HEADROOM", str(PLAYER_HISTORY_CAP_HEADROOM))
-    )
-    _ks_api_key_env: Optional[str] = os.getenv("KILLERSPORTS_API_KEY") or os.getenv(
-        "NFL_KILLERSPORTS_API_KEY"
-    )
-    _ks_username_env: Optional[str] = os.getenv("KILLERSPORTS_USERNAME") or os.getenv(
-        "NFL_KILLERSPORTS_USERNAME"
-    )
-    _ks_password_env: Optional[str] = os.getenv("KILLERSPORTS_PASSWORD") or os.getenv(
-        "NFL_KILLERSPORTS_PASSWORD"
-    )
-    closing_odds_provider: Optional[str] = os.getenv("NFL_CLOSING_ODDS_PROVIDER")
-    if not closing_odds_provider:
-        closing_odds_provider = "local"
-    closing_odds_timeout: int = int(os.getenv("NFL_CLOSING_ODDS_TIMEOUT", "45"))
-    closing_odds_download_dir: Optional[str] = os.getenv("NFL_CLOSING_ODDS_DOWNLOAD_DIR")
-    odds_api_key: Optional[str] = os.getenv("NFL_ODDS_API_KEY")
-    odds_api_sport_key: str = os.getenv("NFL_ODDS_API_SPORT", "americanfootball_nfl")
-    odds_api_regions: str = os.getenv("NFL_ODDS_API_REGIONS", "us")
-    odds_api_markets: str = os.getenv("NFL_ODDS_API_MARKETS", "h2h")
-    odds_api_format: str = os.getenv("NFL_ODDS_API_FORMAT", "american")
-    odds_api_bookmaker: Optional[str] = os.getenv("NFL_ODDS_API_BOOKMAKER")
-    odds_api_snapshot: Optional[str] = os.getenv("NFL_ODDS_API_SNAPSHOT")
-    oddsportal_base_url: str = os.getenv(
-        "ODDSPORTAL_BASE_URL",
-        "https://www.oddsportal.com/american-football/usa/",
-    )
-    oddsportal_results_path: str = os.getenv(
-        "ODDSPORTAL_RESULTS_PATH",
-        "nfl/results/",
-    )
-    oddsportal_season_template: str = os.getenv(
-        "ODDSPORTAL_SEASON_TEMPLATE",
-        "nfl-{season}/results/",
-    )
-    oddsportal_user_agents: Tuple[str, ...] = tuple(
-        ua.strip()
-        for ua in re.split(
-            r"[;,]",
-            os.getenv("ODDSPORTAL_USER_AGENTS", ""),
-        )
-        if ua.strip()
-    )
-    oddsportal_cookie: Optional[str] = os.getenv("NFL_ODDSPORTAL_COOKIE")
-    oddsportal_accept_language: Optional[str] = os.getenv("NFL_ODDSPORTAL_ACCEPT_LANGUAGE")
-    oddsportal_proxy: Optional[str] = os.getenv("NFL_ODDSPORTAL_PROXY")
-    killersports_base_url: Optional[str] = os.getenv("KILLERSPORTS_BASE_URL")
-    killersports_api_key: Optional[str] = _ks_api_key_env
-    killersports_username: Optional[str] = _ks_username_env
-    killersports_password: Optional[str] = _ks_password_env
+
+    recent_form_games: int = RECENT_FORM_GAMES
+    recent_form_last_game_weight: float = RECENT_FORM_LAST_GAME_WEIGHT
+    recent_form_window_weight: float = RECENT_FORM_WINDOW_WEIGHT
+
+    player_history_cap_quantile: float = PLAYER_HISTORY_CAP_QUANTILE
+    player_history_cap_headroom: float = PLAYER_HISTORY_CAP_HEADROOM
 
     @property
     def pg_url(self) -> str:
